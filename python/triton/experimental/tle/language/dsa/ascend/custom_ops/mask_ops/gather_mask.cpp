@@ -23,9 +23,11 @@ gather_impl(memref_t<__ubuf__ T, 1> *src, memref_t<__ubuf__ uint16_t, 1> *mask,
 }
 #define GATHER_ENTRY(TYPE, SUFFIX, WORD)                                       \
   extern "C" __aiv__ __attribute__((always_inline)) void                       \
-  _mlir_ciface_custom_gather_mask_##SUFFIX(                                    \
-      memref_t<__ubuf__ TYPE, 1> *src, memref_t<__ubuf__ uint16_t, 1> *mask,   \
-      memref_t<__ubuf__ TYPE, 1> *dst, memref_t<__ubuf__ int32_t, 1> *count) { \
+      _mlir_ciface_custom_gather_mask_##SUFFIX(                                \
+          memref_t<__ubuf__ TYPE, 1> *src,                                     \
+          memref_t<__ubuf__ uint16_t, 1> *mask,                                \
+          memref_t<__ubuf__ TYPE, 1> *dst,                                     \
+          memref_t<__ubuf__ int32_t, 1> *count) {                              \
     gather_impl<TYPE, WORD>(src, mask, dst, count);                            \
   }
 GATHER_ENTRY(float, float, uint32_t)

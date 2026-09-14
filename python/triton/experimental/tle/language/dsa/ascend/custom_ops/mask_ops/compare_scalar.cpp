@@ -23,15 +23,15 @@ compare_impl(memref_t<__ubuf__ T, 1> *src, float scalar, int32_t comparison,
 
 #define COMPARE_ENTRY(TYPE, SUFFIX)                                            \
   extern "C" __aiv__ __attribute__((always_inline)) void                       \
-  _mlir_ciface_custom_compare_scalar_##SUFFIX(                                 \
-      memref_t<__ubuf__ TYPE, 1> *src, float scalar,                           \
-      memref_t<__ubuf__ uint16_t, 1> *dst) {                                   \
+      _mlir_ciface_custom_compare_scalar_##SUFFIX(                             \
+          memref_t<__ubuf__ TYPE, 1> *src, float scalar,                       \
+          memref_t<__ubuf__ uint16_t, 1> *dst) {                               \
     compare_impl(src, scalar, 0, dst);                                         \
   }                                                                            \
   extern "C" __aiv__ __attribute__((always_inline)) void                       \
-  _mlir_ciface_custom_compare_scalar_##SUFFIX##_mode(                          \
-      memref_t<__ubuf__ TYPE, 1> *src, float scalar, int32_t comparison,       \
-      memref_t<__ubuf__ uint16_t, 1> *dst) {                                   \
+      _mlir_ciface_custom_compare_scalar_##SUFFIX##_mode(                      \
+          memref_t<__ubuf__ TYPE, 1> *src, float scalar, int32_t comparison,   \
+          memref_t<__ubuf__ uint16_t, 1> *dst) {                               \
     compare_impl(src, scalar, comparison, dst);                                \
   }
 COMPARE_ENTRY(float, float)
