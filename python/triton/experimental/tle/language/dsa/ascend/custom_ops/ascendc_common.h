@@ -15,7 +15,7 @@
 // TLE passes contiguous UB memref descriptors, including a possible offset.
 template <typename T>
 __aiv__ __attribute__((always_inline)) AscendC::LocalTensor<T>
-mask_local_tensor(memref_t<__ubuf__ T, 1> *buffer) {
+ascendc_local_tensor(memref_t<__ubuf__ T, 1> *buffer) {
   AscendC::TBuffAddr address{};
   address.dataLen = buffer->sizes[0] * sizeof(T);
   address.bufferAddr = static_cast<uint32_t>(

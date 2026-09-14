@@ -164,7 +164,7 @@ def test_validation():
         (gather_mask, [src, mask], [src]),
         (gather_mask, [src, _tensor(tl.uint32, [16])], [src, count]),
         (gather_mask, [src, mask], [_tensor(tl.float32, [512]), count]),
-        (gather_mask, [src, mask], [src, _tensor(tl.int32, [1])]),
+        (gather_mask, [src, mask], [src, _tensor(tl.int32, [2])]),
         (gather_mask, [src, mask], [src, _tensor(tl.float32, [8])]),
     ]
     for cls, args, out in invalid:

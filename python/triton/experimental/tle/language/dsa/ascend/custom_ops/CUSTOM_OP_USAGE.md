@@ -16,7 +16,7 @@ custom_ops/
 ├── cast_ops/
 │   └── cast_int4_to_fp16.cpp       # packed signed INT4 → FP16
 ├── mask_ops/
-│   ├── compare_scalar.cpp         # FP32 标量相等比较 → uint16 位掩码
+│   ├── compare_scalar.cpp         # FP16/FP32 EQ/GT/GE → uint16 位掩码
 │   ├── gather_mask.cpp            # 按位掩码稳定压紧，并返回数量
 │   └── mask_common.h              # UB memref → AscendC LocalTensor
 └── sort_ops/
@@ -238,15 +238,16 @@ cd /root/xcs_flagtree/python/triton/experimental/tle/language/dsa/ascend/custom_
 这两个 VECTOR / PIPE_V 原语封装 AscendC 的 CompareScalar 和 GatherMask，
 不读取 GM，也不包含专家循环、路由偏移或写回逻辑。
 
-- `compare_scalar(src, scalar, out=mask)`：仅支持 FP32 相等比较（EQ）。
-  `src` 是 UB 中的一维 FP32[N]，`scalar` 为 FP32 标量；`mask` 是一维
-  uint16[N/16]。第 i 个 word 的第 j 位表示 `src[16*i+j] == scalar`，低位在前。
-- `gather_mask(src, mask, out=[selected, count])`：`src` 为一维 FP32[N]，
-  `mask` 与上述位序一致；`selected` 为一维 FP32[N]，`count` 为 int32[8]。
-  保持被选元素的原始顺序；八个 count 元素都保存有效数量，通常读取 count[0]。
-  仅 selected 的有效前缀有定义，尾部内容不保证。全零/全一掩码返回 0/N。
-- 初始支持 N=256、512、1024、2048、4096；掩码至少占一个 32 字节 UB block。
-  输入和输出均需连续、互不重叠。其他 dtype、rank、长度在注册接口中拒绝。
+- `compare_scalar(src, scalar, comparison=None, out=mask)`：支持 FP16/FP32。
+  comparison 是编译期整数：0=EQ、1=GT、2=GE；省略时保持原有 EQ ABI。
+  scalar 以 FP32 传入，比较前转换为 src dtype。mask 为 uint16[N/16]，
+  第 i 个 word 的第 j 位对应 src[16*i+j]，低位在前。
+- `gather_mask(src, mask, out=[selected, count])`：selected 与 src 同形同类型；
+  count 支持 int32[1] 和原有 int32[8]，每个元素都保存有效数量。
+  保持原顺序及原始位模式，包括 FP16 NaN payload 和用 FP16 承载的 int16 索引。
+  仅 selected[:count] 有定义。全零/全一掩码返回 0/N。
+- FP32 N 为 256..4096 的 2 的幂，FP16 为 256..32768 的 2 的幂。
+  所有 UB 缓冲区必须一维连续、32 字节对齐且互不重叠。
 - GatherMask 的硬件数量寄存器在该原语内部读取，不单独暴露依赖硬件状态的
   `get_rsvd_cnt()` 接口。调用者负责处理尾部无效元素；例如非负专家 ID 可用 -1 填充。
 
@@ -306,3 +307,35 @@ These primitives use the native Ascend custom-op compilation path and the
 prebuilt `custom_ops.bc`. The selected toolchain must support that path,
 including `hivm.hir.custom` lowering and its calling convention. This package
 does not provide CANN 9.0 ABI adapters or IR rewriting.
+
+
+## sort32 / merge_sort4
+
+这两个 VECTOR 原语分别封装 AscendC `Sort32` 和非 exhaustion 模式 `MrgSort`。
+它们只进行排序或合并，不包含 TopK 的阈值搜索、循环、前缀截取、索引生成或 GM 写回。
+
+- `sort32(src, indices, out=pairs)`：src 为 FP32[N]，indices 为 uint32[N]，
+  N 为 32..4096 的 2 的幂。独立地将每 32 对 key/index 按 key 降序排列。
+  输出 FP32[2*N] 交替保存 key 和 index 的原始 32 位模式。读取索引必须 bitcast，
+  不能作浮点数值转换。
+- `merge_sort4(src, length, ways, out=pairs)`：输入输出均为一维 FP32 proposal 数组。
+  每组含 ways 个已经降序排列、等长为 length 的列表；每个 proposal 占两个 FP32 槽位。
+  ways 为编译期 2 或 4，length 为编译期 8..2048 的 2 的幂。
+  两路合并仅支持单组；四路合并组数为 1..128 的 2 的幂，支持完整组，总 proposal 数不超过 4096。输出每组的完整降序合并结果。
+- key 允许重复值和正负无穷，不支持 NaN key；相同 key 的 index 顺序不保证稳定。
+  index 的任意 uint32 位模式均保留。UB 输入输出要求连续、32 字节对齐且互不重叠。
+  源码内部的屏障是原语正确执行的一部分，不另设公共同步 API。
+
+```python
+pairs = tle.dsa.ascend.raw("sort32", keys, ids,
+                            out=tl.full((2 * N,), 0, tl.float32))
+# N=128: merge the four sorted 32-element lists.
+merged = tle.dsa.ascend.raw("merge_sort4", pairs, 32, 4,
+                             out=tl.full((2 * N,), 0, tl.float32))
+```
+
+TLE 可以表达比较、压紧、排序和合并算法。保留这些原语的理由是当前后端的实测性能：
+它们直接使用 packed compare、压紧和排序硬件，避免软件位掩码组装、多轮 gather/compare/
+select 和中间数据搬运。不是将整个 TopK 包装为 custom op，也不是声称 TLE 无法表达算法。
+独立正确性测试：`python3 python/tutorials/tle/custom/test_topk_primitives.py`；
+原有 FP32 和路由回归：`python3 python/tutorials/tle/custom/test_mask_ops.py`。

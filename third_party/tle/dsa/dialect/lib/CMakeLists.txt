@@ -35,6 +35,8 @@ set(ASCEND_CUSTOM_OPS
   "sort_ops/sort_1d_pack.cpp::dav-c220-vec"
   "sort_ops/merge_pack_sort.cpp::dav-c220-vec"
   "sort_ops/unpack_sort.cpp::dav-c220-vec"
+  "sort_ops/sort32.cpp::dav-c220-vec"
+  "sort_ops/merge_sort4.cpp::dav-c220-vec"
   "mask_ops/compare_scalar.cpp::dav-c220-vec"
   "mask_ops/gather_mask.cpp::dav-c220-vec"
   "cast_ops/cast_int4_to_fp16.cpp::dav-c220-vec"
@@ -61,10 +63,10 @@ foreach(entry IN LISTS ASCEND_CUSTOM_OPS)
 
   set(op_deps "")
   set(op_include_flags -I "${TEMPLATE_INCLUDE}")
-  if(src MATCHES "^mask_ops/")
-    list(APPEND op_deps "${ASCEND_CUSTOM_OPS_DIR}/mask_ops/mask_common.h")
+  if(src MATCHES "^mask_ops/|^sort_ops/(sort32|merge_sort4)\\.cpp$")
+    list(APPEND op_deps "${ASCEND_CUSTOM_OPS_DIR}/ascendc_common.h")
   endif()
-  if(src MATCHES "^(mask_ops|cast_ops|sync_ops)/")
+  if(src MATCHES "^(mask_ops|cast_ops|sync_ops)/|^sort_ops/(sort32|merge_sort4)\\.cpp$")
     list(APPEND op_include_flags
       -I "${ASCENDC_INCLUDE_DIR}"
       -I "${ASCENDC_INCLUDE_DIR}/interface"

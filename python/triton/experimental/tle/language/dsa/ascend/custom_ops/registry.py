@@ -252,13 +252,14 @@ class unpack_sort:
         self.extra_buffers = [(tl.float16, 0)]
 
 
-# Mask buffers must occupy at least one 32-byte UB block. The initial FP32
-# implementation covers the block sizes validated by the routing kernels.
+# Mask buffers occupy at least one 32-byte UB block.
 def _mask_source_size(src, op_name):
-    assert src.dtype == tl.float32, f"{op_name} requires an fp32 UB tensor"
+    assert src.dtype in (tl.float16, tl.float32), f"{op_name} requires an fp16/fp32 UB tensor"
     assert len(src.shape) == 1, f"{op_name} requires a 1D source"
     size = src.numel.value
-    assert size in (256, 512, 1024, 2048, 4096), (f"{op_name} requires 256, 512, 1024, 2048 or 4096 source elements")
+    limit = 32768 if src.dtype == tl.float16 else 4096
+    assert 256 <= size <= limit and size & (size - 1) == 0, (
+        f"{op_name} requires a power-of-two source size in [256, {limit}]")
     return size
 
 
@@ -270,38 +271,51 @@ def _check_mask_buffer(mask, size, op_name):
 
 @al.register_custom_op
 class compare_scalar:
-    """Compare a 1D FP32 UB tensor with an FP32 scalar for equality.
+    """Packed EQ/GT/GE comparison of contiguous FP16/FP32 UB values.
 
-    Required out: uint16[N / 16] in UB, where N is 256, 512, 1024, 2048 or
-    4096. Bit j of word i is (src[16*i+j] == scalar), least-significant bit
-    first. All output bits are defined. No comparison mode other than EQ
-    is supported. Input and output buffers must be contiguous and disjoint.
+    comparison: compile-time 0 (EQ), 1 (GT), or 2 (GE). Omission means EQ
+    and preserves the original ABI. Scalar is passed as FP32 and rounded
+    to the source dtype before comparison. Required out: uint16[N/16].
+    FP32 sizes: powers of two 256..4096; FP16: 256..32768. Bit i records
+    the predicate for element i, least-significant bit first. All bits are
+    defined. Inputs/outputs must be 32-byte aligned and disjoint.
     """
 
     core = al.CORE.VECTOR
     pipe = al.PIPE.PIPE_V
     mode = al.MODE.SIMD
 
-    def __init__(self, src, scalar, out=None):
+    def __init__(self, src, scalar, comparison=None, out=None):
         assert out is not None, "compare_scalar requires an output bitmask"
         size = _mask_source_size(src, "compare_scalar")
         _check_mask_buffer(out, size, "compare_scalar")
         self.arg_type["scalar"] = tl.float32
-        self.symbol = "custom_compare_scalar_float"
+        suffix = "half" if src.dtype == tl.float16 else "float"
+        self.symbol = "custom_compare_scalar_" + suffix
+        if comparison is None:
+            # Match the legacy operand count as well as its symbol. The custom
+            # dispatcher derives per-argument IR attributes from this signature.
+            self.signature = self.signature.replace(
+                parameters=[p for name, p in self.signature.parameters.items() if name != "comparison"])
+        else:
+            assert isinstance(comparison, int) and comparison in (0, 1, 2), (
+                "compare_scalar comparison must be compile-time 0 (EQ), 1 (GT) or 2 (GE)")
+            self.arg_type["comparison"] = tl.int32
+            self.symbol += "_mode"
         self.bitcode = CUSTOM_OPS_BITCODE
 
 
 @al.register_custom_op
 class gather_mask:
-    """Stably compact FP32 UB values selected by a packed uint16 bitmask.
+    """Stable bit-preserving FP16/FP32 compaction in UB.
 
-    src: FP32[N], N in (256, 512, 1024, 2048, 4096).
-    mask: uint16[N / 16], same bit order as compare_scalar.
-    Required out: [FP32[N], int32[8]], in UB. All eight count elements
-    contain the selected count. Only out[0][:count] is defined; its tail
-    is unspecified. Empty/full masks yield count 0/N. Inputs and outputs
-    must be contiguous and disjoint. There are no GM accesses or routing
-    assumptions; get_rsvd_cnt is consumed inside this primitive.
+    Required out: [same dtype/shape as src, int32[1] or int32[8]]. Each
+    count lane contains the selected count. Only selected[:count] is
+    defined. Mask: uint16[N/16], LSB first. FP32 sizes: powers of two
+    256..4096; FP16: 256..32768. NaN payloads and signed zeros are copied
+    without arithmetic conversion, including int16 index bit patterns.
+    Buffers must be contiguous, 32-byte aligned and disjoint. The reserved
+    count register is consumed inside this primitive, not a separate op.
     """
 
     core = al.CORE.VECTOR
@@ -312,11 +326,11 @@ class gather_mask:
         assert out is not None and len(out) == 2, ("gather_mask requires out=[selected, count]")
         size = _mask_source_size(src, "gather_mask")
         _check_mask_buffer(mask, size, "gather_mask")
-        assert out[0].dtype == tl.float32 and out[0].shape == src.shape, (
+        assert out[0].dtype == src.dtype and out[0].shape == src.shape, (
             "gather_mask selected output must match the source shape and dtype")
-        assert out[1].dtype == tl.int32 and len(
-            out[1].shape) == 1 and out[1].numel.value == 8, ("gather_mask count output must be int32[8]")
-        self.symbol = "custom_gather_mask_float"
+        assert out[1].dtype == tl.int32 and len(out[1].shape) == 1 and out[1].numel.value in (1, 8), (
+            "gather_mask count output must be int32[1] or int32[8]")
+        self.symbol = "custom_gather_mask_" + ("half" if src.dtype == tl.float16 else "float")
         self.bitcode = CUSTOM_OPS_BITCODE
 
 
@@ -383,4 +397,64 @@ class cube_end:
     def __init__(self, token):
         self.arg_type["token"] = tl.int32
         self.symbol = "custom_cube_end"
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
+@al.register_custom_op
+class sort32:
+    """Sort independent 32-key groups descending, carrying uint32 indices.
+
+    src: contiguous FP32[N], indices: uint32[N]; N is a power of two in
+    [32, 4096]. Required out: FP32[2*N], interleaved key and raw uint32
+    index bits. Equal-key index order is unspecified. NaN keys are not
+    supported. This is only Sort32: no merge, index generation or TopK
+    truncation. UB buffers must be 32-byte aligned and disjoint.
+    """
+    core = al.CORE.VECTOR
+    pipe = al.PIPE.PIPE_V
+    mode = al.MODE.SIMD
+
+    def __init__(self, src, indices, out=None):
+        assert src.dtype == tl.float32 and len(src.shape) == 1, "sort32 requires 1D fp32 keys"
+        n = src.numel.value
+        assert 32 <= n <= 4096 and n & (n - 1) == 0, "sort32 requires a power-of-two size in [32, 4096]"
+        assert indices.dtype == tl.uint32 and indices.shape == src.shape, "sort32 requires matching uint32 indices"
+        assert out is not None and out.dtype == tl.float32 and len(
+            out.shape) == 1 and out.numel.value == 2 * n, ("sort32 requires fp32[2*N] output")
+        self.symbol = "custom_sort32_float"
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
+@al.register_custom_op
+class merge_sort4:
+    """Non-exhaustion merge of batched 2/4-way descending proposal lists.
+
+    src: contiguous FP32 slots [key, index bits] in [group, way, proposal]
+    order. Each way has the same length (power of two 8..2048); ways is
+    compile-time 2 or 4. Two-way merging requires one group. Four-way
+    merging supports power-of-two group counts in 1..128. Up to 4096 proposals. Required out
+    has the same shape/dtype; each group's full merged list is returned.
+    Equal-key index order is unspecified; NaN keys are unsupported. No
+    prefix truncation, consumed-count export or TopK scheduling. All UB
+    buffers must be contiguous, 32-byte aligned and disjoint.
+    """
+    core = al.CORE.VECTOR
+    pipe = al.PIPE.PIPE_V
+    mode = al.MODE.SIMD
+
+    def __init__(self, src, length, ways, out=None):
+        assert src.dtype == tl.float32 and len(src.shape) == 1, "merge_sort4 requires 1D fp32 proposals"
+        assert isinstance(length, int) and 8 <= length <= 2048 and length & (length - 1) == 0, (
+            "merge_sort4 length must be a compile-time power of two in [8, 2048]")
+        assert isinstance(ways, int) and ways in (2, 4), "merge_sort4 ways must be compile-time 2 or 4"
+        n = src.numel.value
+        assert n % (2 * length * ways) == 0 and 1 <= n // (2 * length * ways) <= 128 and n <= 8192 and n & (
+            n - 1) == 0, (
+                "merge_sort4 requires whole groups, a power-of-two group count, at most 128 groups and 4096 proposals")
+        assert ways == 4 or n == 2 * length * ways, "merge_sort4 two-way merging requires exactly one group"
+        assert out is not None and out.dtype == tl.float32 and out.shape == src.shape, (
+            "merge_sort4 output must match source shape and dtype")
+        self.arg_type["length"] = tl.int32
+        self.arg_type["ways"] = tl.int32
+        self.symbol = "custom_merge_sort4_float"
         self.bitcode = CUSTOM_OPS_BITCODE

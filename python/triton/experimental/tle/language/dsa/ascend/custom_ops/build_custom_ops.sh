@@ -38,6 +38,8 @@ CUSTOM_OPS=(
   "sort_ops/sort_1d_pack.cpp:dav-c220-vec"
   "sort_ops/merge_pack_sort.cpp:dav-c220-vec"
   "sort_ops/unpack_sort.cpp:dav-c220-vec"
+  "sort_ops/sort32.cpp:dav-c220-vec"
+  "sort_ops/merge_sort4.cpp:dav-c220-vec"
   "mask_ops/compare_scalar.cpp:dav-c220-vec"
   "mask_ops/gather_mask.cpp:dav-c220-vec"
   "cast_ops/cast_int4_to_fp16.cpp:dav-c220-vec"
@@ -72,7 +74,7 @@ for entry in "${CUSTOM_OPS[@]}"; do
     --cce-aicore-arch="${arch}" --cce-enable-print
     --cce-enable-sanitizer -std=c++17 -I "${TEMPLATE_INCLUDE}" )
 
-  if [[ "${src}" == mask_ops/* || "${src}" == cast_ops/* || "${src}" == sync_ops/* ]]; then
+  if [[ "${src}" == mask_ops/* || "${src}" == cast_ops/* || "${src}" == sync_ops/* || "${src}" == sort_ops/sort32.cpp || "${src}" == sort_ops/merge_sort4.cpp ]]; then
     CCEC_COMMON_ARGS+=( -I "${ASCENDC_INCLUDE_DIR}"
       -I "${ASCENDC_INCLUDE_DIR}/interface" -I "${ASCENDC_INCLUDE_DIR}/impl" )
   fi
