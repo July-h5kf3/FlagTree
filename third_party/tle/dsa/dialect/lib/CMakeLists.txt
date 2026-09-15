@@ -35,24 +35,10 @@ set(ASCEND_CUSTOM_OPS
   "sort_ops/sort_1d_pack.cpp::dav-c220-vec"
   "sort_ops/merge_pack_sort.cpp::dav-c220-vec"
   "sort_ops/unpack_sort.cpp::dav-c220-vec"
-  "sort_ops/sort32.cpp::dav-c220-vec"
-  "sort_ops/merge_sort4.cpp::dav-c220-vec"
   "mask_ops/compare_scalar.cpp::dav-c220-vec"
-  "mask_ops/gather_mask.cpp::dav-c220-vec"
   "cast_ops/cast_int4_to_fp16.cpp::dav-c220-vec"
   "sync_ops/cube_boundary.cpp::dav-c220-cube"
 )
-
-# The mask and cast primitives wrap the AscendC APIs. This cache variable can also
-# be supplied explicitly for non-standard CANN installations.
-find_path(ASCENDC_INCLUDE_DIR kernel_operator.h
-  HINTS "$ENV{ASCEND_HOME_PATH}" "${CCEC_BIN_DIR}/.."
-  PATH_SUFFIXES "${CMAKE_SYSTEM_PROCESSOR}-linux/tikcpp/tikcfw" "tikcpp/tikcfw")
-# Other backends configure this directory without building AscendCustomOpsBitcode.
-# Do not require CANN headers until that target is actually built.
-if(NOT ASCENDC_INCLUDE_DIR)
-  set(ASCENDC_INCLUDE_DIR "${CCEC_BIN_DIR}/../${CMAKE_SYSTEM_PROCESSOR}-linux/tikcpp/tikcfw")
-endif()
 
 set(SORT_OPS_DIR "${ASCEND_CUSTOM_OPS_DIR}/sort_ops")
 set(OP_BITCODES "")
@@ -63,15 +49,6 @@ foreach(entry IN LISTS ASCEND_CUSTOM_OPS)
 
   set(op_deps "")
   set(op_include_flags -I "${TEMPLATE_INCLUDE}")
-  if(src MATCHES "^mask_ops/|^sort_ops/(sort32|merge_sort4)\\.cpp$")
-    list(APPEND op_deps "${ASCEND_CUSTOM_OPS_DIR}/ascendc_common.h")
-  endif()
-  if(src MATCHES "^(mask_ops|cast_ops|sync_ops)/|^sort_ops/(sort32|merge_sort4)\\.cpp$")
-    list(APPEND op_include_flags
-      -I "${ASCENDC_INCLUDE_DIR}"
-      -I "${ASCENDC_INCLUDE_DIR}/interface"
-      -I "${ASCENDC_INCLUDE_DIR}/impl")
-  endif()
   if(src MATCHES "^sort_ops/")
     list(APPEND op_deps "${SORT_OPS_DIR}/sort_common.h")
   endif()
