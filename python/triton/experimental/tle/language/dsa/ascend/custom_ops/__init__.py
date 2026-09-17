@@ -21,8 +21,6 @@ from .registry import (
     unpack_sort,
     compare_scalar,
     cast_int4_to_fp16,
-    cube_begin,
-    cube_end,
 )
 
 __all__ = [
@@ -42,6 +40,4 @@ __all__ = [
     "unpack_sort",
     "compare_scalar",
     "cast_int4_to_fp16",
-    "cube_begin",
-    "cube_end",
 ]

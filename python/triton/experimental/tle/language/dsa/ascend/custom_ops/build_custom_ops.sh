@@ -45,7 +45,6 @@ CUSTOM_OPS=(
   "sort_ops/unpack_sort.cpp:dav-c220-vec"
   "mask_ops/compare_scalar.cpp:dav-c220-vec"
   "cast_ops/cast_int4_to_fp16.cpp:dav-c220-vec"
-  "sync_ops/cube_boundary.cpp:dav-c220-cube"
 )
 
 if [[ ! -d "${TEMPLATE_INCLUDE}" ]]; then

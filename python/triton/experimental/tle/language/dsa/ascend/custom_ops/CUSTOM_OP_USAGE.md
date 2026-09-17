@@ -21,8 +21,6 @@ custom_ops/
 │   └── compare_scalar.cpp          # FP16/FP32 EQ/GT/GE → uint16 位掩码
 ├── reduction_ops/
 │   └── pair_reduce_sum.cpp         # 相邻两个（奇偶）元素求和, 暂只支持 mask 连续模式
-├── sync_ops/
-│   └── cube_boundary.cpp           # CUBE 本地 pipe_barrier(PIPE_ALL) 边界标记
 └── sort_ops/
     ├── sort32.cpp                  # 排序函数，一次迭代可以完成32个数的排序
     ├── sort_1d_pack.cpp            # sort_1d_pack ABI 与路径分发
@@ -468,16 +466,6 @@ values = tle.dsa.ascend.raw("cast_int4_to_fp16", packed, 0, 2 * N, out=values)  
 普通及 mix 两套入口均构建到现有 `custom_ops.bc`。测试入口为
 `python python/tutorials/tle/custom/test_cast_ops.py`，也已接入
 `test_custom_ops.py`。测试包含全部字节编码、不同块大小、图重放以及参数校验。
-
-## Cube region boundaries
-
-`raw("cube_begin", tl.program_id(0))` and `raw("cube_end", tl.program_id(0))`
-use the CUBE-local `pipe_barrier(PIPE_ALL)` intrinsic, with no output.
-The int32 token is ignored. Both have identical barrier semantics; their names
-mark entry and exit in caller code. They do not implement cross-core handshakes,
-allocate buffers, or initialize/finalize a GEMM. Use TLE `sync_block_set/wait`
-for Vector/Cube producer-consumer synchronization and `tl.dot` for computation.
-
 
 ## Toolchain requirement
 
