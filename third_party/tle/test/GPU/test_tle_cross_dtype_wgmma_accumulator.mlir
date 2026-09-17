@@ -48,9 +48,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.tar
 
 // -----
 
-// Copyright 2025- FlagOS Contributors
-//
-
 #mma_fp8 = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 64, 32]}>
 #mma_bf16 = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 64, 16]}>
 #dot_bf16 = #ttg.dot_op<{opIdx = 0, parent = #mma_bf16, kWidth = 2}>

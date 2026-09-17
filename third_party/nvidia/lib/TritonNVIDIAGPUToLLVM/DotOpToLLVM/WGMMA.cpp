@@ -268,16 +268,16 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
   auto instrMNK = mmaEncoding.getInstrShape();
 #endif // __TLE__
 #ifdef __TLE__
-  // C ownership depends on M/N and warp/CTA distribution, not K. Register A
-  // must agree with that layout even after FenceInsertion removes the async
-  // accumulator-chain marker.
+  // C ownership depends on M/N and warp/CTA distribution, not K. The
+  // register-A layout only depends on kWidth, warpsPerCTA, and CTALayout, so
+  // an accumulator encoding with different instrShape M/N distributes A the
+  // same way. Register A must agree with that layout even after
+  // FenceInsertion removes the async accumulator-chain marker.
   if (!aInShared) {
     auto aDotEncoding = cast<DotOperandEncodingAttr>(aTensorTy.getEncoding());
     auto aMmaEncoding =
         dyn_cast<NvidiaMmaEncodingAttr>(aDotEncoding.getParent());
     if (!aMmaEncoding || !aMmaEncoding.isHopper() ||
-        instrMNK[0] != aMmaEncoding.getInstrShape()[0] ||
-        instrMNK[1] != aMmaEncoding.getInstrShape()[1] ||
         mmaEncoding.getWarpsPerCTA() != aMmaEncoding.getWarpsPerCTA() ||
         mmaEncoding.getCTALayout() != aMmaEncoding.getCTALayout()) {
       return op->emitError("incompatible register-A and accumulator layouts "
