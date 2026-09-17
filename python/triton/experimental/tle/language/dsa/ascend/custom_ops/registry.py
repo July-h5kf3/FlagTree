@@ -543,41 +543,43 @@ def _check_mask_buffer(mask, size, op_name):
 
 @al.register_custom_op
 class compare_scalar:
-    """Packed EQ/GT/GE comparison of contiguous FP16/FP32 UB values.
+    """Packed scalar comparison of contiguous FP16/FP32 UB values.
 
-    comparison: compile-time 0 (EQ), 1 (GT), or 2 (GE). Omission means EQ
-    and preserves the original ABI. Scalar is passed as FP32 and rounded
-    to the source dtype before comparison. Required out: uint16[N/16], or uint32[N/32] for FP32 sources.
-    The uint32 form feeds gather_mask_custom_pattern without repacking.
-    FP32 sizes: powers of two 256..4096; FP16: 256..32768. Bit i records
-    the predicate for element i, least-significant bit first. All bits are
-    defined. Inputs/outputs must be 32-byte aligned and disjoint.
+    Based on CANN 9.1 `dav_c220/kernel_operator_vec_cmp_impl.h`
+    CompareScalarCompute / VcmpvsIntrinsicsImpl (CompareScalar Level 2). All
+    parameters of that API are exposed: cmpMode is the CANN CMPMODE value
+    0=LT, 1=GT, 2=EQ, 3=LE, 4=GE, 5=NE (utils/kernel_utils_mode.h); count is
+    the number of compared elements and must equal the source size. scalar is
+    passed as FP32 and rounded to the source dtype before comparison.
+    Required out: uint16[N/16], or uint32[N/32] for FP32 sources. The uint32
+    form feeds gather_mask_custom_pattern without repacking. FP32 sizes:
+    powers of two 256..4096; FP16: 256..32768. Bit i records the predicate
+    for element i, least-significant bit first. All bits are defined.
+    Inputs/outputs must be 32-byte aligned and disjoint. The op inserts no
+    pipeline barrier; ordering is the caller's responsibility.
     """
 
     core = al.CORE.VECTOR
     pipe = al.PIPE.PIPE_V
     mode = al.MODE.SIMD
 
-    def __init__(self, src, scalar, comparison=None, out=None):
+    def __init__(self, src, scalar, cmpMode, count, out=None):
         assert out is not None, "compare_scalar requires an output bitmask"
         size = _mask_source_size(src, "compare_scalar")
-        _check_mask_buffer(out, size, "compare_scalar")
+        assert isinstance(cmpMode, int) and 0 <= cmpMode <= 5, (
+            "compare_scalar cmpMode must be a compile-time CANN CMPMODE value "
+            "0=LT, 1=GT, 2=EQ, 3=LE, 4=GE, 5=NE")
+        assert isinstance(count, int) and count == size, (
+            f"compare_scalar count must be a compile-time element count equal to the source size ({size})")
         assert src.dtype == tl.float32 or out.dtype == tl.uint16, "FP16 comparison requires a uint16 mask"
+        _check_mask_buffer(out, count, "compare_scalar")
         self.arg_type["scalar"] = tl.float32
+        self.arg_type["cmpMode"] = tl.int32
+        self.arg_type["count"] = tl.int32
         suffix = "half" if src.dtype == tl.float16 else "float"
         if out.dtype == tl.uint32:
             suffix += "_mask32"
         self.symbol = "custom_compare_scalar_" + suffix
-        if comparison is None:
-            # Match the legacy operand count as well as its symbol. The custom
-            # dispatcher derives per-argument IR attributes from this signature.
-            self.signature = self.signature.replace(
-                parameters=[p for name, p in self.signature.parameters.items() if name != "comparison"])
-        else:
-            assert isinstance(comparison, int) and comparison in (0, 1, 2), (
-                "compare_scalar comparison must be compile-time 0 (EQ), 1 (GT) or 2 (GE)")
-            self.arg_type["comparison"] = tl.int32
-            self.symbol += "_mode"
         self.bitcode = CUSTOM_OPS_BITCODE
 
 
@@ -585,26 +587,39 @@ class compare_scalar:
 class cast_int4_to_fp16:
     """Unpack signed INT4 values from a 1D uint8 UB tensor into FP16.
 
-    src: uint8[N] in UB, N a power of two from 32 through 8192 bytes.
-    Required out: float16[2*N] in UB. Each source byte encodes two signed
-    two's-complement values in [-8, 7]; the low nibble is emitted first.
-    All output elements are defined. No zero-point, scale or layout
-    conversion is applied. Inputs and outputs must be contiguous,
-    32-byte aligned and disjoint. GM accesses stay in the caller.
+    Based on CANN 9.1 `dav_c220/kernel_operator_vec_vconv_impl.h` CastImpl
+    (Cast Level 2) and its int4b_t -> half specialization. All parameters of
+    that API are exposed: roundMode must be CAST_NONE (0), the only mode
+    supported from int4b_t to half on this device; count is the number of
+    output FP16 elements and must equal 2 * N. src: uint8[N] in UB, N a
+    power of two from 32 through 8192 bytes. Required out: float16[2*N] in
+    UB. Each source byte encodes two signed two's-complement values in
+    [-8, 7]; the low nibble is emitted first. All output elements are
+    defined. No zero-point, scale or layout conversion is applied. Inputs
+    and outputs must be contiguous, 32-byte aligned and disjoint. GM
+    accesses stay in the caller. The op inserts no pipeline barrier beyond
+    the mask set/restore of the reference implementation; ordering is the
+    caller's responsibility.
     """
 
     core = al.CORE.VECTOR
     pipe = al.PIPE.PIPE_V
     mode = al.MODE.SIMD
 
-    def __init__(self, src, out=None):
+    def __init__(self, src, roundMode, count, out=None):
         assert out is not None, "cast_int4_to_fp16 requires an output buffer"
         assert src.dtype == tl.uint8 and len(src.shape) == 1, ("cast_int4_to_fp16 requires a 1D uint8 UB source")
         size = src.numel.value
         assert size in (32, 64, 128, 256, 512, 1024, 2048, 4096,
                         8192), ("cast_int4_to_fp16 requires a power-of-two byte count in [32, 8192]")
-        assert out.dtype == tl.float16 and len(out.shape) == 1 and out.numel.value == 2 * size, (
+        assert isinstance(roundMode, int) and roundMode == 0, (
+            "cast_int4_to_fp16 only supports RoundMode::CAST_NONE (0) from int4b_t to half on this device")
+        assert isinstance(count, int) and count == 2 * size, (
+            f"cast_int4_to_fp16 count must be a compile-time output element count equal to 2 * N ({2 * size})")
+        assert out.dtype == tl.float16 and len(out.shape) == 1 and out.numel.value == count, (
             "cast_int4_to_fp16 requires a 1D float16 output with twice the source element count")
+        self.arg_type["roundMode"] = tl.int32
+        self.arg_type["count"] = tl.int32
         self.symbol = "custom_cast_int4_to_fp16"
         self.bitcode = CUSTOM_OPS_BITCODE
 

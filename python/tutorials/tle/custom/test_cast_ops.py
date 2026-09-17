@@ -10,12 +10,14 @@ import triton.experimental.tle as tle
 import triton.language as tl
 from triton.experimental.tle.language.dsa.ascend.custom_ops import cast_int4_to_fp16
 
+CAST_NONE = tl.constexpr(0)
+
 
 @triton.jit
 def cast_kernel(X, Out, N: tl.constexpr):
     packed = tl.load(X + tl.arange(0, N))
     values = tl.full((2 * N, ), 0, tl.float16)
-    values = tle.dsa.ascend.raw("cast_int4_to_fp16", packed, out=values)
+    values = tle.dsa.ascend.raw("cast_int4_to_fp16", packed, CAST_NONE, 2 * N, out=values)
     tl.store(Out + tl.arange(0, 2 * N), values)
 
 
@@ -64,35 +66,41 @@ def _tensor(dtype, shape):
     return tl.tensor(None, tl.block_type(dtype, shape))
 
 
-def _init(src, out):
+def _init(*args, **kwargs):
     op = cast_int4_to_fp16.__new__(cast_int4_to_fp16)
     op.arg_type = {}
-    cast_int4_to_fp16.__init__(op, src, out=out)
+    op.__init__(*args, **kwargs)
     return op
 
 
 def test_validation():
     for n in (32, 64, 128, 256, 512, 1024, 2048, 4096, 8192):
-        op = _init(_tensor(tl.uint8, [n]), _tensor(tl.float16, [2 * n]))
+        op = _init(_tensor(tl.uint8, [n]), 0, 2 * n, out=_tensor(tl.float16, [2 * n]))
         assert op.symbol == "custom_cast_int4_to_fp16"
         assert op.bitcode.endswith("custom_ops.bc")
     src = _tensor(tl.uint8, [64])
     dst = _tensor(tl.float16, [128])
     invalid = [
-        (src, None),
-        (_tensor(tl.int8, [64]), dst),
-        (_tensor(tl.float16, [64]), dst),
-        (_tensor(tl.uint8, [8, 8]), dst),
-        (_tensor(tl.uint8, [16]), _tensor(tl.float16, [32])),
-        (_tensor(tl.uint8, [16384]), _tensor(tl.float16, [32768])),
-        (src, _tensor(tl.bfloat16, [128])),
-        (src, _tensor(tl.float16, [64])),
-        (src, _tensor(tl.float16, [256])),
-        (src, _tensor(tl.float16, [8, 16])),
+        (src, 0, 128, None),
+        (_tensor(tl.int8, [64]), 0, 128, dst),
+        (_tensor(tl.float16, [64]), 0, 128, dst),
+        (_tensor(tl.uint8, [8, 8]), 0, 128, dst),
+        (_tensor(tl.uint8, [16]), 0, 32, _tensor(tl.float16, [32])),
+        (_tensor(tl.uint8, [16384]), 0, 32768, _tensor(tl.float16, [32768])),
+        (src, 0, 128, _tensor(tl.bfloat16, [128])),
+        (src, 0, 128, _tensor(tl.float16, [64])),
+        (src, 0, 128, _tensor(tl.float16, [256])),
+        (src, 0, 128, _tensor(tl.float16, [8, 16])),
+        # Unsupported round modes: only CAST_NONE (0) is valid for s4 -> f16.
+        (src, 1, 128, dst),
+        (src, 6, 128, dst),
+        # count must equal the output element count 2 * N.
+        (src, 0, 64, dst),
+        (src, 0, 256, dst),
     ]
-    for source, output in invalid:
+    for args in invalid:
         try:
-            _init(source, output)
+            _init(*args[:-1], out=args[-1])
         except AssertionError:
             continue
         raise AssertionError("cast_int4_to_fp16 accepted an invalid signature")
