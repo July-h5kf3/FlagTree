@@ -61,6 +61,7 @@ triton::nvgpu::WGMMAEltType getMmaRetType(Value d) {
   }
 }
 
+#ifdef __TLE__
 static std::optional<triton::nvgpu::WGMMAEltType>
 getSupportedMmaOperandType(Type aTy, bool allowTF32) {
   if (aTy.isF16()) {
@@ -79,13 +80,32 @@ getSupportedMmaOperandType(Type aTy, bool allowTF32) {
     return std::nullopt;
   }
 }
+#endif // __TLE__
 
 triton::nvgpu::WGMMAEltType getMmaOperandType(Value a, bool allowTF32) {
   auto aTy = cast<triton::gpu::TensorOrMemDesc>(a.getType()).getElementType();
+#ifdef __TLE__
   auto type = getSupportedMmaOperandType(aTy, allowTF32);
   if (!type)
     llvm::report_fatal_error("Unsupported mma operand type found");
   return *type;
+#else
+  if (aTy.isF16()) {
+    return triton::nvgpu::WGMMAEltType::f16;
+  } else if (aTy.isBF16()) {
+    return triton::nvgpu::WGMMAEltType::bf16;
+  } else if (aTy.isF32() && allowTF32) {
+    return triton::nvgpu::WGMMAEltType::tf32;
+  } else if (aTy.isInteger(8)) {
+    return triton::nvgpu::WGMMAEltType::s8;
+  } else if (llvm::isa<Float8E5M2Type>(aTy)) {
+    return triton::nvgpu::WGMMAEltType::e5m2;
+  } else if (llvm::isa<Float8E4M3FNType>(aTy)) {
+    return triton::nvgpu::WGMMAEltType::e4m3;
+  } else {
+    llvm::report_fatal_error("Unsupported mma operand type found");
+  }
+#endif // __TLE__
 }
 
 #ifdef __TLE__
@@ -242,7 +262,11 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
   auto baseB = getOffsetedBase(loadedB, cast<MemDescType>(bTensorTy),
                                typeConverter, rewriter, loc);
   auto dShapePerCTA = getShapePerCTA(dTensorTy);
+#ifdef __TLE__
   SmallVector<unsigned> instrMNK(mmaEncoding.getInstrShape());
+#else
+  auto instrMNK = mmaEncoding.getInstrShape();
+#endif // __TLE__
 #ifdef __TLE__
   // C ownership depends on M/N and warp/CTA distribution, not K. Register A
   // must agree with that layout even after FenceInsertion removes the async
