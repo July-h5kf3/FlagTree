@@ -678,6 +678,7 @@ def test_duplicate():
 
 
 def main():
+    from test_cast_int8_ops import main as test_cast_int8_ops
     from test_cast_ops import main as test_cast_ops
     from test_compare_scalar import main as test_compare_scalar
 
@@ -689,6 +690,7 @@ def main():
     test_unpack_sort()
     test_compare_scalar()
     test_cast_ops()
+    test_cast_int8_ops()
     test_sort32()
     test_mrgsort()
     test_gather_mask()
