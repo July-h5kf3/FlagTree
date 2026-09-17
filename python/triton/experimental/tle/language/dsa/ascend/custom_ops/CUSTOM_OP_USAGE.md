@@ -16,8 +16,7 @@ custom_ops/
 │   ├── gather_gm_to_ub.cpp         # GM → UB 按索引行 gather
 │   └── gather_mask.cpp             # 以内置固定模式对应的二进制或用户自定义输入的 Tensor 数值对应的二进制为 gather mask, 从源操作数中选取元素写入目的操作数中
 ├── cast_ops/
-│   ├── cast_int4_to_fp16.cpp       # packed signed INT4 → FP16
-│   └── cast_int8_to_fp16.cpp       # int8 → FP16
+│   └── cast_int4_to_fp16.cpp       # packed signed INT4 → FP16
 ├── mask_ops/
 │   └── compare_scalar.cpp          # FP16/FP32 EQ/GT/GE → uint16 位掩码
 ├── reduction_ops/
@@ -468,28 +467,9 @@ values = tle.dsa.ascend.raw("cast_int4_to_fp16", packed, 0, 2 * N, out=values)  
 `python python/tutorials/tle/custom/test_cast_ops.py`，也已接入
 `test_custom_ops.py`。测试包含全部字节编码、不同块大小、图重放以及参数校验。
 
-## cast_int8_to_fp16
-
-`cast_int8_to_fp16(src, roundMode, count, out=values)` 将 UB 中的 int8 逐
-元素转为 FP16。接口暴露 AscendC `Cast` API（Level 2）的全部参数。
-实现参考 CANN 9.1 `dav_c220/kernel_operator_vec_vconv_impl.h` 的 `CastImpl`
-及其 int8_t→half 特化，直接使用 `vconv_s82f16` intrinsic，并设置/恢复
-mask 状态。`roundMode` 只支持 `CAST_NONE`（0）；`count` 为输出元素个数，
-必须等于输入元素数。不在 op 内插入 pipeline barrier；前后序由调用方保证。
-
-输入 `src` 是一维 `int8[N]`，N 为 32 至 8192 的 2 的幂；输出 `out` 必须
-是一维 `float16[N]`。输入、输出连续、32 字节对齐且互不重叠。
-
-```python
-src8 = tl.load(X + tl.arange(0, N))  # int8[N]
-values = tl.full((N,), 0, tl.float16)
-values = tle.dsa.ascend.raw("cast_int8_to_fp16", src8, 0, N, out=values)  # CAST_NONE
-```
-
 ## Toolchain requirement
 
 These primitives use the native Ascend custom-op compilation path and the
 prebuilt `custom_ops.bc`. The selected toolchain must support that path,
 including `hivm.hir.custom` lowering and its calling convention. This package
 does not provide CANN 9.0 ABI adapters or IR rewriting.
-
