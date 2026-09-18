@@ -9,6 +9,7 @@ import triton.language as tl
 from triton.experimental import tle
 from triton.experimental.tle.language.dsa.ascend.custom_ops import compare_scalar
 
+
 def _hardware_ne(values, scalar):
     # vcmpvs_ne follows ordered semantics: a comparison involving NaN is
     # false, whereas np.not_equal(NaN, s) is true.

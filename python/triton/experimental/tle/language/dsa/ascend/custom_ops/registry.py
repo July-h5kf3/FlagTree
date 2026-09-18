@@ -566,9 +566,9 @@ class compare_scalar:
     def __init__(self, src, scalar, cmpMode, count, out=None):
         assert out is not None, "compare_scalar requires an output bitmask"
         size = _mask_source_size(src, "compare_scalar")
-        assert isinstance(cmpMode, int) and 0 <= cmpMode <= 5, (
-            "compare_scalar cmpMode must be a compile-time CANN CMPMODE value "
-            "0=LT, 1=GT, 2=EQ, 3=LE, 4=GE, 5=NE")
+        assert isinstance(
+            cmpMode, int) and 0 <= cmpMode <= 5, ("compare_scalar cmpMode must be a compile-time CANN CMPMODE value "
+                                                  "0=LT, 1=GT, 2=EQ, 3=LE, 4=GE, 5=NE")
         assert isinstance(count, int) and count == size, (
             f"compare_scalar count must be a compile-time element count equal to the source size ({size})")
         assert src.dtype == tl.float32 or out.dtype == tl.uint16, "FP16 comparison requires a uint16 mask"
@@ -660,4 +660,3 @@ class cast_int8_to_fp16:
         self.arg_type["count"] = tl.int32
         self.symbol = "custom_cast_int8_to_fp16"
         self.bitcode = CUSTOM_OPS_BITCODE
-

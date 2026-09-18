@@ -32,8 +32,7 @@ def test_cast_int8_to_fp16():
             storage = torch.full((n + 32, ), 123, dtype=torch.float16, device="npu")
             out = storage[16:-16]
             cast_kernel_int8[(1, )](x, out, N=n)
-            np.testing.assert_array_equal(out.cpu().numpy(),
-                                          packed.astype(np.float16))
+            np.testing.assert_array_equal(out.cpu().numpy(), packed.astype(np.float16))
             np.testing.assert_array_equal(storage[:16].cpu().numpy(), np.full(16, 123))
             np.testing.assert_array_equal(storage[-16:].cpu().numpy(), np.full(16, 123))
             cases += 1
@@ -53,8 +52,7 @@ def test_graph_replay_int8():
     for value in (-128, -1, 0, 127):
         x.fill_(value)
         graph.replay()
-        np.testing.assert_array_equal(out.cpu().numpy(),
-                                      np.full(n, value, dtype=np.int8).astype(np.float16))
+        np.testing.assert_array_equal(out.cpu().numpy(), np.full(n, value, dtype=np.int8).astype(np.float16))
     print("[PASS] cast_int8 graph replay with four changed inputs")
 
 

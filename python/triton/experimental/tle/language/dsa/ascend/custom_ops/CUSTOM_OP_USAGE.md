@@ -492,4 +492,3 @@ These primitives use the native Ascend custom-op compilation path and the
 prebuilt `custom_ops.bc`. The selected toolchain must support that path,
 including `hivm.hir.custom` lowering and its calling convention. This package
 does not provide CANN 9.0 ABI adapters or IR rewriting.
-

@@ -50,10 +50,12 @@ compare_scalar_vcmpvs(__ubuf__ uint8_t *dst, __ubuf__ T *src0, T src1,
 // Pipeline barriers are the caller's responsibility; this op adds none.
 template <typename T, typename U>
 __aiv__ __attribute__((always_inline)) void
-compare_scalar_impl(memref_t<__ubuf__ T, 1> *src, float scalar, int32_t cmp_mode,
-                    uint32_t count, memref_t<__ubuf__ U, 1> *dst) {
+compare_scalar_impl(memref_t<__ubuf__ T, 1> *src, float scalar,
+                    int32_t cmp_mode, uint32_t count,
+                    memref_t<__ubuf__ U, 1> *dst) {
   auto src0 = src->aligned + src->offset;
-  auto dst_ptr = reinterpret_cast<__ubuf__ uint8_t *>(dst->aligned + dst->offset);
+  auto dst_ptr =
+      reinterpret_cast<__ubuf__ uint8_t *>(dst->aligned + dst->offset);
   const T src1 = static_cast<T>(scalar);
   const uint32_t sum_repeat = count * sizeof(T) / 256;
   const uint32_t repeat_round = sum_repeat / 252;
