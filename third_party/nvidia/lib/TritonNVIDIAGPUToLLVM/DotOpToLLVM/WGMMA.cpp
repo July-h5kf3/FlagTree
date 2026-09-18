@@ -264,10 +264,7 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
   auto dShapePerCTA = getShapePerCTA(dTensorTy);
 #ifdef __TLE__
   SmallVector<unsigned> instrMNK(mmaEncoding.getInstrShape());
-#else
-  auto instrMNK = mmaEncoding.getInstrShape();
-#endif // __TLE__
-#ifdef __TLE__
+
   // C ownership depends on M/N and warp/CTA distribution, not K. The
   // register-A layout only depends on kWidth, warpsPerCTA, and CTALayout, so
   // an accumulator encoding with different instrShape M/N distributes A the
@@ -292,7 +289,9 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
     return op->emitError("unsupported operand types or precision for Hopper "
                          "WGMMA instruction shape");
   instrMNK[2] = *instructionK;
-#endif
+#else
+  auto instrMNK = mmaEncoding.getInstrShape();
+#endif // __TLE__
   auto accSize = 2 * (instrMNK[1] / 4);
   unsigned M = 4 * instrMNK[0];
   unsigned N = instrMNK[1];
