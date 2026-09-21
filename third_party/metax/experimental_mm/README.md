@@ -15,7 +15,7 @@ cmake --build build/metax-mm --parallel 2
 cp build/metax-mm/shared-load-address third_party/metax/backend/
 ```
 
-A full FlagTree build can enable the same target with `TRITON_METAX_EXPERIMENTAL_MM=ON`. The backend package includes the executable. Editable builds place it beside `compiler.py`; normal builds place it in the backend build package. The binary and Python adapter are included in the backend cache key. No optimization option is enabled by default.
+A full FlagTree build can enable the same target with `TRITON_METAX_EXPERIMENTAL_MM=ON`. When enabled, the build selects the validated MetaX plugin 0.6.2; the default build retains plugin 0.6.1. The backend package includes the executable. Editable builds place it beside `compiler.py`; normal builds place it in the backend build package. The binary and Python adapter are included in the backend cache key. No optimization option is enabled by default.
 
 The validated environment uses the SDK reporting LLVM 22.0.0git (distributed under the name `metax-llvm19`) and the MACA 3.7.2 consumer. `address_pass.py` transports the vendor calling convention and capture-attribute syntax between those versions. The C++ code performs the instruction transformation. Other SDK/consumer combinations have not been validated.
 
@@ -38,7 +38,7 @@ Non-split K must be divisible by 256 and the INT32 accumulation must be safe. Th
 
 `experimental_mm_split_partial_i32=S` is an explicit **ABI-changing lowering contract**, intended for an MM plan that also owns scratch storage and final reduction. It must not be passed to an ordinary BF16-output launcher. The fifth pointer then addresses INT32 scratch `[S,M,N]`, grid.y is S, and the compiler emits a chunk of `ceil(K/256)/S` iterations. The input row stride remains K. Tiles must divide evenly across splits; each chunk contains 2..511 tiles, and K must be divisible by 16. K-tail masks are proved over the complete reduction interval and regenerated for each initial/future copy.
 
-The plan must run a second reduction over scratch, use INT64 when K>131071, then convert once to FP32 and evaluate `(sum*SA)*SB` before BF16 conversion. This explicitly requests exact large-K MM semantics; it is not a claim that overflowing INT32 source arithmetic is equivalent to INT64 accumulation. The checkpoint's `split_runtime.py` implements this caller contract. Allocation and all component launches belong to the plan; timings include both kernels.
+The plan must run a second reduction over scratch, use INT64 when K>131071, then convert once to FP32 and evaluate `(sum*SA)*SB` before BF16 conversion. This explicitly requests exact large-K MM semantics; it is not a claim that overflowing INT32 source arithmetic is equivalent to INT64 accumulation. The example `test/split_runtime.py` implements this caller contract. Allocation and all component launches belong to the plan; timings include both kernels.
 
 ## Validation
 
@@ -46,4 +46,4 @@ The plan must run a second reduction over scratch, use INT64 when K>131071, then
 python -m pytest third_party/metax/experimental_mm/test -q
 ```
 
-These tests compile ordinary source fixtures with the default backend, then test the optional structural transform, including incomplete row tiles, CTA grouping, >2 GiB output, split-K, wrong shape, altered tail masks, and accumulation bounds. They need the MetaX runtime/compiler and optional executable, but do not launch GPU work. Existing GPU correctness and timing evidence is recorded in the `metax-mm-auto-split-20260921` task checkpoint: 48 former manual routes replaced, 72 retained source/config routes, and all 120 shapes validated. Native `(4096,1,152064)` is excluded from timing after an earlier native memory violation.
+These tests compile ordinary source fixtures with the default backend, then test the optional structural transform, including incomplete row tiles, CTA grouping, >2 GiB output, split-K, wrong shape, altered tail masks, and accumulation bounds. They need the MetaX runtime/compiler and optional executable, but do not launch GPU work. Recorded GPU validation ([details](VALIDATION.md)) covers: 48 former manual routes replaced, 72 retained source/config routes, and all 120 shapes validated. Native `(4096,1,152064)` is excluded from timing after an earlier native memory violation.

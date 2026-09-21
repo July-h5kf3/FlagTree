@@ -23,6 +23,8 @@ import os
 
 def register_cache(cache, flagtree_backend, check_env, set_llvm_env):
     is_metax = "metax" == flagtree_backend
+    experimental_mm = os.environ.get("TRITON_METAX_EXPERIMENTAL_MM", "OFF").upper() in ("ON", "1", "TRUE")
+    plugin_version, plugin_digest = ("0.6.2", "de37eb01") if experimental_mm else ("0.6.1", "afb7ab8f")
     cache.store(
         file="metax-llvm19",
         condition=is_metax,
@@ -33,9 +35,10 @@ def register_cache(cache, flagtree_backend, check_env, set_llvm_env):
     cache.store(
         file="metaxTritonPlugin.so",
         condition=is_metax and not os.environ.get("FLAGTREE_PLUGIN"),
-        url="https://baai-cp-web.ks3-cn-beijing.ksyuncs.com/trans/metaxTritonPlugin-cpython3.12-x86_64_v0.6.1.tar.gz",
+        url=
+        f"https://baai-cp-web.ks3-cn-beijing.ksyuncs.com/trans/metaxTritonPlugin-cpython3.12-x86_64_v{plugin_version}.tar.gz",
         copy_dst_path=f"third_party/{flagtree_backend}",
-        md5_digest="afb7ab8f",
+        md5_digest=plugin_digest,
     )
 
 
