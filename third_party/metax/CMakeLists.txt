@@ -34,3 +34,8 @@ if(TRITON_BUILD_PYTHON_MODULE)
     set(CMAKE_BUILD_RPATH "${CMAKE_BUILD_RPATH}" PARENT_SCOPE)
   endif()
 endif()
+
+option(TRITON_METAX_EXPERIMENTAL_MM "Build the opt-in C550 LLVM MM optimizer" OFF)
+if(TRITON_METAX_EXPERIMENTAL_MM)
+  add_subdirectory(experimental_mm)
+endif()
