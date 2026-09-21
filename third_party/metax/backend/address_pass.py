@@ -5,7 +5,10 @@ import tempfile
 from pathlib import Path
 
 
-def transform(source, base_zero=False, pipeline=False, shape=(), group_rows=1, split_partial_i32=1):
+def transform(source, base_zero=False, pipeline=False, shape=(), group_rows=1, split_partial_i32=1,
+              rematerialize_indices=False):
+    if rematerialize_indices and not (pipeline and shape):
+        raise ValueError("MM index rematerialization requires pipeline and shape")
     # The available analysis SDK is LLVM 22; MACA's code generator is LLVM 19.
     # This adapter transports its vendor calling convention losslessly. Only
     # the C++ def-use transformation operates on instructions and addresses.
@@ -22,6 +25,8 @@ def transform(source, base_zero=False, pipeline=False, shape=(), group_rows=1, s
         output_path = Path(temporary) / "output.ll"
         input_path.write_text(normalized)
         command = [str(executable), str(input_path), "-o", str(output_path)]
+        if rematerialize_indices:
+            command.append("--rematerialize-tail-indices")
         if pipeline:
             command.append("--matmul-pipeline")
         if group_rows != 1:

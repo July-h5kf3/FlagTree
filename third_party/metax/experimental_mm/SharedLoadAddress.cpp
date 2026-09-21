@@ -21,6 +21,8 @@ static cl::opt<bool> BaseZero("dynamic-shared-base-zero", cl::init(false));
 static cl::opt<unsigned> GroupRows("group-rows", cl::init(1));
 static cl::opt<unsigned> Splits("split-partial-i32", cl::init(1));
 static cl::list<unsigned> LayoutShape("layout-shape", cl::CommaSeparated);
+static cl::opt<bool> RematerializeIndices("rematerialize-tail-indices",
+                                          cl::init(false));
 static cl::opt<bool> MatmulPipeline("matmul-pipeline", cl::init(false));
 
 struct OffsetExpression {
@@ -154,6 +156,8 @@ int main(int argc, char **argv) {
   }
   if (verifyModule(*module, &errs()))
     return 2;
+  if (RematerializeIndices && (LayoutShape.empty() || !MatmulPipeline))
+    return 5;
   if (Splits != 1 && LayoutShape.empty())
     return 5;
   if (GroupRows != 1 && LayoutShape.empty())
@@ -164,7 +168,7 @@ int main(int argc, char **argv) {
     optimizeMatmulPipeline(*module, LayoutShape.empty() ? 0 : LayoutShape[0],
                            LayoutShape.empty() ? 0 : LayoutShape[1],
                            LayoutShape.empty() ? 0 : LayoutShape[2], GroupRows,
-                           Splits);
+                           Splits, RematerializeIndices);
   unsigned changed = rewriteSharedLoads(*module);
   if (verifyModule(*module, &errs()))
     return 3;

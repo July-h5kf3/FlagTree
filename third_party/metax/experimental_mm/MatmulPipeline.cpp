@@ -1110,7 +1110,7 @@ struct Emitter {
 
 unsigned optimizeMatmulPipeline(Module &module, unsigned rows, unsigned columns,
                                 unsigned reduction, unsigned groupRows,
-                                unsigned splits) {
+                                unsigned splits, bool rematerializeIndices) {
   unsigned matched = 0;
   for (Function &function : module) {
     if (function.isDeclaration())
@@ -1148,6 +1148,8 @@ unsigned optimizeMatmulPipeline(Module &module, unsigned rows, unsigned columns,
         if (splits == 1)
           output.prefetchColumnScale(emitter.tailBlock);
         output.emitCtaOrder();
+        if (rematerializeIndices)
+          output.rematerializeTailIndices(emitter.tailBlock);
       }
     } else {
       errs() << "skipped_mm=" << function.getName()

@@ -946,6 +946,57 @@ struct OutputLayout {
            << " group_rows=" << groupRows << "\n";
   }
 
+  void rematerializeTailIndices(BasicBlock *tail) {
+    SmallVector<Instruction *> consumers;
+    for (BasicBlock *block : {tail, pattern.exit})
+      for (Instruction &instruction : *block)
+        consumers.push_back(&instruction);
+
+    IRBuilder<> builder(&*tail->getFirstInsertionPt());
+    auto *type = FunctionType::get(builder.getInt32Ty(),
+                                   {builder.getInt32Ty()}, false);
+    // A tied empty asm preserves the lane value while preventing CSE from
+    // keeping its derived output indices live across the steady-state loop.
+    auto *identity = InlineAsm::get(type, "", "=r,0", true);
+    auto *thread = builder.CreateCall(identity, {pattern.thread},
+                                      "mm.tail.thread");
+    thread->setConvergent();
+    thread->setDoesNotThrow();
+    std::map<Value *, Value *> rematerialized = {{pattern.thread, thread}};
+    std::function<Value *(Value *)> rebuild = [&](Value *value) -> Value * {
+      auto found = rematerialized.find(value);
+      if (found != rematerialized.end())
+        return found->second;
+      auto *instruction = dyn_cast<Instruction>(value);
+      if (!instruction || instruction->getParent() != pattern.entry)
+        return value;
+      bool pure = isa<BinaryOperator>(instruction) ||
+                  isa<CastInst>(instruction) ||
+                  isa<GetElementPtrInst>(instruction) ||
+                  isa<CmpInst>(instruction) || isa<SelectInst>(instruction) ||
+                  called(instruction) == "llvm.umin.i32";
+      if (!pure)
+        return value;
+      SmallVector<Value *> operands;
+      bool changed = false;
+      for (Value *operand : instruction->operands()) {
+        Value *replacement = rebuild(operand);
+        operands.push_back(replacement);
+        changed |= replacement != operand;
+      }
+      if (!changed)
+        return rematerialized[value] = value;
+      Instruction *clone = instruction->clone();
+      for (unsigned index = 0; index < operands.size(); ++index)
+        clone->setOperand(index, operands[index]);
+      builder.Insert(clone, "mm.tail.index");
+      return rematerialized[value] = clone;
+    };
+    for (Instruction *consumer : consumers)
+      for (Use &operand : consumer->operands())
+        operand.set(rebuild(operand.get()));
+  }
+
   void prefetchColumnScale(BasicBlock *tail) {
     unsigned mmaCount = 0;
     Instruction *insertion = nullptr;

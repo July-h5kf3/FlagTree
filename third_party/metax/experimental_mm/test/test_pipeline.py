@@ -43,6 +43,7 @@ def source_cache(tmp_path_factory):
     return compile_source
 
 
+@pytest.mark.parametrize("rematerialize", [False, True])
 @pytest.mark.parametrize("shape,group,splits", [
     ((256, 1024, 4096), 1, 1),
     ((97, 1024, 4096), 1, 1),
@@ -50,13 +51,14 @@ def source_cache(tmp_path_factory):
     ((255, 1024, 4096), 1, 1),
     ((384, 1024, 2048), 2, 1),
     ((8192, 152064, 3584), 32, 1),
+    ((1848, 1536, 128256), 1, 1),
     ((1848, 1536, 151936), 1, 2),
     ((1848, 1536, 152064), 1, 2),
     ((98, 512, 3584), 1, 7),
 ])
-def test_compile_structure(source_cache, shape, group, splits):
+def test_compile_structure(source_cache, shape, group, splits, rematerialize):
     output, _ = ADAPTER.transform(source_cache(shape), base_zero=True, pipeline=True, shape=shape, group_rows=group,
-                                  split_partial_i32=splits)
+                                  split_partial_i32=splits, rematerialize_indices=rematerialize)
     assert "mm.steady" in output and "mm.tail" in output
     if splits > 1:
         assert output.count("call void @llvm.mxc.stg.predicator.v8i16") == 16
@@ -83,3 +85,8 @@ def test_unsafe_accumulation(source_cache):
     shape = (1848, 1536, 151936)
     with pytest.raises(ValueError, match="constant trip count"):
         ADAPTER.transform(source_cache(shape), pipeline=True, shape=shape)
+
+
+def test_rematerialize_requires_layout():
+    with pytest.raises(ValueError, match="requires pipeline and shape"):
+        ADAPTER.transform("", pipeline=True, rematerialize_indices=True)

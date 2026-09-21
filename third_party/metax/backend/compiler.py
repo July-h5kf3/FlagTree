@@ -140,6 +140,7 @@ class MACAOptions:
     # MACA: new args
     experimental_shared_load_address: bool = False
     experimental_mm_pipeline: bool = False
+    experimental_mm_rematerialize_indices: bool = False
     experimental_mm_shape: tuple = ()
     experimental_mm_group_rows: int = 1
     experimental_mm_split_partial_i32: int = 1
@@ -149,6 +150,9 @@ class MACAOptions:
     inner_stages: Tuple[int, int] = field(default_factory=lambda: (0, 0))
 
     def __post_init__(self):
+        if self.experimental_mm_rematerialize_indices and not (self.experimental_mm_pipeline
+                                                               and self.experimental_mm_shape):
+            raise ValueError("MM index rematerialization requires pipeline and shape")
         if (self.experimental_mm_shape or self.experimental_mm_group_rows != 1
                 or self.experimental_mm_split_partial_i32 != 1) and not self.experimental_mm_pipeline:
             raise ValueError("MM shape, CTA grouping, and split output require experimental_mm_pipeline")
@@ -402,7 +406,8 @@ class MACABackend(BaseBackend):
             from .address_pass import transform
             llir, _ = transform(llir, base_zero=True, pipeline=options.experimental_mm_pipeline,
                                 shape=options.experimental_mm_shape, group_rows=options.experimental_mm_group_rows,
-                                split_partial_i32=options.experimental_mm_split_partial_i32)
+                                split_partial_i32=options.experimental_mm_split_partial_i32,
+                                rematerialize_indices=options.experimental_mm_rematerialize_indices)
         metadata["name"] = maca_get_kernel_name(llir)
         return llir
 
