@@ -41,3 +41,14 @@ def register_cache(cache, flagtree_backend, check_env, set_llvm_env):
 
 def install_extension(*args, **kargs):
     return
+
+
+def get_backend_cmake_args(*args, **kwargs):
+    enabled = os.environ.get("TRITON_METAX_EXPERIMENTAL_MM", "OFF").upper()
+    if enabled not in ("ON", "OFF", "1", "0", "TRUE", "FALSE"):
+        raise ValueError("TRITON_METAX_EXPERIMENTAL_MM must be a CMake boolean")
+    return [f"-DTRITON_METAX_EXPERIMENTAL_MM={enabled}"]
+
+
+def get_package_data(backends):
+    return {"triton.backends.metax": ["shared-load-address"]}

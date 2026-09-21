@@ -138,12 +138,20 @@ class MACAOptions:
     arch: str = None
     instrumentation_mode: str = ""
     # MACA: new args
+    experimental_shared_load_address: bool = False
+    experimental_mm_pipeline: bool = False
+    experimental_mm_shape: tuple = ()
+    experimental_mm_group_rows: int = 1
+    experimental_mm_split_partial_i32: int = 1
     pipeline: str = "basic"
     scenario: str = ""
     pipeline_load_num: int = -1
     inner_stages: Tuple[int, int] = field(default_factory=lambda: (0, 0))
 
     def __post_init__(self):
+        if (self.experimental_mm_shape or self.experimental_mm_group_rows != 1
+                or self.experimental_mm_split_partial_i32 != 1) and not self.experimental_mm_pipeline:
+            raise ValueError("MM shape, CTA grouping, and split output require experimental_mm_pipeline")
         default_libdir = os.getenv("MACA_PATH") + '/lib'
         ext_default_libdir = Path(__file__).parent / 'lib'
         extern_libs = {} if self.extern_libs is None else dict(self.extern_libs)
@@ -388,6 +396,13 @@ class MACABackend(BaseBackend):
             maca_path = os.environ.get('MACA_PATH')
             assert maca_path, "Not found MACA_PATH"
             llir = metax.link_extern_libs(llir, paths, maca_path)
+        if options.experimental_mm_pipeline or options.experimental_shared_load_address:
+            if capability != 80:
+                raise ValueError("Shared load address optimization currently requires C550/sm80")
+            from .address_pass import transform
+            llir, _ = transform(llir, base_zero=True, pipeline=options.experimental_mm_pipeline,
+                                shape=options.experimental_mm_shape, group_rows=options.experimental_mm_group_rows,
+                                split_partial_i32=options.experimental_mm_split_partial_i32)
         metadata["name"] = maca_get_kernel_name(llir)
         return llir
 
@@ -458,6 +473,10 @@ class MACABackend(BaseBackend):
                 compile_options += " -mllvm -metaxgpu-live-range-split=false"
         if ("noaddropt" in scenarios) or (os.getenv("TRITON_DISABLE_MACA_COMPILER_4G_ADDR_OPT")):
             compile_options = compile_options.replace("-mllvm -metaxgpu-aggressive-4g-addr-opt=true ", "")
+        if opt.experimental_mm_pipeline:
+            compile_options += " -mllvm -metaxgpu-igroup=false"
+            compile_options += " -mllvm -metaxgpu-mma-unroll-count=1"
+            compile_options += " -mllvm -metaxgpu-disable-bsm-offset=0"
         return metax.translate_llvmir_to_mcfatbin(src, mxcc_arch, os.environ.get('MACA_PATH'), compile_options)
 
     def add_stages(self, stages, options, language):
@@ -477,4 +496,10 @@ class MACABackend(BaseBackend):
         if mxcc_arch is None:
             raise RuntimeError('mxcc_arch is None (not specified)')
         version = subprocess.check_output([mxcc_arch, "--version"]).decode("utf-8").split('\n', 1)[0]
-        return f'{version}-{self.capability}'
+        pass_root = Path(__file__).parent
+        executable = pass_root / "shared-load-address"
+        pass_identity = "unavailable"
+        if executable.is_file():
+            pass_identity = "-".join(
+                file_hash(str(pass_root / filename)) for filename in ("address_pass.py", "shared-load-address"))
+        return f'{version}-{self.capability}-{pass_identity}'
