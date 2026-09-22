@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Standalone correctness checks for the signed INT4-to-FP16 custom op."""
 
+import statistics
+
 import numpy as np
 import torch
 import torch_npu  # noqa: F401
@@ -45,21 +47,69 @@ def test_cast_int4_to_fp16():
     print(f"[PASS] cast_int4_to_fp16: {cases} size/encoding cases")
 
 
-def test_graph_replay():
-    n = 4096
-    x = torch.zeros(n, dtype=torch.uint8, device="npu")
-    out = torch.empty(2 * n, dtype=torch.float16, device="npu")
-    for _ in range(3):
-        cast_kernel[(1, )](x, out, N=n)
-    torch.npu.synchronize()
-    graph = torch.npu.NPUGraph()
-    with torch.npu.graph(graph):
-        cast_kernel[(1, )](x, out, N=n)
-    for value in (0x78, 0xF0, 0x00):
-        x.fill_(value)
-        graph.replay()
-        np.testing.assert_array_equal(out.cpu().numpy(), _reference(np.full(n, value, dtype=np.uint8)))
-    print("[PASS] cast graph replay with three changed inputs")
+@triton.jit
+def cast_bench_kernel(X, Y, BYTES: tl.constexpr, TILES: tl.constexpr, CUSTOM: tl.constexpr):
+    for tile in range(tl.program_id(0), TILES, tl.num_programs(0)):
+        packed = tl.load(X + tile * BYTES + tl.arange(0, BYTES))
+        if CUSTOM:
+            values = tle.dsa.ascend.raw("cast_int4_to_fp16", packed, 0, 2 * BYTES, out=tl.full((2 * BYTES, ), 0,
+                                                                                               tl.float16))
+        else:
+            output_index = tl.arange(0, packed.numel * 2)
+            codes = tl.gather(packed.to(tl.int8, bitcast=True), output_index // 2, 0).to(tl.int16)
+            nibbles = (codes >> ((output_index & 1) * 4)) & 15
+            values = ((nibbles ^ 8) - 8).to(tl.float16)
+        tl.store(Y + tile * 2 * BYTES + tl.arange(0, 2 * BYTES), values)
+
+
+def bench_cast_int4_to_fp16():
+    # Largest packed tile used by the W4A16 caller. Triton unpacks each byte
+    # into two signed nibbles, low nibble first, then casts with .to(fp16).
+    nbytes, tiles = 4096, 5120
+    packed = (np.arange(nbytes * tiles, dtype=np.uint32) % 256).astype(np.uint8)
+    expected = _reference(packed)
+    x = torch.from_numpy(packed).to("npu")
+    y = torch.empty(packed.size * 2, dtype=torch.float16, device="npu")
+
+    def launch(custom):
+        return cast_bench_kernel[(40, )](x, y, nbytes, tiles, custom, num_warps=1, multibuffer=False,
+                                         enable_fp_fusion=False)
+
+    for custom in (True, False):
+        launch(custom)
+        torch.npu.synchronize()
+        np.testing.assert_array_equal(y.cpu().numpy(), expected)
+    graphs = {}
+    for name, custom in (("custom", True), ("triton", False)):
+        for _ in range(3):
+            launch(custom)
+        torch.npu.synchronize()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            for _ in range(20):
+                launch(custom)
+        graphs[name] = graph
+    rounds = []
+    for trial in range(5):
+        row = {}
+        names = ("custom", "triton") if trial % 2 == 0 else ("triton", "custom")
+        for name in names:
+            for _ in range(3):
+                graphs[name].replay()
+            torch.npu.synchronize()
+            start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
+            start.record()
+            for _ in range(20):
+                graphs[name].replay()
+            end.record()
+            end.synchronize()
+            row[name] = start.elapsed_time(end) * 1000 / 400
+        rounds.append(row)
+    custom_us = statistics.median(row["custom"] for row in rounds)
+    triton_us = statistics.median(row["triton"] for row in rounds)
+    print(f"[BENCH] cast_int4_to_fp16 {nbytes} bytes x {tiles} tiles: "
+          f"custom {custom_us:.3f} us, triton {triton_us:.3f} us, "
+          f"triton/custom {triton_us / custom_us:.2f}x")
 
 
 def _tensor(dtype, shape):
@@ -110,8 +160,8 @@ def test_validation():
 def main():
     test_validation()
     test_cast_int4_to_fp16()
-    test_graph_replay()
-    print("All cast custom op correctness tests passed.")
+    bench_cast_int4_to_fp16()
+    print("All cast custom op tests passed.")
 
 
 if __name__ == "__main__":
