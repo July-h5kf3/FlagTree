@@ -466,7 +466,7 @@ values = tle.dsa.ascend.raw("cast_int4_to_fp16", packed, 0, 2 * N, out=values)  
 普通及 mix 两套入口均构建到现有 `custom_ops.bc`。测试入口为
 `python python/tutorials/tle/custom/test_cast_ops.py`，也已接入
 `test_custom_ops.py`。测试包含全部字节编码、不同块大小和参数校验，以及
-4096 字节 tile 与 Triton nibble 解包加 `.to(tl.float16)` 的耗时对比。
+4096 字节 tile 与 Triton `tl.interleave` 拆 nibble 再 `.to(tl.float16)` 的耗时对比。
 
 ## Toolchain requirement
 

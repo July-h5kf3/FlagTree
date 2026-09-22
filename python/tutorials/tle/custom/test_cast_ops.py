@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Standalone correctness checks for the signed INT4-to-FP16 custom op."""
 
-import statistics
-
 import numpy as np
 import torch
 import torch_npu  # noqa: F401
@@ -55,16 +53,18 @@ def cast_bench_kernel(X, Y, BYTES: tl.constexpr, TILES: tl.constexpr, CUSTOM: tl
             values = tle.dsa.ascend.raw("cast_int4_to_fp16", packed, 0, 2 * BYTES, out=tl.full((2 * BYTES, ), 0,
                                                                                                tl.float16))
         else:
-            output_index = tl.arange(0, packed.numel * 2)
-            codes = tl.gather(packed.to(tl.int8, bitcast=True), output_index // 2, 0).to(tl.int16)
-            nibbles = (codes >> ((output_index & 1) * 4)) & 15
-            values = ((nibbles ^ 8) - 8).to(tl.float16)
+            codes = packed.to(tl.int16)
+            low = codes & 0xF
+            high = (codes >> 4) & 0xF
+            low = ((low ^ 8) - 8).to(tl.float16)
+            high = ((high ^ 8) - 8).to(tl.float16)
+            values = tl.interleave(low, high)
         tl.store(Y + tile * 2 * BYTES + tl.arange(0, 2 * BYTES), values)
 
 
 def bench_cast_int4_to_fp16():
-    # Largest packed tile used by the W4A16 caller. Triton unpacks each byte
-    # into two signed nibbles, low nibble first, then casts with .to(fp16).
+    # Largest packed tile used by the W4A16 caller. The Triton side sign-extends
+    # each nibble to FP16 and interleaves them, low nibble first.
     nbytes, tiles = 4096, 5120
     packed = (np.arange(nbytes * tiles, dtype=np.uint32) % 256).astype(np.uint8)
     expected = _reference(packed)
@@ -79,37 +79,18 @@ def bench_cast_int4_to_fp16():
         launch(custom)
         torch.npu.synchronize()
         np.testing.assert_array_equal(y.cpu().numpy(), expected)
-    graphs = {}
-    for name, custom in (("custom", True), ("triton", False)):
-        for _ in range(3):
-            launch(custom)
-        torch.npu.synchronize()
-        graph = torch.npu.NPUGraph()
-        with torch.npu.graph(graph):
-            for _ in range(20):
-                launch(custom)
-        graphs[name] = graph
-    rounds = []
-    for trial in range(5):
-        row = {}
-        names = ("custom", "triton") if trial % 2 == 0 else ("triton", "custom")
-        for name in names:
-            for _ in range(3):
-                graphs[name].replay()
-            torch.npu.synchronize()
-            start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
-            start.record()
-            for _ in range(20):
-                graphs[name].replay()
-            end.record()
-            end.synchronize()
-            row[name] = start.elapsed_time(end) * 1000 / 400
-        rounds.append(row)
-    custom_us = statistics.median(row["custom"] for row in rounds)
-    triton_us = statistics.median(row["triton"] for row in rounds)
+    # do_bench times each launch with device events. Two orders, then the mean.
+    measured = {"custom": [], "triton": []}
+    for custom_first in (False, True):
+        order = (("custom", True), ("triton", False)) if custom_first else (("triton", False), ("custom", True))
+        for name, custom in order:
+            measured[name].append(triton.testing.do_bench(lambda custom=custom: launch(custom), return_mode="median"))
+    custom_us = sum(measured["custom"]) / len(measured["custom"]) * 1000
+    triton_us = sum(measured["triton"]) / len(measured["triton"]) * 1000
     print(f"[BENCH] cast_int4_to_fp16 {nbytes} bytes x {tiles} tiles: "
           f"custom {custom_us:.3f} us, triton {triton_us:.3f} us, "
-          f"triton/custom {triton_us / custom_us:.2f}x")
+          f"triton/custom {triton_us / custom_us:.2f}x "
+          f"rounds_ms={measured}")
 
 
 def _tensor(dtype, shape):
