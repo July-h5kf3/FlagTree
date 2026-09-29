@@ -291,6 +291,9 @@ class MACABackend(BaseBackend):
             metax.passes.ttgpuir.add_tritonmetaxgpu_optimize_cstore_pass(pm, opt.num_stages)
             passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
+        # Rewire load -> transpose -> dot graphs so MetaX can select the
+        # shared layout for the dot operand before pipeline lowering.
+        metax.passes.ttgpuir.add_tritonmetaxgpu_change_transop_graph_pass(pm)
         passes.common.add_cse(pm)
         passes.ttgpuir.add_fuse_nested_loops(pm)
         passes.common.add_canonicalizer(pm)

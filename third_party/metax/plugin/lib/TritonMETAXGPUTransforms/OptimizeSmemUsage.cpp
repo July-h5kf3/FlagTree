@@ -40,8 +40,15 @@ public:
       // TODO(MACA): support calculating cvtLayout smem usage and fallback to
       // low smem size cost algorithm
 
-      if (isa<ttg::MACAMmaEncodingAttr>(srcLayout) &&
-          isa<BlockedEncodingAttr>(dstLayout)) {
+      const bool isMmaToBlocked =
+          isa<ttg::MACAMmaEncodingAttr>(srcLayout) &&
+          isa<BlockedEncodingAttr>(dstLayout);
+      const bool isAttentionPToDot =
+          isa<ttg::LinearEncodingAttr>(srcLayout) &&
+          isa<ttg::DotOperandEncodingAttr>(dstLayout) &&
+          dstTy.getElementType().isF16() && dstTy.getShape() ==
+              ArrayRef<int64_t>({64, 128});
+      if (isMmaToBlocked || isAttentionPToDot) {
         OpBuilder builder(op->getContext());
         bool hasAttr = op->hasAttr(tt::AttrSharedMemForceNoVec);
         if (!hasAttr) {
