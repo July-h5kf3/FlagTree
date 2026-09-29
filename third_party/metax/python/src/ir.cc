@@ -370,7 +370,11 @@ PLUGIN_EXPORT void init_triton_ir(py::module &&m) {
            [](MLIRContext &self, bool v) { self.printOpOnDiagnostic(v); })
       .def("printStackTraceOnDiagnostic", [](MLIRContext &self, bool v) {
         self.printStackTraceOnDiagnostic(v);
-      });
+      })
+      .def_property(
+          "allow_unregistered_dialects",
+          [](MLIRContext &self) { return self.allowsUnregisteredDialects(); },
+          [](MLIRContext &self, bool v) { self.allowUnregisteredDialects(v); });
 
   py::class_<SourceMgrDiagnosticHandler>(m, "source_mgr_diag",
                                          py::module_local())
@@ -384,7 +388,7 @@ PLUGIN_EXPORT void init_triton_ir(py::module &&m) {
                     math::MathDialect, arith::ArithDialect, scf::SCFDialect,
                     ::mlir::gpu::GPUDialect, cf::ControlFlowDialect,
                     LLVM::LLVMDialect, mlir::ub::UBDialect,
-                    mlir::triton::gluon::GluonDialect>();
+                    func::FuncDialect, mlir::triton::gluon::GluonDialect>();
     mlir::LLVM::registerInlinerInterface(registry);
     registerBuiltinDialectTranslation(registry);
     registerLLVMDialectTranslation(registry);

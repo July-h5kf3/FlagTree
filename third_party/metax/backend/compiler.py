@@ -386,7 +386,27 @@ class MACABackend(BaseBackend):
     @staticmethod
     def make_llir(src, metadata, options, capability):
         mlir_opt_path = knobs.metax.mlir_opt_path
-        opted_mlir = metax.mlir_opt(src, mlir_opt_path)
+        if os.getenv("TRITON_CVT_WARP_SHUFFLE") == "1" or "warp_shuffle" in parse_option(options.scenario):
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".mlir") as source_file:
+                source_file.write(src)
+                source_file.flush()
+                context = ir.context()
+                context.allow_unregistered_dialects = True
+                ir.load_dialects(context)
+                metax.load_dialects(context)
+                if enable_dist:
+                    distributed.ir.load_dialects(context)
+                module = ir.parse_mlir_module(source_file.name, context)
+            pm = ir.pass_manager(context)
+            pm.enable_debug()
+            passes.convert.add_scf_to_cf(pm)
+            passes.convert.add_index_to_llvmir(pm)
+            passes.common.add_canonicalizer(pm)
+            pm.run(module, "warp_shuffle_mlir")
+            opted_mlir = str(module)
+        else:
+            opted_mlir = metax.mlir_opt(src, mlir_opt_path)
         mlir_translate_path = knobs.metax.mlir_translate_path
         llir = metax.translate_mlir_to_llir(opted_mlir, mlir_translate_path)
         if options.extern_libs:
