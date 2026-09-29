@@ -458,6 +458,12 @@ class MACABackend(BaseBackend):
                 compile_options += " -mllvm -metaxgpu-live-range-split=false"
         if ("noaddropt" in scenarios) or (os.getenv("TRITON_DISABLE_MACA_COMPILER_4G_ADDR_OPT")):
             compile_options = compile_options.replace("-mllvm -metaxgpu-aggressive-4g-addr-opt=true ", "")
+        if "regpressure" in scenarios:
+            # Override the basic pipeline default for kernels whose TTGIR has
+            # repeated shared-memory layout conversions.
+            compile_options += " -mllvm -metaxgpu-sched-regpressure=true "
+        if "minreg" in scenarios:
+            compile_options += " -mllvm -metaxgpu-sched-select=metaxgpu-minreg "
         return metax.translate_llvmir_to_mcfatbin(src, mxcc_arch, os.environ.get('MACA_PATH'), compile_options)
 
     def add_stages(self, stages, options, language):
