@@ -1122,6 +1122,11 @@ bool cvtReordersRegisters(RankedTensorType srcTy, RankedTensorType dstTy) {
 bool cvtNeedsWarpShuffle(RankedTensorType srcTy, RankedTensorType dstTy) {
   if (getenv("TRITON_CVT_WARP_SHUFFLE") == nullptr)
     return false;
+  // Keep FP32 running accumulators on the existing shared-memory path. The
+  // MetaX warp shuffle lowering currently cannot legalize the 64x64 FP32
+  // accumulator transpose; FP16 dot operands remain eligible.
+  if (srcTy.getElementType().isF32() || dstTy.getElementType().isF32())
+    return false;
   auto layout = minimalCvtLayout(srcTy, dstTy);
   MLIRContext *ctx = srcTy.getContext();
   auto kRegister = StringAttr::get(ctx, "register");
