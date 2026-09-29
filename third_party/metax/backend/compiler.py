@@ -241,7 +241,25 @@ class MACABackend(BaseBackend):
         passes.common.add_licm(pm)
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)
-        pm.run(mod, 'make_ttir')
+        if os.getenv("TRITON_CVT_WARP_SHUFFLE") == "1":
+            # The MACA shuffle intrinsic is emitted by later lowering and the
+            # generic inliner cannot process its outlined wrapper.
+            for pass_name, add_pass in (
+                ("rewrite_tensor_pointer", passes.ttir.add_rewrite_tensor_pointer),
+                ("combine", passes.ttir.add_combine),
+                ("canonicalizer", passes.common.add_canonicalizer),
+                ("reorder_broadcast", passes.ttir.add_reorder_broadcast),
+                ("cse", passes.common.add_cse),
+                ("licm", passes.common.add_licm),
+                ("symbol_dce", passes.common.add_symbol_dce),
+                ("loop_unroll", passes.ttir.add_loop_unroll),
+            ):
+                pass_manager = ir.pass_manager(mod.context)
+                pass_manager.enable_debug()
+                add_pass(pass_manager)
+                pass_manager.run(mod, f"make_ttir_{pass_name}")
+        else:
+            pm.run(mod, 'make_ttir')
         return mod
 
     @staticmethod
