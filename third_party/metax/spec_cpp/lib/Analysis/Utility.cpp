@@ -1125,7 +1125,9 @@ bool cvtNeedsWarpShuffle(RankedTensorType srcTy, RankedTensorType dstTy) {
   // Keep FP32 running accumulators on the existing shared-memory path. The
   // MetaX warp shuffle lowering currently cannot legalize the 64x64 FP32
   // accumulator transpose; FP16 dot operands remain eligible.
-  if (srcTy.getElementType().isF32() || dstTy.getElementType().isF32())
+  if (!srcTy.getElementType().isF16() || !dstTy.getElementType().isF16() ||
+      srcTy.getShape() != ArrayRef<int64_t>({64, 128}) ||
+      dstTy.getShape() != ArrayRef<int64_t>({128, 64}))
     return false;
   auto layout = minimalCvtLayout(srcTy, dstTy);
   MLIRContext *ctx = srcTy.getContext();
