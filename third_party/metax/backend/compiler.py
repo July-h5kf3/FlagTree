@@ -294,6 +294,9 @@ class MACABackend(BaseBackend):
         # Rewire load -> transpose -> dot graphs so MetaX can select the
         # shared layout for the dot operand before pipeline lowering.
         metax.passes.ttgpuir.add_tritonmetaxgpu_change_transop_graph_pass(pm)
+        # Mark the FP16 Linear->DotOperand conversion before generic layout
+        # removal lowers it to shared-memory allocation operations.
+        metax.passes.ttgpuir.add_tritonmetaxgpu_optimize_smem_usage(pm, reduce_smem_usage)
         passes.common.add_cse(pm)
         passes.ttgpuir.add_fuse_nested_loops(pm)
         passes.common.add_canonicalizer(pm)
