@@ -33,9 +33,17 @@ PLUGIN_EXPORT void init_triton_metax_passes_ttgpuir(py::module &&m) {
   m.def("add_builtin_func_to_llvmir", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::METAX::createConvertBuiltinFuncToLLVMPass());
   });
-  ADD_PASS_WRAPPER_4("add_accelerate_matmul",
-                     mlir::createTritonMETAXGPUAccelerateMatmulPass, int, bool,
-                     bool, int);
+  m.def(
+      "add_accelerate_matmul",
+      [](mlir::PassManager &pm, int numStages, bool disablePrefetch,
+         bool storeCoalesce, int capability, bool attentionQueryWarps) {
+        pm.addPass(mlir::createTritonMETAXGPUAccelerateMatmulPass(
+            numStages, disablePrefetch, storeCoalesce, capability,
+            attentionQueryWarps));
+      },
+      py::arg("pm"), py::arg("num_stages"), py::arg("disable_prefetch"),
+      py::arg("store_coalesce"), py::arg("capability"),
+      py::arg("attention_query_warps") = false);
   ADD_PASS_WRAPPER_4("add_pipeline_maca",
                      mlir::createTritonMETAXGPUPipelineMACAPass, int, int, bool,
                      bool);

@@ -281,7 +281,12 @@ class MACABackend(BaseBackend):
         if opt.pipeline == "cpasync" or opt.pipeline == "cpasync-mixed":
             disable_prefetch = True
             metax.passes.ttgpuir.add_tritonmetaxgpu_change_layout_for_int8_pass(pm, opt.num_stages, opt.pipeline)
-        metax.passes.ttgpuir.add_accelerate_matmul(pm, opt.num_stages, disable_prefetch, store_coalesce, capability)
+        attention_query_warps = "attention-query-warps" in scenarios
+        if attention_query_warps:
+            metax.passes.ttgpuir.add_accelerate_matmul(pm, opt.num_stages, disable_prefetch, store_coalesce, capability,
+                                                       True)
+        else:
+            metax.passes.ttgpuir.add_accelerate_matmul(pm, opt.num_stages, disable_prefetch, store_coalesce, capability)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         if not os.getenv("TRITON_DISABLE_CONSTANCY_LOAD_LAYOUT_OPT"):
             metax.passes.ttgpuir.add_tritonmetaxgpu_change_layout_for_constancy_load_layout(pm)

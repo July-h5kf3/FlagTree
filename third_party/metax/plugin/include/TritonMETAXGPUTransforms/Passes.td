@@ -27,7 +27,10 @@ def TritonMETAXGPUAccelerateMatmul : Pass<"tritonmetaxgpu-accelerate-matmul", "m
            "storeCoalesce">,
     Option<"computeCapability", "compute-capability",
            "int32_t", /*default*/"80",
-           "computeCapability">
+           "computeCapability">,
+    Option<"attentionQueryWarps", "attention-query-warps",
+           "bool", /*default*/"false",
+           "Distribute TN INT8 attention chains across query rows">
     ];
 }
 

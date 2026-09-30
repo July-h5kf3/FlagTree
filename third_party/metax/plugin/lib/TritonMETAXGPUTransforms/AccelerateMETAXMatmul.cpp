@@ -4,6 +4,7 @@
  */
 #include "TritonMETAXGPUTransforms/MACACommon.h"
 #include "TritonMETAXGPUTransforms/Passes.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -130,14 +131,17 @@ class BlockedToMMA : public mlir::RewritePattern {
   int numStages;
   int disablePrefetch;
   int storeCoalesce;
+  bool attentionQueryWarps;
 
 public:
   BlockedToMMA(mlir::MLIRContext *context, int computeCapability, int dotCnt,
-               int numStages, bool disablePrefetch, bool storeCoalesce)
+               int numStages, bool disablePrefetch, bool storeCoalesce,
+               bool attentionQueryWarps)
       : mlir::RewritePattern(triton::DotOp::getOperationName(), 2, context),
         computeCapability(computeCapability), dotCnt(dotCnt),
         numStages(numStages), disablePrefetch(disablePrefetch),
-        storeCoalesce(storeCoalesce) {}
+        storeCoalesce(storeCoalesce), attentionQueryWarps(attentionQueryWarps) {
+  }
 
   mlir::LogicalResult
   matchAndRewrite(mlir::Operation *op,
@@ -245,6 +249,48 @@ public:
           }
         }
       }
+      if (attentionQueryWarps && isa<scf::ForOp>(parentOp) &&
+          (numWarps == 2 || numWarps == 4) && n == 16 * numWarps) {
+        auto filter = [&dotOp](Operation *operation) {
+          return operation->getParentRegion() == dotOp->getParentRegion();
+        };
+        bool hasTNInt8Dot = false;
+        bool hasHalfDot = false;
+        bool hasExp2 = false;
+        for (Operation *operation : mlir::getSlice(dotOp, {filter})) {
+          if (auto chainDot = dyn_cast<triton::DotOp>(operation)) {
+            Type inputType = chainDot.getA().getType().getElementType();
+            if (inputType.isInteger(8) &&
+                chainDot.getType().getShape()[1] == n) {
+              auto chainMma = dyn_cast<ttg::MACAMmaEncodingAttr>(
+                  chainDot.getType().getEncoding());
+              if (chainMma) {
+                hasTNInt8Dot |=
+                    chainMma.getWarpsPerCTA() ==
+                    ArrayRef<unsigned>({1, static_cast<unsigned>(numWarps)});
+              } else {
+                auto chainA = chainDot.getA().getDefiningOp<ConvertLayoutOp>();
+                auto chainB = chainDot.getB().getDefiningOp<ConvertLayoutOp>();
+                hasTNInt8Dot |= chainA && chainB &&
+                                ArrayRef<unsigned>(getOrder(chainA)) ==
+                                    ArrayRef<unsigned>({1, 0}) &&
+                                ArrayRef<unsigned>(getOrder(chainB)) ==
+                                    ArrayRef<unsigned>({0, 1});
+              }
+            }
+            hasHalfDot |= inputType.isF16();
+          } else {
+            hasExp2 |= isa<math::Exp2Op>(operation);
+          }
+        }
+        if (hasTNInt8Dot && hasHalfDot && hasExp2) {
+          // Keeping a complete query row in one warp avoids cross-warp
+          // softmax reductions and the following probability redistribution.
+          warpsPerTile = {1, static_cast<unsigned>(numWarps)};
+          elemsPerThread = getDefaultElemsPerThread(elementTy, enableTf32,
+                                                    computeCapability);
+        }
+      }
       enableALdsTrans = getIfLdsTrans(elemsPerThread, versionMajor_,
                                       versionMinor_, aorder, true, elemATy);
       enableBLdsTrans = getIfLdsTrans(elemsPerThread, versionMajor_,
@@ -315,11 +361,13 @@ public:
   TritonMETAXGPUAccelerateMatmulPass() = default;
   TritonMETAXGPUAccelerateMatmulPass(int numStages, bool disablePrefetch,
                                      bool storeCoalesce,
-                                     int computeCapability = 80) {
+                                     int computeCapability = 80,
+                                     bool attentionQueryWarps = false) {
     this->computeCapability = computeCapability;
     this->numStages = numStages;
     this->disablePrefetch = disablePrefetch;
     this->storeCoalesce = storeCoalesce;
+    this->attentionQueryWarps = attentionQueryWarps;
   }
 
   void runOnOperation() override {
@@ -333,7 +381,8 @@ public:
     mlir::RewritePatternSet patterns(context);
     // TODO: support chain dot & multi dot
     patterns.add<::BlockedToMMA>(context, computeCapability, /*dot_cut=*/1,
-                                 numStages, disablePrefetch, storeCoalesce);
+                                 numStages, disablePrefetch, storeCoalesce,
+                                 attentionQueryWarps);
     if (applyPatternsGreedily(m, std::move(patterns)).failed()) {
       signalPassFailure();
     }
@@ -342,7 +391,8 @@ public:
 
 std::unique_ptr<Pass> mlir::createTritonMETAXGPUAccelerateMatmulPass(
     int numStages, bool disablePrefetch, bool storeCoalesce,
-    int computeCapability) {
+    int computeCapability, bool attentionQueryWarps) {
   return std::make_unique<TritonMETAXGPUAccelerateMatmulPass>(
-      numStages, disablePrefetch, storeCoalesce, computeCapability);
+      numStages, disablePrefetch, storeCoalesce, computeCapability,
+      attentionQueryWarps);
 }

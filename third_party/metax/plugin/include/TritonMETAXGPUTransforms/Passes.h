@@ -7,7 +7,7 @@ namespace mlir {
 
 std::unique_ptr<Pass> createTritonMETAXGPUAccelerateMatmulPass(
     int numStages = 2, bool disablePrefetch = false, bool storeCoalesce = false,
-    int computeCapability = 80);
+    int computeCapability = 80, bool attentionQueryWarps = false);
 
 std::unique_ptr<Pass> createTritonMETAXGPUPipelineMACAPass(
     int numStages = 2, int pipelineLoadNum = -1, bool isFullStage = false,
