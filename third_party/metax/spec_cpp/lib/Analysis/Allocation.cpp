@@ -35,7 +35,7 @@ namespace triton {
 unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
 #ifdef USE_MACA
                                        RankedTensorType dstTy,
-                                       bool force_no_vec) {
+                                       bool force_no_vec, bool fullVScratch) {
 #else
                                        RankedTensorType dstTy) {
 #endif
@@ -47,8 +47,8 @@ unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
   auto bitwidth = getBitwidth(srcTy);
 
 #ifdef USE_MACA
-  auto smem =
-      gpu::optimalSwizzlingLdSt(srcLayout, dstLayout, bitwidth, force_no_vec);
+  auto smem = gpu::optimalSwizzlingLdSt(srcLayout, dstLayout, bitwidth,
+                                        force_no_vec, fullVScratch);
 #else
   auto smem = gpu::optimalSwizzlingLdSt(srcLayout, dstLayout, bitwidth);
 #endif
@@ -108,7 +108,10 @@ unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op) {
     // The generic pass uses swizzling
 #ifdef USE_MACA
     bool force_no_vec = op->hasAttr(AttrSharedMemForceNoVec);
-    auto elems = getNumScratchElemsSwizzledCvt(srcTy, dstTy, force_no_vec);
+    bool fullVScratch =
+        op->getParentOfType<ModuleOp>()->hasAttr(AttrAttentionFullVScratch);
+    auto elems =
+        getNumScratchElemsSwizzledCvt(srcTy, dstTy, force_no_vec, fullVScratch);
 #else
     auto elems = getNumScratchElemsSwizzledCvt(srcTy, dstTy);
 #endif

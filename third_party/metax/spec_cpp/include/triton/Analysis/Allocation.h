@@ -23,7 +23,8 @@ unsigned defaultAllocationAnalysisScratchSizeFn(Operation *op);
 unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
 #ifdef USE_MACA
                                        RankedTensorType dstTy,
-                                       bool forceNoVectorize = false);
+                                       bool forceNoVectorize = false,
+                                       bool fullVScratch = false);
 #else
                                        RankedTensorType dstTy);
 #endif

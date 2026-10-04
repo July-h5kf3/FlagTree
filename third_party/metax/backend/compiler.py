@@ -281,6 +281,15 @@ class MACABackend(BaseBackend):
         if opt.pipeline == "cpasync" or opt.pipeline == "cpasync-mixed":
             disable_prefetch = True
             metax.passes.ttgpuir.add_tritonmetaxgpu_change_layout_for_int8_pass(pm, opt.num_stages, opt.pipeline)
+        if "attention-wide-query-warps" in scenarios:
+            mod.set_attr("mxg.attention_wide_query_warps", ir.builder(mod.context).get_unit_attr())
+            attention_query_warps = True
+        else:
+            attention_query_warps = "attention-query-warps" in scenarios
+        if "attention-short-query-scales" in scenarios:
+            mod.set_attr("mxg.attention_short_query_warps", ir.builder(mod.context).get_unit_attr())
+            attention_query_warps = True
+        mod.set_attr("mxg.attention_query_warps", ir.builder(mod.context).get_bool_attr(attention_query_warps))
         metax.passes.ttgpuir.add_accelerate_matmul(pm, opt.num_stages, disable_prefetch, store_coalesce, capability)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         if not os.getenv("TRITON_DISABLE_CONSTANCY_LOAD_LAYOUT_OPT"):
@@ -340,6 +349,10 @@ class MACABackend(BaseBackend):
 
     @staticmethod
     def make_mlir(src, metadata, options, capability):
+        metadata["attention_wide_query_warps"] = src.get_int_attr("mxg.attention_wide_query_warps_applied") or 0
+        metadata["attention_short_query_warps"] = src.get_int_attr("mxg.attention_short_query_warps_applied") or 0
+        if "attention-full-v-scratch" in parse_option(options.scenario):
+            src.set_attr("mxg.attention_full_v_scratch", ir.builder(src.context).get_unit_attr())
         # warp-specialization mutates num_warps
         num_warp_groups = src.get_int_attr("triton_gpu.num-warp-groups-per-cta")
         if num_warp_groups is not None:
@@ -458,6 +471,17 @@ class MACABackend(BaseBackend):
                 compile_options += " -mllvm -metaxgpu-live-range-split=false"
         if ("noaddropt" in scenarios) or (os.getenv("TRITON_DISABLE_MACA_COMPILER_4G_ADDR_OPT")):
             compile_options = compile_options.replace("-mllvm -metaxgpu-aggressive-4g-addr-opt=true ", "")
+        wide_attention = "attention-wide-query-warps" in scenarios and metadata["attention_wide_query_warps"]
+        short_attention = ("attention-short-query-scales" in scenarios and opt.num_stages == 1
+                           and metadata.get("attention_short_query_warps", 0))
+        if opt.pipeline == "basic" and (wide_attention or short_attention):
+            compile_options = compile_options.replace("-metaxgpu-sched-regpressure=false",
+                                                      "-metaxgpu-sched-regpressure=true")
+            compile_options += " -mllvm -metaxgpu-slp-vectorize-i8=true"
+            if (wide_attention and "attention-wide-4g-address" in scenarios and "noaddropt" not in scenarios
+                    and not os.getenv("TRITON_DISABLE_MACA_COMPILER_4G_ADDR_OPT")
+                    and not metadata.get("global_scratch_size", 0) and not metadata.get("profile_scratch_size", 0)):
+                compile_options += " -mllvm -metaxgpu-aggressive-4g-addr-opt=true"
         return metax.translate_llvmir_to_mcfatbin(src, mxcc_arch, os.environ.get('MACA_PATH'), compile_options)
 
     def add_stages(self, stages, options, language):

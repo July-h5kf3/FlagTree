@@ -11,6 +11,7 @@ class LinearLayout;
 class TargetInfoBase;
 #ifdef USE_MACA
 constexpr char AttrSharedMemForceNoVec[] = "mxg.shared_mem_force_no_vec";
+constexpr char AttrAttentionFullVScratch[] = "mxg.attention_full_v_scratch";
 #endif
 } // namespace mlir::triton
 
@@ -50,7 +51,8 @@ LinearLayout optimalSwizzlingLdSt(const LinearLayout &src,
 #ifdef USE_MACA
 
                                   const LinearLayout &dst, int32_t bitwidth,
-                                  bool forceNoVec = false
+                                  bool forceNoVec = false,
+                                  bool fullVScratch = false
 #else
                                   const LinearLayout &dst, int32_t bitwidth
 #endif

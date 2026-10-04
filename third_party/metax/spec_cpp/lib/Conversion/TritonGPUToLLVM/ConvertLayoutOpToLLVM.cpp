@@ -113,7 +113,8 @@ struct ConvertLayoutOpConversion
   SmallVector<Value> transferWithinBlockSwizzlingImpl(
       Location loc, ConversionPatternRewriter &rewriter,
       const LinearLayout &srcLayout, const LinearLayout &dstLayout,
-      ArrayRef<Value> inVals, Type llvmElemTy, Value smemBase) const {
+      ArrayRef<Value> inVals, Type llvmElemTy, Value smemBase,
+      bool fullVScratch) const {
     auto *ctx = rewriter.getContext();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     // We handle transformations recursively as they all need a preprocessing
@@ -125,9 +126,9 @@ struct ConvertLayoutOpConversion
       auto newInVals = llvm::to_vector(llvm::map_range(inVals, [&](Value v) {
         return b.ptrtoint(llvmElemTyPtr, v).getResult();
       }));
-      auto outVals =
-          transferWithinBlockSwizzlingImpl(loc, rewriter, srcLayout, dstLayout,
-                                           newInVals, llvmElemTyPtr, smemBase);
+      auto outVals = transferWithinBlockSwizzlingImpl(
+          loc, rewriter, srcLayout, dstLayout, newInVals, llvmElemTyPtr,
+          smemBase, fullVScratch);
       for (auto &v : outVals) {
         v = b.inttoptr(llvmElemTy, v);
       }
@@ -141,7 +142,8 @@ struct ConvertLayoutOpConversion
       auto newInVals = llvm::to_vector(llvm::map_range(
           inVals, [&](Value v) { return b.zext(i8ElemTy, v).getResult(); }));
       auto outVals = transferWithinBlockSwizzlingImpl(
-          loc, rewriter, srcLayout, dstLayout, newInVals, i8ElemTy, smemBase);
+          loc, rewriter, srcLayout, dstLayout, newInVals, i8ElemTy, smemBase,
+          fullVScratch);
       for (auto &v : outVals) {
         v = b.trunc(llvmElemTy, v);
       }
@@ -154,7 +156,8 @@ struct ConvertLayoutOpConversion
       auto prmtSrc = removeBroadcastSrc.apply(srcLayout);
       auto newInVals = removeBroadcastSrc.apply(inVals);
       return transferWithinBlockSwizzlingImpl(loc, rewriter, prmtSrc, dstLayout,
-                                              newInVals, llvmElemTy, smemBase);
+                                              newInVals, llvmElemTy, smemBase,
+                                              fullVScratch);
     }
 
     // Remove broadcasting in dst
@@ -162,14 +165,20 @@ struct ConvertLayoutOpConversion
     if (!removeBroadcastDst.isIdentity()) {
       auto prmtDst = removeBroadcastDst.apply(dstLayout);
       auto outVals = transferWithinBlockSwizzlingImpl(
-          loc, rewriter, srcLayout, prmtDst, inVals, llvmElemTy, smemBase);
+          loc, rewriter, srcLayout, prmtDst, inVals, llvmElemTy, smemBase,
+          fullVScratch);
       return broadcastAs(outVals, dstLayout);
     }
 
     // At this point we have a type that's at least 8-bit
     // and we don't have broadcasting in the registers
     auto bitwidth = llvmElemTy.getIntOrFloatBitWidth();
+#ifdef USE_MACA
+    auto smem = optimalSwizzlingLdSt(srcLayout, dstLayout, bitwidth, false,
+                                     fullVScratch);
+#else
     auto smem = optimalSwizzlingLdSt(srcLayout, dstLayout, bitwidth);
+#endif
 
     // Extract reps from smem
     auto kReg = str_attr("register");
@@ -249,6 +258,18 @@ struct ConvertLayoutOpConversion
     auto kReg = str_attr("register");
     auto kLane = str_attr("lane");
     auto kWarp = str_attr("warp");
+    bool fullVScratch = false;
+#ifdef USE_MACA
+    auto kBlock = str_attr("block");
+    // Allocation checks the original block bases; preserve that restriction
+    // before removing the block dimension for within-CTA lowering.
+    fullVScratch =
+        op->getParentOfType<ModuleOp>()->hasAttr(AttrAttentionFullVScratch) &&
+        (!srcLayout.hasInDim(kBlock) ||
+         srcLayout.getBases().lookup(kBlock).empty()) &&
+        (!dstLayout.hasInDim(kBlock) ||
+         dstLayout.getBases().lookup(kBlock).empty());
+#endif
     srcLayout = srcLayout.sublayout({kReg, kLane, kWarp},
                                     to_vector(srcLayout.getOutDimNames()));
     dstLayout = dstLayout.sublayout({kReg, kLane, kWarp},
@@ -259,7 +280,8 @@ struct ConvertLayoutOpConversion
         LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op.getOperation());
     auto inVals = unpackLLElements(loc, src, rewriter);
     auto outVals = transferWithinBlockSwizzlingImpl(
-        loc, rewriter, srcLayout, dstLayout, inVals, llvmElemTy, smemBase);
+        loc, rewriter, srcLayout, dstLayout, inVals, llvmElemTy, smemBase,
+        fullVScratch);
 
     Value result =
         packLLElements(loc, getTypeConverter(), outVals, rewriter, dstTy);

@@ -47,6 +47,20 @@ public:
     if (!cvtEncoding)
       return failure();
 
+    // Keep thread-local MACA operand permutations in registers. In particular,
+    // a transposed attention probability tile can differ only in register
+    // order.
+    auto mma = dyn_cast<MACAMmaEncodingAttr>(cvtEncoding.getParent());
+    if (mma && mma.getVersionMajor() == 2 && !mma.getIsATrans() &&
+        !mma.getIsBTrans() && cvtEncoding.getOpIdx() == 1 &&
+        isa<LinearEncodingAttr>(cvtOp.getSrc().getType().getEncoding())) {
+      auto conversion =
+          minimalCvtLayout(cvtOp.getSrc().getType(), sharedLoadTy);
+      auto dims = llvm::to_vector(conversion.getInDimNames());
+      if (dims.empty() || (dims.size() == 1 && dims.front() == "register"))
+        return failure();
+    }
+
     // Set needTrans to true here. newInnerCvtEnc is computed based on
     // argEncoding which is before the transpose. Without needTrans we will
     // compute vec and maxPhase based on incorrect m, n and k size of mma. The

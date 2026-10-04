@@ -4,6 +4,7 @@
  */
 #include "TritonMETAXGPUTransforms/MACACommon.h"
 #include "TritonMETAXGPUTransforms/Passes.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -243,6 +244,82 @@ public:
                       mlir::IntegerType::get(mod.getContext(), 32), 1));
             }
           }
+        }
+      }
+      auto attention =
+          mod->getAttrOfType<mlir::BoolAttr>("mxg.attention_query_warps");
+      bool attentionQueryWarps = attention && attention.getValue();
+      bool wideAttention =
+          mod->hasAttr("mxg.attention_wide_query_warps") && numWarps == 4 &&
+          n == 128 &&
+          ((m == 64 && k == 128 && elemATy.isInteger(8) &&
+            elemBTy.isInteger(8)) ||
+           (m == 128 && k == 64 && elemATy.isF16() && elemBTy.isF16()));
+      if (attentionQueryWarps && isa<scf::ForOp>(parentOp) &&
+          (numWarps == 2 || numWarps == 4 || numWarps == 8) &&
+          (n == 16 * numWarps || wideAttention)) {
+        auto filter = [&dotOp](Operation *operation) {
+          return operation->getParentRegion() == dotOp->getParentRegion();
+        };
+        bool hasTNInt8Dot = false;
+        bool hasHalfDot = false;
+        bool hasExp2 = false;
+        bool hasShortQK = false;
+        bool hasShortPV = false;
+        for (Operation *operation : mlir::getSlice(dotOp, {filter})) {
+          if (auto chainDot = dyn_cast<triton::DotOp>(operation)) {
+            Type inputType = chainDot.getA().getType().getElementType();
+            auto chainAType = cast<RankedTensorType>(chainDot.getA().getType());
+            auto chainBType = cast<RankedTensorType>(chainDot.getB().getType());
+            auto chainShape = chainDot.getType().getShape();
+            hasShortQK |= inputType.isInteger(8) &&
+                          chainBType.getElementType().isInteger(8) &&
+                          chainShape == ArrayRef<int64_t>({64, 64}) &&
+                          chainAType.getShape()[1] == 128;
+            hasShortPV |= inputType.isF16() &&
+                          chainBType.getElementType().isF16() &&
+                          chainShape == ArrayRef<int64_t>({128, 64}) &&
+                          chainAType.getShape()[1] == 64;
+            if (inputType.isInteger(8) && chainShape[1] == n) {
+              hasTNInt8Dot |= wideAttention && chainShape[0] == 64 &&
+                              chainAType.getShape()[1] == 128;
+              auto chainMma = dyn_cast<ttg::MACAMmaEncodingAttr>(
+                  chainDot.getType().getEncoding());
+              if (chainMma) {
+                hasTNInt8Dot |=
+                    chainMma.getWarpsPerCTA() ==
+                    ArrayRef<unsigned>({1, static_cast<unsigned>(numWarps)});
+              } else {
+                auto chainA = chainDot.getA().getDefiningOp<ConvertLayoutOp>();
+                auto chainB = chainDot.getB().getDefiningOp<ConvertLayoutOp>();
+                hasTNInt8Dot |= chainA && chainB &&
+                                ArrayRef<unsigned>(getOrder(chainA)) ==
+                                    ArrayRef<unsigned>({1, 0}) &&
+                                ArrayRef<unsigned>(getOrder(chainB)) ==
+                                    ArrayRef<unsigned>({0, 1});
+              }
+            }
+            hasHalfDot |= inputType.isF16();
+          } else {
+            hasExp2 |= isa<math::Exp2Op>(operation);
+          }
+        }
+        if (hasTNInt8Dot && hasHalfDot && hasExp2) {
+          auto applied = mlir::IntegerAttr::get(
+              mlir::IntegerType::get(mod.getContext(), 32), 1);
+          if (wideAttention) {
+            mod->setAttr("mxg.attention_wide_query_warps_applied", applied);
+          }
+          if (mod->hasAttr("mxg.attention_short_query_warps") &&
+              numWarps == 4 && this->numStages == 1 && n == 64 && hasShortQK &&
+              hasShortPV) {
+            mod->setAttr("mxg.attention_short_query_warps_applied", applied);
+          }
+          // Keeping a complete query row in one warp avoids cross-warp
+          // softmax reductions and the following probability redistribution.
+          warpsPerTile = {1, static_cast<unsigned>(numWarps)};
+          elemsPerThread = getDefaultElemsPerThread(elementTy, enableTf32,
+                                                    computeCapability);
         }
       }
       enableALdsTrans = getIfLdsTrans(elemsPerThread, versionMajor_,

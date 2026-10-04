@@ -457,7 +457,7 @@ LinearLayout optimalSwizzlingLdSt(const LinearLayout &src,
                                   const LinearLayout &dst, int32_t bitwidth
 #ifdef USE_MACA
                                   ,
-                                  bool forceNoVec
+                                  bool forceNoVec, bool fullVScratch
 #endif
 ) {
   auto *ctx = src.getInDimNames().begin()->getContext();
@@ -563,8 +563,34 @@ LinearLayout optimalSwizzlingLdSt(const LinearLayout &src,
   auto tileSrc = to_vector(ArrayRef(laneSrc).drop_back(log2Vec));
   auto tileDst = to_vector(ArrayRef(laneDst).drop_back(log2Vec));
 #endif
+  int32_t leaveReps = 0;
+#ifdef USE_MACA
+  auto shape = src.getOutDims();
+  auto kWarp = StringAttr::get(ctx, "warp");
+  auto kBlock = StringAttr::get(ctx, "block");
+  bool matchesFullV =
+      fullVScratch && !forceNoVec && bitwidth == 16 && shape.size() == 2 &&
+      shape[0].second == 64 && shape[1].second == 128 &&
+      dst.getOutDims() == shape &&
+      ArrayRef<int32_t>(regSrc) == ArrayRef<int32_t>({1, 2, 4, 2048, 4096}) &&
+      ArrayRef<int32_t>(regDst) ==
+          ArrayRef<int32_t>({1, 2, 16, 32, 1024, 2048, 4096}) &&
+      ArrayRef<int32_t>(laneSrc) ==
+          ArrayRef<int32_t>({8, 16, 32, 64, 128, 256}) &&
+      ArrayRef<int32_t>(laneDst) ==
+          ArrayRef<int32_t>({64, 128, 256, 512, 4, 8}) &&
+      ArrayRef<int32_t>(flatten(srcFlat, kWarp)) ==
+          ArrayRef<int32_t>({512, 1024}) &&
+      ArrayRef<int32_t>(flatten(dstFlat, kWarp)) == ArrayRef<int32_t>({0, 0}) &&
+      (!srcFlat.hasInDim(kBlock) || flatten(srcFlat, kBlock).empty()) &&
+      (!dstFlat.hasInDim(kBlock) || flatten(dstFlat, kBlock).empty());
+  // Keep both halves of the attention V tile in shared memory. Reusing the
+  // scratch for two repetitions makes the first half live in registers while
+  // the second half is stored, preventing its loads from sinking to the MMA.
+  leaveReps = matchesFullV ? 1 : 0;
+#endif
   auto smem = optimalSwizzling(srcFlat, dstFlat, bitwidth, vbasis, tileSrc,
-                               tileDst, src.getOutDims());
+                               tileDst, src.getOutDims(), leaveReps);
 
   // We might be able to vectorise a bit more the load or the store
   // This may happen when there is broadcasting
