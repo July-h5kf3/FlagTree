@@ -61,15 +61,15 @@ bash python/triton/experimental/tle/language/dsa/ascend/custom_ops/build_custom_
 
 ## Provenance and scope
 
-The C++ implementations copy the applicable dtype branches from the CANN 9.1
-SDK sources listed below. CANN tensor descriptors are flattened to the custom-op
+The C++ implementations specialize the applicable dtype branches from the CANN
+9.1 SDK sources listed below. CANN tensor descriptors are flattened to the custom-op
 ABI, and dtype dispatch is resolved by each fixed-type entry. Cube entries are
 compiled for `dav-c220-cube`, and Cast entries for `dav-c220-vec`, so the SDK core
 guards are resolved at build time. SDK debug/overflow checks and TSCM dispatch
 are outside this explicit-address interface. The caller supplies valid addresses,
 strides and buffer capacities.
 
-| C++ entry | Copied CANN source under `aarch64-linux/asc/impl/` | Leaf intrinsic (compiler declaration line) |
+| C++ entry | Corresponding CANN source under `aarch64-linux/asc/impl/` | Leaf intrinsic (compiler declaration line) |
 | --- | --- | --- |
 | `data_copy_nd2nz_i8` | `basic_api/dav_c220/kernel_operator_data_copy_impl.h:245-258`: INT8 branch of `DataCopyGM2L1ND2NZImplBase` | `copy_gm_to_cbuf_multi_nd2nz_b8` (981) |
 | `load_data_2d_int8_b` | `basic_api/dav_c220/kernel_operator_mm_impl.h:50-68`: INT8 branch of `LoadData2DL12L0BCal` | `load_cbuf_to_cb` (1385) |
@@ -80,6 +80,20 @@ strides and buffer capacities.
 | `copy_l0c2gm_i32` | `c_api/instr_impl/npu_arch_2201/cube_datamove_impl/asc_copy_l0c2gm_impl.h:174-182`: INT32-to-INT32 overload | `copy_matrix_cc_to_gm` (1013) |
 | `cast_fp32_to_int16` | `basic_api/dav_c220/kernel_operator_vec_vconv_impl.h:801-828,585-609`: count masking/strides and rounding modes 1-5 | `vconv_f322s16{a,c,f,r,z}` (2575-2583), mask intrinsics below |
 | `cast_fp16_to_int8` | `basic_api/dav_c220/kernel_operator_vec_vconv_impl.h:801-828,163-187`: count masking/strides and rounding modes 1-5 | `vconv_f162s8{a,c,f,r,z}` (2519-2527), mask intrinsics below |
+
+The `data_copy_nd2nz_i8`, `copy_l0c2gm_i32`, and `load_data_2d_int8_b`
+entries explicitly pack the instruction parameters and use the short intrinsic
+overloads. Their bit layouts were reconstructed from the CANN 9.1 dav-c220
+compiler's generated LLVM IR, rather than copied from an AscendC C++ packing
+function. The corresponding long-argument SDK calls above provide the reference.
+All masks preserve the original lowering's truncation, and boolean fields retain
+C++ nonzero-to-true conversion. The public custom-op signatures are unchanged.
+
+| Short intrinsic | Packed fields (`[high:low]`) |
+| --- | --- |
+| `copy_gm_to_cbuf_multi_nd2nz_b8(dst, src, shape_config, stride_config)` | `shape_config`: sid=0 `[3:0]`, ndNum `[15:4]`, nValue `[31:16]`, dValue `[47:32]`, srcNdMatrixStride `[63:48]`; `stride_config`: srcDValue `[15:0]`, dstNzC0Stride `[31:16]`, dstNzNStride `[47:32]`, dstNzMatrixStride `[63:48]` |
+| `copy_matrix_cc_to_gm(dst, src, shape_config, control_config)` | `shape_config`: sid=0 `[3:0]`, n_size `[15:4]`, m_size `[31:16]`, dst_stride_dst_d `[63:32]`; `control_config`: src_stride `[15:0]`, unit_flag_mode `[33:32]`, quant_pre `[38:34]`, relu_pre `[41:39]`, channel_split `[42]`, nz2nd_en `[43]` |
+| `load_cbuf_to_cb(dst, src, config, transpose, inc)` | `config`: startIndex `[15:0]`, repeatTimes `[23:16]`, srcStride `[39:24]`, sid `[43:40]`, dstGap `[59:44]`; transpose remains a branch-selected immediate, and addrMode remains unused as in the dav-c220 SDK |
 
 Compiler declaration lines refer to CANN 9.1.0
 `tools/bisheng_compiler/lib/clang/15.0.5/include/cce_aicore_intrinsics.h`.
@@ -93,7 +107,8 @@ alias or its `__builtin_cce_` name selects the same compiler builtin.
 In particular, CANN's INT8 `DataCopyGM2L1ND2NZImplBase` branch directly invokes
 `copy_gm_to_cbuf_multi_nd2nz_b8` with the fields of `Nd2NzParams`. Its INT32
 `asc_copy_l0c2gm_impl` overload directly invokes `copy_matrix_cc_to_gm` with
-`sid=0` and the `QuantMode_t` cast retained here. The compiled custom entries
+`sid=0` and a `QuantMode_t` cast. The expanded form preserves the resulting
+five-bit quantization field. The compiled custom entries
 contain `llvm.hivm.MOV.OUT.TO.L1.MULTI.ND2NZ.s8` and
 `llvm.hivm.FIX.L0C.TO.OUT.s32`, respectively. All nine entries were checked in
 the linked bitcode: their calls target `llvm.hivm.*` instructions and LLVM

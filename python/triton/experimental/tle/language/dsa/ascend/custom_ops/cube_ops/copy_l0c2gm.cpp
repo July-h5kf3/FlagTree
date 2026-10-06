@@ -23,9 +23,8 @@ _mlir_ciface_set_l0c_copy_params(int32_t nd_num, int32_t src_nd_stride,
   set_nd_para(config);
 }
 
-// Copied CANN 9.1 npu_arch_2201/cube_datamove_impl/asc_copy_l0c2gm_impl.h:
-// asc_copy_l0c2gm_impl, INT32 to INT32 overload (lines 174-182).
-// copy_matrix_cc_to_gm is a compiler builtin alias (see PRIMITIVES.md).
+// CANN 9.1 asc_copy_l0c2gm_impl, INT32 to INT32 overload. Register packing
+// is expanded from the dav-c220 compiler lowering; see PRIMITIVES.md.
 // Full Fixpipe tiling, quantization setup and barriers are outside this ABI.
 extern "C" __aicore__ __attribute__((always_inline)) void
 _mlir_ciface_copy_l0c2gm_i32(uint64_t dst_address, uint32_t src_address,
@@ -34,11 +33,17 @@ _mlir_ciface_copy_l0c2gm_i32(uint64_t dst_address, uint32_t src_address,
                              int32_t unit_flag_mode, uint64_t quant_pre,
                              int32_t relu_pre, int32_t channel_split,
                              int32_t nz2nd_en) {
+  // sid occupies bits [3:0] and is fixed to zero by the CANN overload.
+  uint64_t shape_config = ((uint64_t(n_size) & 0xFFF) << 4) |
+                          ((uint64_t(m_size) & 0xFFFF) << 16) |
+                          ((uint64_t(dst_stride_dst_d) & 0xFFFFFFFF) << 32);
+  uint64_t control_config =
+      (uint64_t(src_stride) & 0xFFFF) |
+      ((uint64_t(unit_flag_mode) & 0x3) << 32) | ((quant_pre & 0x1F) << 34) |
+      ((uint64_t(relu_pre) & 0x7) << 39) |
+      (uint64_t(bool(channel_split)) << 42) | (uint64_t(bool(nz2nd_en)) << 43);
   copy_matrix_cc_to_gm(
       reinterpret_cast<__gm__ int32_t *>(dst_address),
-      reinterpret_cast<__cc__ int32_t *>((uint64_t)src_address), 0,
-      (uint16_t)n_size, (uint16_t)m_size, (uint32_t)dst_stride_dst_d,
-      (uint16_t)src_stride, (uint8_t)unit_flag_mode,
-      static_cast<QuantMode_t>(quant_pre), (uint8_t)relu_pre,
-      (bool)channel_split, (bool)nz2nd_en);
+      reinterpret_cast<__cc__ int32_t *>((uint64_t)src_address), shape_config,
+      control_config);
 }
