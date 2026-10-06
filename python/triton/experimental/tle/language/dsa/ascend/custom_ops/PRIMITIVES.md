@@ -12,7 +12,7 @@ padding, and synchronization. No attention loop or softmax is implemented here.
 | `cube_load3d_a_into` | `LoadData3DV2L12L0ACal` | L1 to L0A |
 | `cube_load2d_b_into` | `LoadData2DL12L0BCal` | L1 to L0B |
 | `cube_load_transpose_b_into` | `LoadData2DL12L0BTransposeCal` | L1 to L0B |
-| `cube_mmad_into` | `asc_mmad_impl`, INT8 to INT32 | L0A/L0B to L0C |
+| `cube_mmad_into` | `MmadCal`, INT8 to INT32, no bias | L0A/L0B to L0C |
 | `cube_set_l0c_copy_params` | `SetFixpipeNz2ndFlagImpl` | Fixpipe configuration |
 | `cube_copy_l0c2gm_i32` | `asc_copy_l0c2gm_impl`, INT32 to INT32 | L0C to GM |
 
@@ -75,25 +75,19 @@ strides and buffer capacities.
 | `load_data_2d_int8_b` | `basic_api/dav_c220/kernel_operator_mm_impl.h:50-68`: INT8 branch of `LoadData2DL12L0BCal` | `load_cbuf_to_cb` (1385) |
 | `load_data_transpose_int8_b` | `basic_api/dav_c220/kernel_operator_mm_impl.h:163-176`: INT8 branch of `LoadData2DL12L0BTransposeCal` | `load_cbuf_to_cb_transpose` (1395) |
 | `load_data_3d_int8_a` | `basic_api/kernel_operator_mm_base_impl.h:173-178` and `basic_api/dav_c220/kernel_operator_mm_impl.h:191-209,424-441,462-475`: FMatrix/padding setup and INT8 Load3D | `set_fmatrix` (2079), `set_padding` (2279), `img2colv2_cbuf_to_ca` (1349) |
-| `mmad_int8` | `c_api/instr_impl/npu_arch_2201/cube_compute_impl/asc_mmad_impl.h:146-154`: INT8 no-offset overload | `mad` (1451), called as `__builtin_cce_mad` |
+| `mmad_int8` | `basic_api/dav_c220/kernel_operator_mm_impl.h:341-362`: INT8 branch of `MmadCal`, with `isBias=false` | `mad` (1451) |
 | `set_l0c_copy_params` | `basic_api/dav_c220/kernel_operator_fixpipe_impl.h:65-75`: `SetFixpipeNz2ndFlagImpl` register packing | `set_nd_para` (2269) |
 | `copy_l0c2gm_i32` | `c_api/instr_impl/npu_arch_2201/cube_datamove_impl/asc_copy_l0c2gm_impl.h:174-182`: INT32-to-INT32 overload | `copy_matrix_cc_to_gm` (1013) |
 | `cast_fp32_to_int16` | `basic_api/dav_c220/kernel_operator_vec_vconv_impl.h:801-828,585-609`: count masking/strides and rounding modes 1-5 | `vconv_f322s16{a,c,f,r,z}` (2575-2583), mask intrinsics below |
 | `cast_fp16_to_int8` | `basic_api/dav_c220/kernel_operator_vec_vconv_impl.h:801-828,163-187`: count masking/strides and rounding modes 1-5 | `vconv_f162s8{a,c,f,r,z}` (2519-2527), mask intrinsics below |
 
-The `data_copy_nd2nz_i8`, `copy_l0c2gm_i32`, and `load_data_2d_int8_b`
-entries explicitly pack the instruction parameters and use the short intrinsic
-overloads. Their bit layouts were reconstructed from the CANN 9.1 dav-c220
-compiler's generated LLVM IR, rather than copied from an AscendC C++ packing
-function. The corresponding long-argument SDK calls above provide the reference.
-All masks preserve the original lowering's truncation, and boolean fields retain
-C++ nonzero-to-true conversion. The public custom-op signatures are unchanged.
-
-| Short intrinsic | Packed fields (`[high:low]`) |
-| --- | --- |
-| `copy_gm_to_cbuf_multi_nd2nz_b8(dst, src, shape_config, stride_config)` | `shape_config`: sid=0 `[3:0]`, ndNum `[15:4]`, nValue `[31:16]`, dValue `[47:32]`, srcNdMatrixStride `[63:48]`; `stride_config`: srcDValue `[15:0]`, dstNzC0Stride `[31:16]`, dstNzNStride `[47:32]`, dstNzMatrixStride `[63:48]` |
-| `copy_matrix_cc_to_gm(dst, src, shape_config, control_config)` | `shape_config`: sid=0 `[3:0]`, n_size `[15:4]`, m_size `[31:16]`, dst_stride_dst_d `[63:32]`; `control_config`: src_stride `[15:0]`, unit_flag_mode `[33:32]`, quant_pre `[38:34]`, relu_pre `[41:39]`, channel_split `[42]`, nz2nd_en `[43]` |
-| `load_cbuf_to_cb(dst, src, config, transpose, inc)` | `config`: startIndex `[15:0]`, repeatTimes `[23:16]`, srcStride `[39:24]`, sid `[43:40]`, dstGap `[59:44]`; transpose remains a branch-selected immediate, and addrMode remains unused as in the dav-c220 SDK |
+The implementations retain the named, typed intrinsic calls in the official
+source, as do the Sort32 and MrgSort custom ops. The ND2NZ and Load2D entries
+copy their AscendC dtype branches; the L0C-to-GM entry copies the INT32 C API
+implementation because its explicit-address contract matches this interface.
+No instruction-register layouts are reconstructed from compiler-generated IR.
+The ABI conversion casts reproduce the types of the SDK parameter fields;
+Load2D retains the two branches required for its transpose immediate.
 
 Compiler declaration lines refer to CANN 9.1.0
 `tools/bisheng_compiler/lib/clang/15.0.5/include/cce_aicore_intrinsics.h`.
@@ -104,22 +98,27 @@ The existing MrgSort custom op's `vmrgsort4` is also such an alias (2699).
 These declarations do not forward to a CANN C++ function body. Calling the
 alias or its `__builtin_cce_` name selects the same compiler builtin.
 
-In particular, CANN's INT8 `DataCopyGM2L1ND2NZImplBase` branch directly invokes
-`copy_gm_to_cbuf_multi_nd2nz_b8` with the fields of `Nd2NzParams`. Its INT32
-`asc_copy_l0c2gm_impl` overload directly invokes `copy_matrix_cc_to_gm` with
-`sid=0` and a `QuantMode_t` cast. The expanded form preserves the resulting
-five-bit quantization field. The compiled custom entries
-contain `llvm.hivm.MOV.OUT.TO.L1.MULTI.ND2NZ.s8` and
-`llvm.hivm.FIX.L0C.TO.OUT.s32`, respectively. All nine entries were checked in
-the linked bitcode: their calls target `llvm.hivm.*` instructions and LLVM
-lifetime markers, with no calls to AscendC API functions.
+CANN's INT8 `DataCopyGM2L1ND2NZImplBase` branch consists of the
+`copy_gm_to_cbuf_multi_nd2nz_b8` intrinsic with the fields of `Nd2NzParams`.
+Its INT32 `asc_copy_l0c2gm_impl` overload consists of the
+`copy_matrix_cc_to_gm` intrinsic with `sid=0` and a `QuantMode_t` cast.
+These are compiler-provided hardware instructions, not AscendC API wrappers
+with another C++ implementation to inline. The custom ops do not call
+`AscendC::DataCopy`, `AscendC::LoadData`, `AscendC::Mmad`, `AscendC::Fixpipe`,
+or the `asc_*` C API functions.
 
-`copy_l0c2gm_i32` covers the low-level C API overload above. It does not implement
-the full AscendC `Fixpipe` contract. `FixpipeInfoParams` stride conversion,
-`GenFixpipeTiling`, quantization-table transfers and internal pipeline barriers
-are outside this interface; ND configuration is exposed separately through
-`set_l0c_copy_params`. Callers provide instruction-level sizes/strides and perform
-the required setup and synchronization.
+`copy_l0c2gm_i32` retains the low-level C API contract. It is not a complete
+AscendC `Fixpipe` overload. In particular, the CANN 9.1
+`basic_api/dav_c220/kernel_operator_fixpipe_v2_impl.h:58-81,219-240,368-392`
+defines the `FixpipeParamsV220` INT32-to-INT32 path. It accepts only
+`NoQuant`, disallows channel splitting,
+sets ND parameters for row-major output, and issues a `PIPE_FIX` barrier
+before the same `copy_matrix_cc_to_gm` instruction. Its `nSize`, `mSize`,
+`srcStride`, and `dstStride` already use instruction-level units; the older
+`FixpipeParams` overload has additional burst/gap conversions. Replacing the
+current entry with either complete overload would change its contract.
+ND configuration therefore remains in `set_l0c_copy_params`, and setup and
+synchronization remain the caller's responsibility.
 
 For MMA, `basic_api/dav_c220/kernel_operator_mm_impl.h:341-360` contains
 `MmadCal`. Its INT8 branch has the same leaf call as `asc_mmad_impl` when

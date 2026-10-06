@@ -11,25 +11,26 @@
  */
 #include "Utils.h"
 
-// CANN 9.1 LoadData2DL12L0BCal, INT8 branch. Register packing is expanded
-// from the dav-c220 compiler lowering; see PRIMITIVES.md.
+// Copied INT8 branch of CANN 9.1 dav_c220/kernel_operator_mm_impl.h:
+// LoadData2DL12L0BCal (lines 50-68).
 extern "C" __aicore__ __attribute__((always_inline)) void
 _mlir_ciface_load_data_2d_int8_b(uint32_t src_address, int32_t startIndex,
                                  int32_t repeatTimes, int32_t srcStride,
                                  int32_t sid, int32_t dstGap,
                                  int32_t ifTranspose, int32_t addrMode,
                                  uint32_t dst_address) {
-  uint64_t config =
-      (uint64_t(startIndex) & 0xFFFF) | ((uint64_t(repeatTimes) & 0xFF) << 16) |
-      ((uint64_t(srcStride) & 0xFFFF) << 24) |
-      ((uint64_t(dstGap) & 0xFFFF) << 44) | ((uint64_t(sid) & 0xF) << 40);
-  auto *dst = reinterpret_cast<__cb__ int8_t *>((uint64_t)dst_address);
-  auto *src = reinterpret_cast<__cbuf__ int8_t *>((uint64_t)src_address);
-  // The transpose operand must remain an immediate; dav-c220 uses inc.
   if (ifTranspose) {
-    load_cbuf_to_cb(dst, src, config, 1, inc);
+    load_cbuf_to_cb(reinterpret_cast<__cb__ int8_t *>((uint64_t)dst_address),
+                    reinterpret_cast<__cbuf__ int8_t *>((uint64_t)src_address),
+                    (uint16_t)startIndex, (uint8_t)repeatTimes,
+                    (uint16_t)srcStride, (uint16_t)dstGap, (uint8_t)sid, 1,
+                    inc);
   } else {
-    load_cbuf_to_cb(dst, src, config, 0, inc);
+    load_cbuf_to_cb(reinterpret_cast<__cb__ int8_t *>((uint64_t)dst_address),
+                    reinterpret_cast<__cbuf__ int8_t *>((uint64_t)src_address),
+                    (uint16_t)startIndex, (uint8_t)repeatTimes,
+                    (uint16_t)srcStride, (uint16_t)dstGap, (uint8_t)sid, 0,
+                    inc);
   }
 }
 

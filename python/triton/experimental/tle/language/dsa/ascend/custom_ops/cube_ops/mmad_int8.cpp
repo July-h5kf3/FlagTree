@@ -11,18 +11,15 @@
  */
 #include "Utils.h"
 
-// Copied from CANN 9.1 asc_mmad_impl.h:146-154, INT8/no-offset overload.
-// MmadCal in dav_c220/kernel_operator_mm_impl.h:341-360 has the same
-// INT8 path when isBias=false. mad is the __builtin_cce_mad compiler alias
-// (cce_aicore_intrinsics.h:1451); use that builtin directly here.
+// Copied INT8 branch of CANN 9.1 dav_c220/kernel_operator_mm_impl.h:
+// MmadCal (lines 341-362), specialized for isBias=false.
 extern "C" __aicore__ __attribute__((always_inline)) void
 _mlir_ciface_mmad_int8(uint32_t a_address, uint32_t b_address,
                        int32_t left_height, int32_t n_dim, int32_t right_width,
                        int32_t unit_flag, int32_t k_direction_align,
                        int32_t c_matrix_source, int32_t c_matrix_init_val,
                        uint32_t c_address) {
-  __builtin_cce_mad(
-      reinterpret_cast<__cc__ int32_t *>((uint64_t)c_address),
+  mad(reinterpret_cast<__cc__ int32_t *>((uint64_t)c_address),
       reinterpret_cast<__ca__ int8_t *>((uint64_t)a_address),
       reinterpret_cast<__cb__ int8_t *>((uint64_t)b_address),
       static_cast<uint16_t>(left_height), static_cast<uint16_t>(n_dim),
