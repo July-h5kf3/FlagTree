@@ -904,7 +904,12 @@ setup(
         # Pre-built custom-op bitcode, required at runtime by
         # triton/experimental/tle/language/dsa/ascend/custom_ops/registry.py.
         # Same convention as triton/backends/*/lib/libdevice.10.bc.
-        "triton.experimental.tle.language.dsa.ascend.custom_ops": ["custom_ops.bc"],
+        "triton.experimental.tle.language.dsa.ascend.custom_ops": [
+            "custom_ops.bc",
+            "LICENSE.CANN",
+            "PRIMITIVES.md",
+            "primitives_sources.json",
+        ],
     },
     entry_points=get_entry_points(),
     include_package_data=True,
