@@ -1,5 +1,12 @@
 # Copyright 2026 FlagOS Contributors
 # SPDX-License-Identifier: Apache-2.0
+"""CANN dav-c220 Cube primitives for al.scope(core_mode="cube").
+
+GM addresses are uint64 byte addresses; local addresses are uint32 byte offsets.
+Sizes and strides follow the corresponding CANN overload. The caller owns local
+buffers, bounds, padding, ND writeback setup, and pipeline synchronization.
+These primitives do not allocate buffers or insert barriers.
+"""
 
 import triton.language as tl
 import triton.language.extra.cann.extension as al
