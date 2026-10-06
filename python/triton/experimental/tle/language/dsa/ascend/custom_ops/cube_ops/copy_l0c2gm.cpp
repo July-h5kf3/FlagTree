@@ -25,6 +25,8 @@ _mlir_ciface_set_l0c_copy_params(int32_t nd_num, int32_t src_nd_stride,
 
 // Copied CANN 9.1 npu_arch_2201/cube_datamove_impl/asc_copy_l0c2gm_impl.h:
 // asc_copy_l0c2gm_impl, INT32 to INT32 overload (lines 174-182).
+// copy_matrix_cc_to_gm is a compiler builtin alias (see PRIMITIVES.md).
+// Full Fixpipe tiling, quantization setup and barriers are outside this ABI.
 extern "C" __aicore__ __attribute__((always_inline)) void
 _mlir_ciface_copy_l0c2gm_i32(uint64_t dst_address, uint32_t src_address,
                              int32_t n_size, int32_t m_size,

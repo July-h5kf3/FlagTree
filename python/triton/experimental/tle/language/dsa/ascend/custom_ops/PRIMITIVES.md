@@ -25,7 +25,6 @@ Use `al.scope(core_mode="cube")` for Cube work. Configure L0C writeback before
 copying results. Issue TLE pipeline events between producer and consumer
 operations; the primitives do not insert barriers or allocate local buffers.
 
-
 ## Cast
 
 `cast_fp32_to_int16` and `cast_fp16_to_int8` expose the CANN Cast count overload:
@@ -70,26 +69,46 @@ guards are resolved at build time. SDK debug/overflow checks and TSCM dispatch
 are outside this explicit-address interface. The caller supplies valid addresses,
 strides and buffer capacities.
 
-| Source under `aarch64-linux/asc/impl/` | Copied implementation |
-| --- | --- |
-| `basic_api/dav_c220/kernel_operator_data_copy_impl.h:245-258` | `DataCopyGM2L1ND2NZImplBase`, INT8 branch |
-| `basic_api/dav_c220/kernel_operator_mm_impl.h:50-68,163-176` | `LoadData2DL12L0BCal`, `LoadData2DL12L0BTransposeCal`, INT8 branches |
-| `basic_api/kernel_operator_mm_base_impl.h:173-178` and `basic_api/dav_c220/kernel_operator_mm_impl.h:191-209,424-441,462-475` | Load3D FMatrix/padding setup and INT8 L1-to-L0A instruction |
-| `c_api/instr_impl/npu_arch_2201/cube_compute_impl/asc_mmad_impl.h:146-154` | INT8 no-offset `asc_mmad_impl` overload |
-| `basic_api/dav_c220/kernel_operator_fixpipe_impl.h:65-75` | `SetFixpipeNz2ndFlagImpl` register packing |
-| `c_api/instr_impl/npu_arch_2201/cube_datamove_impl/asc_copy_l0c2gm_impl.h:174-182` | INT32-to-INT32 `asc_copy_l0c2gm_impl` overload |
-| `basic_api/dav_c220/kernel_operator_vec_vconv_impl.h:801-828,163-187,585-609` | `CastImpl` count masking/strides and `CastIntrinsicsImpl` modes 1-5 |
+| C++ entry | Copied CANN source under `aarch64-linux/asc/impl/` | Leaf intrinsic (compiler declaration line) |
+| --- | --- | --- |
+| `data_copy_nd2nz_i8` | `basic_api/dav_c220/kernel_operator_data_copy_impl.h:245-258`: INT8 branch of `DataCopyGM2L1ND2NZImplBase` | `copy_gm_to_cbuf_multi_nd2nz_b8` (981) |
+| `load_data_2d_int8_b` | `basic_api/dav_c220/kernel_operator_mm_impl.h:50-68`: INT8 branch of `LoadData2DL12L0BCal` | `load_cbuf_to_cb` (1385) |
+| `load_data_transpose_int8_b` | `basic_api/dav_c220/kernel_operator_mm_impl.h:163-176`: INT8 branch of `LoadData2DL12L0BTransposeCal` | `load_cbuf_to_cb_transpose` (1395) |
+| `load_data_3d_int8_a` | `basic_api/kernel_operator_mm_base_impl.h:173-178` and `basic_api/dav_c220/kernel_operator_mm_impl.h:191-209,424-441,462-475`: FMatrix/padding setup and INT8 Load3D | `set_fmatrix` (2079), `set_padding` (2279), `img2colv2_cbuf_to_ca` (1349) |
+| `mmad_int8` | `c_api/instr_impl/npu_arch_2201/cube_compute_impl/asc_mmad_impl.h:146-154`: INT8 no-offset overload | `mad` (1451), called as `__builtin_cce_mad` |
+| `set_l0c_copy_params` | `basic_api/dav_c220/kernel_operator_fixpipe_impl.h:65-75`: `SetFixpipeNz2ndFlagImpl` register packing | `set_nd_para` (2269) |
+| `copy_l0c2gm_i32` | `c_api/instr_impl/npu_arch_2201/cube_datamove_impl/asc_copy_l0c2gm_impl.h:174-182`: INT32-to-INT32 overload | `copy_matrix_cc_to_gm` (1013) |
+| `cast_fp32_to_int16` | `basic_api/dav_c220/kernel_operator_vec_vconv_impl.h:801-828,585-609`: count masking/strides and rounding modes 1-5 | `vconv_f322s16{a,c,f,r,z}` (2575-2583), mask intrinsics below |
+| `cast_fp16_to_int8` | `basic_api/dav_c220/kernel_operator_vec_vconv_impl.h:801-828,163-187`: count masking/strides and rounding modes 1-5 | `vconv_f162s8{a,c,f,r,z}` (2519-2527), mask intrinsics below |
 
-For MMA, the corresponding AscendC `MmadCal` implementation is at
-`basic_api/dav_c220/kernel_operator_mm_impl.h:341-360`. Its INT8 path ends in
-`mad(c, a, b, m, k, n, unitFlag, kDirectionAlign, cmatrixSource, cmatrixInitVal)`;
-for this no-bias interface, `isBias=false`, so `cmatrixInitVal` is unchanged.
-CANN's compiler header `tools/bisheng_compiler/lib/clang/15.0.5/include/cce_aicore_intrinsics.h:1451`
-declares `mad` as a `clang_builtin_alias` of `__builtin_cce_mad`.
-`mmad_int8.cpp` calls that builtin directly. There is no C++ matrix-multiply
-loop behind this overload to copy; the builtin emits the Cube instruction.
-The other entries likewise retain the leaf instructions from their CANN source
-bodies, as the existing MrgSort custom op retains `vmrgsort4`.
+Compiler declaration lines refer to CANN 9.1.0
+`tools/bisheng_compiler/lib/clang/15.0.5/include/cce_aicore_intrinsics.h`.
+Each listed intrinsic is declared as `clang_builtin_alias(__builtin_cce_<name>)`.
+The Cast mask intrinsics are `set_mask_count` (2243), `set_mask_norm` (2245),
+and `set_vector_mask` (2317); they use the same declaration mechanism.
+The existing MrgSort custom op's `vmrgsort4` is also such an alias (2699).
+These declarations do not forward to a CANN C++ function body. Calling the
+alias or its `__builtin_cce_` name selects the same compiler builtin.
+
+In particular, CANN's INT8 `DataCopyGM2L1ND2NZImplBase` branch directly invokes
+`copy_gm_to_cbuf_multi_nd2nz_b8` with the fields of `Nd2NzParams`. Its INT32
+`asc_copy_l0c2gm_impl` overload directly invokes `copy_matrix_cc_to_gm` with
+`sid=0` and the `QuantMode_t` cast retained here. The compiled custom entries
+contain `llvm.hivm.MOV.OUT.TO.L1.MULTI.ND2NZ.s8` and
+`llvm.hivm.FIX.L0C.TO.OUT.s32`, respectively. All nine entries were checked in
+the linked bitcode: their calls target `llvm.hivm.*` instructions and LLVM
+lifetime markers, with no calls to AscendC API functions.
+
+`copy_l0c2gm_i32` covers the low-level C API overload above. It does not implement
+the full AscendC `Fixpipe` contract. `FixpipeInfoParams` stride conversion,
+`GenFixpipeTiling`, quantization-table transfers and internal pipeline barriers
+are outside this interface; ND configuration is exposed separately through
+`set_l0c_copy_params`. Callers provide instruction-level sizes/strides and perform
+the required setup and synchronization.
+
+For MMA, `basic_api/dav_c220/kernel_operator_mm_impl.h:341-360` contains
+`MmadCal`. Its INT8 branch has the same leaf call as `asc_mmad_impl` when
+`isBias=false`. There is no C++ matrix-multiply loop behind that overload.
 
 Source hashes are recorded in `primitives_sources.json`; paths are relative to
 the CANN installation root. The C++ files retain Huawei's copyright notices and are
