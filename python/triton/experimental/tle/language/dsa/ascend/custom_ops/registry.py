@@ -1,4 +1,14 @@
 # Copyright 2026- Xcoresigma Technology Co., Ltd
+# Copyright 2026 FlagOS Contributors
+"""Custom-op registrations sharing custom_ops.bc.
+
+The cube_* entries run in al.scope(core_mode="cube"). Their GM addresses are
+uint64 byte addresses; local addresses are uint32 byte offsets.
+Sizes and strides follow the corresponding CANN overload. The caller owns local
+buffers, bounds, padding, ND writeback setup, and pipeline synchronization.
+These primitives do not allocate buffers or insert barriers.
+"""
+
 from pathlib import Path
 
 import triton.language as tl
@@ -250,3 +260,148 @@ class unpack_sort:
         self.symbol = "custom_unpack_sort_float"
         self.bitcode = CUSTOM_OPS_BITCODE
         self.extra_buffers = [(tl.float16, 0)]
+
+
+@al.register_custom_op
+class cube_mmad_into:
+    core = al.CORE.CUBE
+    pipe = al.PIPE.PIPE_M
+    mode = al.MODE.SIMD
+
+    def __init__(self, src_a: tl.uint32, src_b: tl.uint32, left_height, n_dim, right_width, unit_flag,
+                 k_direction_align, c_matrix_source, c_matrix_init_val, dst: tl.uint32):
+        self.symbol = "mmad_int8"
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
+@al.register_custom_op
+class cube_load2d_b_into:
+    core = al.CORE.CUBE
+    pipe = al.PIPE.PIPE_MTE1
+    mode = al.MODE.SIMD
+
+    def __init__(self, src: tl.uint32, startIndex, repeatTimes, srcStride, sid, dstGap, ifTranspose, addrMode,
+                 dst: tl.uint32):
+        self.symbol = "load_data_2d_int8_b"
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
+@al.register_custom_op
+class cube_load3d_a_into:
+    core = al.CORE.CUBE
+    pipe = al.PIPE.PIPE_MTE1
+    mode = al.MODE.SIMD
+
+    def __init__(self, src: tl.uint32, padList, l1H, l1W, channelSize, kExtension, mExtension, kStartPt, mStartPt,
+                 strideW, strideH, filterW, filterH, dilationFilterW, dilationFilterH, enTranspose, enSmallK, padValue,
+                 filterSizeW, filterSizeH, fMatrixCtrl, isSetFMatrix, isSetPadding, dst: tl.uint32):
+        self.symbol = "load_data_3d_int8_a"
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
+@al.register_custom_op
+class cube_set_l0c_copy_params:
+    core = al.CORE.CUBE
+    pipe = al.PIPE.PIPE_S
+    mode = al.MODE.SIMD
+
+    def __init__(self, nd_num, src_nd_stride, dst_nd_stride):
+        self.symbol = "set_l0c_copy_params"
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
+@al.register_custom_op
+class cube_copy_l0c2gm_i32:
+    core = al.CORE.CUBE
+    pipe = al.PIPE.PIPE_FIX
+    mode = al.MODE.SIMD
+
+    def __init__(self, dst: tl.uint64, src: tl.uint32, n_size, m_size, dst_stride_dst_d, src_stride, unit_flag_mode,
+                 quant_pre: tl.uint64, relu_pre, channel_split, nz2nd_en):
+        self.symbol = "copy_l0c2gm_i32"
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
+@al.register_custom_op
+class cube_nd2nz_i8:
+    core = al.CORE.CUBE
+    pipe = al.PIPE.PIPE_MTE2
+    mode = al.MODE.SIMD
+
+    def __init__(self, dst: tl.uint32, src: tl.uint64, ndNum, nValue, dValue, srcNdMatrixStride, srcDValue,
+                 dstNzC0Stride, dstNzNStride, dstNzMatrixStride):
+        self.symbol = "data_copy_nd2nz_i8"
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
+@al.register_custom_op
+class cube_load_transpose_b_into:
+    core = al.CORE.CUBE
+    pipe = al.PIPE.PIPE_MTE1
+    mode = al.MODE.SIMD
+
+    def __init__(self, src: tl.uint32, startIndex, repeatTimes, srcStride, dstGap, dstFracGap, addrMode,
+                 dst: tl.uint32):
+        self.symbol = "load_data_transpose_int8_b"
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
+def validate_cast(src, out, src_dtype, dst_dtype, roundMode, count):
+    assert src.dtype == src_dtype and len(src.shape) == 1, "Cast requires a 1D source of the declared dtype"
+    assert out is not None, "Cast requires an output buffer"
+    assert out.dtype == dst_dtype and len(out.shape) == 1, "Cast requires a 1D output of the declared dtype"
+    capacity = src.numel.value
+    assert capacity >= 32 and capacity & (capacity - 1) == 0, "Cast capacity must be a power of two of at least 32"
+    assert out.numel.value == capacity, "Cast source and output capacities must match"
+    assert isinstance(roundMode,
+                      int) and roundMode in (1, 2, 3, 4, 5), "Cast supports RINT/FLOOR/CEIL/ROUND/TRUNC (1..5)"
+    assert isinstance(count,
+                      int) and 0 < count <= capacity, "Cast count must be a compile-time integer in [1, capacity]"
+
+
+@al.register_custom_op
+class cast_fp32_to_int16:
+    """CANN Cast(dst, src, roundMode, count), float32 to int16.
+
+    All scalar parameters of the count overload are exposed. Modes are
+    1=RINT (ties to even), 2=FLOOR, 3=CEIL, 4=ROUND (ties away from zero),
+    5=TRUNC. Source and required out are contiguous, 32-byte aligned,
+    disjoint 1D UB tensors with equal power-of-two capacity of at least 32; UB fit is the caller's responsibility.
+    Elements at or beyond count retain their previous out values.
+    The caller must supply finite values representable after rounding.
+    Mask count mode is restored to normal/all lanes; no barrier is added.
+    """
+    core = al.CORE.VECTOR
+    pipe = al.PIPE.PIPE_V
+    mode = al.MODE.SIMD
+
+    def __init__(self, src, roundMode, count, out=None):
+        validate_cast(src, out, tl.float32, tl.int16, roundMode, count)
+        self.arg_type["roundMode"] = tl.int32
+        self.arg_type["count"] = tl.uint32
+        self.symbol = "cast_fp32_to_int16"
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
+@al.register_custom_op
+class cast_fp16_to_int8:
+    """CANN Cast(dst, src, roundMode, count), float16 to int8.
+
+    All scalar parameters of the count overload are exposed. Modes are
+    1=RINT (ties to even), 2=FLOOR, 3=CEIL, 4=ROUND (ties away from zero),
+    5=TRUNC. Source and required out are contiguous, 32-byte aligned,
+    disjoint 1D UB tensors with equal power-of-two capacity of at least 32; UB fit is the caller's responsibility.
+    Elements at or beyond count retain their previous out values.
+    The caller must supply finite values representable after rounding.
+    Mask count mode is restored to normal/all lanes; no barrier is added.
+    """
+    core = al.CORE.VECTOR
+    pipe = al.PIPE.PIPE_V
+    mode = al.MODE.SIMD
+
+    def __init__(self, src, roundMode, count, out=None):
+        validate_cast(src, out, tl.float16, tl.int8, roundMode, count)
+        self.arg_type["roundMode"] = tl.int32
+        self.arg_type["count"] = tl.uint32
+        self.symbol = "cast_fp16_to_int8"
+        self.bitcode = CUSTOM_OPS_BITCODE
