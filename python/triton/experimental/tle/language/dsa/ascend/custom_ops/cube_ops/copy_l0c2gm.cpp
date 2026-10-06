@@ -11,7 +11,8 @@
  */
 #include "Utils.h"
 
-// CANN 9.1 SetFixpipeNz2ndFlagImpl / set_l0c_copy_params_impl.
+// Copied CANN 9.1 dav_c220/kernel_operator_fixpipe_impl.h:
+// SetFixpipeNz2ndFlagImpl (lines 65-75).
 extern "C" __aicore__ __attribute__((always_inline)) void
 _mlir_ciface_set_l0c_copy_params(int32_t nd_num, int32_t src_nd_stride,
                                  int32_t dst_nd_stride) {
@@ -22,7 +23,8 @@ _mlir_ciface_set_l0c_copy_params(int32_t nd_num, int32_t src_nd_stride,
   set_nd_para(config);
 }
 
-// CANN 9.1 asc_copy_l0c2gm_impl, INT32 to INT32 overload, npu_arch_2201.
+// Copied CANN 9.1 npu_arch_2201/cube_datamove_impl/asc_copy_l0c2gm_impl.h:
+// asc_copy_l0c2gm_impl, INT32 to INT32 overload (lines 174-182).
 extern "C" __aicore__ __attribute__((always_inline)) void
 _mlir_ciface_copy_l0c2gm_i32(uint64_t dst_address, uint32_t src_address,
                              int32_t n_size, int32_t m_size,

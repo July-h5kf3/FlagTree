@@ -11,7 +11,8 @@
  */
 #include "Utils.h"
 
-// CANN 9.1 dav_c220 DataCopyGM2L1ND2NZImplBase<T>, INT8 specialization.
+// Copied INT8 branch of CANN 9.1 dav_c220/kernel_operator_data_copy_impl.h:
+// DataCopyGM2L1ND2NZImplBase (lines 245-258).
 extern "C" __aicore__ __attribute__((always_inline)) void
 _mlir_ciface_data_copy_nd2nz_i8(uint32_t dst_address, uint64_t src_address,
                                 int32_t ndNum, int32_t nValue, int32_t dValue,

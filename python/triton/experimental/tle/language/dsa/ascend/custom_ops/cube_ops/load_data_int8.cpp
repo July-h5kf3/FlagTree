@@ -11,7 +11,8 @@
  */
 #include "Utils.h"
 
-// CANN 9.1 dav_c220 LoadData2DL12L0BCal, INT8 specialization.
+// Copied INT8 branch of CANN 9.1 dav_c220/kernel_operator_mm_impl.h:
+// LoadData2DL12L0BCal (lines 50-68).
 extern "C" __aicore__ __attribute__((always_inline)) void
 _mlir_ciface_load_data_2d_int8_b(uint32_t src_address, int32_t startIndex,
                                  int32_t repeatTimes, int32_t srcStride,
@@ -33,8 +34,10 @@ _mlir_ciface_load_data_2d_int8_b(uint32_t src_address, int32_t startIndex,
   }
 }
 
-// CANN 9.1 LoadDataImpl / Load3DSetFMatrixCal / Load3DSetPaddingCal /
-// LoadData3DV2L12L0ACal. Scope: INT8, L1 to L0A, dav_c220.
+// Copied INT8 branches of CANN 9.1 kernel_operator_mm_base_impl.h:173-178
+// and dav_c220/kernel_operator_mm_impl.h:191-209,424-441,462-475
+// (LoadDataImpl, LoadData3DV2L12L0ACal, Load3DSetFMatrixCal,
+// Load3DSetPaddingCal).
 extern "C" __aicore__ __attribute__((always_inline)) void
 _mlir_ciface_load_data_3d_int8_a(
     uint32_t src_address, int32_t pad0, int32_t pad1, int32_t pad2,
@@ -79,7 +82,8 @@ _mlir_ciface_load_data_3d_int8_a(
       (bool)fMatrixCtrl, (uint16_t)channelSize);
 }
 
-// CANN 9.1 LoadData2DL12L0BTransposeCal, INT8 specialization.
+// Copied INT8 branch of CANN 9.1 dav_c220/kernel_operator_mm_impl.h:
+// LoadData2DL12L0BTransposeCal (lines 163-176).
 extern "C" __aicore__ __attribute__((always_inline)) void
 _mlir_ciface_load_data_transpose_int8_b(uint32_t src_address,
                                         int32_t startIndex, int32_t repeatTimes,

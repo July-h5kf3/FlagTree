@@ -11,8 +11,9 @@
  */
 #include "Utils.h"
 
-// CANN 9.1 dav_c220 CastImpl count overload and its float -> int16_t
-// specialization.
+// Copied CANN 9.1 dav_c220/kernel_operator_vec_vconv_impl.h:
+// CastImpl count overload (801-828) and CastIntrinsicsImpl (585-609), modes
+// 1-5.
 extern "C" __aicore__ __attribute__((always_inline)) void
 _mlir_ciface_cast_fp32_to_int16(memref_t<__ubuf__ float, 1> *source,
                                 int32_t round_mode, uint32_t count,
