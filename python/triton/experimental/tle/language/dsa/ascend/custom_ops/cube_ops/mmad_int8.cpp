@@ -27,3 +27,16 @@ _mlir_ciface_mmad_int8(uint32_t a_address, uint32_t b_address,
       static_cast<bool>(k_direction_align), static_cast<bool>(c_matrix_source),
       static_cast<bool>(c_matrix_init_val));
 }
+
+extern "C" __aicore__ __attribute__((always_inline)) void _mlir_ciface_mmad_f16(
+    uint32_t a_address, uint32_t b_address, int32_t left_height, int32_t n_dim,
+    int32_t right_width, int32_t unit_flag, int32_t k_direction_align,
+    int32_t c_matrix_source, int32_t c_matrix_init_val, uint32_t c_address) {
+  mad(reinterpret_cast<__cc__ float *>((uint64_t)c_address),
+      reinterpret_cast<__ca__ half *>((uint64_t)a_address),
+      reinterpret_cast<__cb__ half *>((uint64_t)b_address),
+      static_cast<uint16_t>(left_height), static_cast<uint16_t>(n_dim),
+      static_cast<uint16_t>(right_width), static_cast<uint8_t>(unit_flag),
+      static_cast<bool>(k_direction_align), static_cast<bool>(c_matrix_source),
+      static_cast<bool>(c_matrix_init_val));
+}

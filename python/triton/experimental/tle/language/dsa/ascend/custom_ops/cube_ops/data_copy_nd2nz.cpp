@@ -27,3 +27,17 @@ _mlir_ciface_data_copy_nd2nz_i8(uint32_t dst_address, uint64_t src_address,
       (uint16_t)srcDValue, (uint16_t)dstNzC0Stride, (uint16_t)dstNzNStride,
       (uint16_t)dstNzMatrixStride);
 }
+
+extern "C" __aicore__ __attribute__((always_inline)) void
+_mlir_ciface_data_copy_nd2nz_f16(uint32_t dst_address, uint64_t src_address,
+                                 int32_t ndNum, int32_t nValue, int32_t dValue,
+                                 int32_t srcNdMatrixStride, int32_t srcDValue,
+                                 int32_t dstNzC0Stride, int32_t dstNzNStride,
+                                 int32_t dstNzMatrixStride) {
+  copy_gm_to_cbuf_multi_nd2nz_b16(
+      reinterpret_cast<__cbuf__ half *>((uint64_t)dst_address),
+      reinterpret_cast<__gm__ half *>(src_address), 0, (uint16_t)ndNum,
+      (uint16_t)nValue, (uint16_t)dValue, (uint16_t)srcNdMatrixStride,
+      (uint16_t)srcDValue, (uint16_t)dstNzC0Stride, (uint16_t)dstNzNStride,
+      (uint16_t)dstNzMatrixStride);
+}

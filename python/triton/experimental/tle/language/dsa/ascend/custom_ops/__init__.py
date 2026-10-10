@@ -8,6 +8,11 @@ from .common import (
 )
 # 面向用户的 custom op
 from .registry import (
+    cube_nd2nz_f16,
+    cube_load2d_f16_b_into,
+    cube_load3d_f16_a_into,
+    cube_mmad_f16_into,
+    cube_copy_l0c2gm_f32,
     cube_nd2nz_i8,
     cube_load3d_a_into,
     cube_load2d_b_into,
@@ -17,7 +22,6 @@ from .registry import (
     cube_copy_l0c2gm_i32,
     cast_fp32_to_int16,
     cast_fp16_to_int8,
-
     duplicate_bitwise_mask,
     gather_gm_to_l1,
     gather_gm_to_ub,
@@ -34,6 +38,11 @@ from .registry import (
 )
 
 __all__ = [
+    "cube_nd2nz_f16",
+    "cube_load2d_f16_b_into",
+    "cube_load3d_f16_a_into",
+    "cube_mmad_f16_into",
+    "cube_copy_l0c2gm_f32",
     "cube_nd2nz_i8",
     "cube_load3d_a_into",
     "cube_load2d_b_into",
@@ -43,7 +52,6 @@ __all__ = [
     "cube_copy_l0c2gm_i32",
     "cast_fp32_to_int16",
     "cast_fp16_to_int8",
-
     "SORT_IMPL_BASE",
     "SORT_IMPL_S4096_K129_512",
     "SORT_IMPL_S4096_K1_128_K2048",

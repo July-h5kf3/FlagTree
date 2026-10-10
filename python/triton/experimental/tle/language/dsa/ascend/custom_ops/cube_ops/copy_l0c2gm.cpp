@@ -42,3 +42,19 @@ _mlir_ciface_copy_l0c2gm_i32(uint64_t dst_address, uint32_t src_address,
       static_cast<QuantMode_t>(quant_pre), (uint8_t)relu_pre,
       (bool)channel_split, (bool)nz2nd_en);
 }
+
+extern "C" __aicore__ __attribute__((always_inline)) void
+_mlir_ciface_copy_l0c2gm_f32(uint64_t dst_address, uint32_t src_address,
+                             int32_t n_size, int32_t m_size,
+                             int32_t dst_stride_dst_d, int32_t src_stride,
+                             int32_t unit_flag_mode, uint64_t quant_pre,
+                             int32_t relu_pre, int32_t channel_split,
+                             int32_t nz2nd_en) {
+  copy_matrix_cc_to_gm(reinterpret_cast<__gm__ float *>(dst_address),
+                       reinterpret_cast<__cc__ float *>((uint64_t)src_address),
+                       0, (uint16_t)n_size, (uint16_t)m_size,
+                       (uint32_t)dst_stride_dst_d, (uint16_t)src_stride,
+                       (uint8_t)unit_flag_mode,
+                       static_cast<QuantMode_t>(quant_pre), (uint8_t)relu_pre,
+                       (bool)channel_split, (bool)nz2nd_en);
+}
