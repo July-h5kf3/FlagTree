@@ -644,9 +644,16 @@ def _compile_linalg_to_npu_bin(linalg: str, metadata, opt):
         metadata["disable_auto_cv_work_space_manage"] = True
 
     if opt.compile_on_910_95:
-        return linalg_to_bin_enable_npu_compile_910_95(linalg, metadata, opt)
+        binary = linalg_to_bin_enable_npu_compile_910_95(linalg, metadata, opt)
     else:
-        return linalg_to_bin_enable_npu_compile_A2_A3(linalg, metadata, opt)
+        binary = linalg_to_bin_enable_npu_compile_A2_A3(linalg, metadata, opt)
+
+    # Void Cube calls can retain the frontend AIV label. CANN task kinds
+    # select the loader ELF magic: 2 is AIC; 3 and 4 are mixed kernels.
+    task_kind = metadata.get("bs_task_type", 0) // 10
+    if metadata["mix_mode"] == "aiv" and task_kind in (2, 3, 4):
+        metadata["mix_mode"] = "aic" if task_kind == 2 else "mix"
+    return binary
 
 
 def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):

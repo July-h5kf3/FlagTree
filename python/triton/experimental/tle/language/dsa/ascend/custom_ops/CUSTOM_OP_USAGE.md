@@ -1,5 +1,40 @@
 # Ascend Custom Ops 使用说明
 
+## FP16 Cube primitives for mixed attention
+
+The FP16 variants expose the same individual CANN instructions as the INT8
+variants. They do not implement attention, softmax, tiling, allocation or
+synchronization. All variants use CUSTOM_OPS_BITCODE.
+
+| Entry | Pipe | Source and destination |
+| --- | --- | --- |
+| `cube_nd2nz_f16` | MTE2 | FP16 GM ND to L1 NZ |
+| `cube_load3d_f16_a_into` | MTE1 | FP16 L1 NZ to L0A |
+| `cube_load2d_f16_b_into` | MTE1 | FP16 L1 to L0B, optional transpose |
+| `cube_mmad_f16_into` | M | FP16 L0A/L0B to FP32 L0C |
+| `cube_copy_l0c2gm_f32` | FIX | FP32 L0C to GM, optional NZ to ND |
+
+Arguments follow the corresponding INT8 entry. GM addresses are uint64 and
+local addresses are uint32 byte offsets. Matrix dimensions and strides are
+element counts; LoadData block/repeat parameters retain their CANN units.
+The load3d padding value is the raw 16-bit FP16 representation. Callers must
+keep all regions aligned, within the hardware capacities and ordered with
+the appropriate pipeline and cross-core events.
+
+These entries support the existing mixed INT8-QK/FP16-PV schedule with shared
+explicit L1/L0 regions. The current TLE tile allocation API does not bind its
+buffers to those raw addresses; mixing its independently allocated dot
+buffers with the existing INT8 primitives does not establish safe ownership.
+
+A 128x512x128 FP16 matrix check on 910B4-1/CANN9.1 passed against an independent
+CPU FP32 reference at atol=rtol=0.001. Native primitives measured 0.004911 ms
+versus 0.003770 ms for ordinary Triton dot: they are not a faster standalone
+matmul. Their purpose is explicit resource ownership in the mixed schedule.
+The attention caller keeps mask, online softmax and scheduling in Triton/TLE;
+replacing two INT8 probability planes with one FP16 plane passed the unchanged
+attention accuracy checks and reduced the long-prefill A/B latency from
+13.664 ms to 9.801 ms, including the Triton value preparation kernel.
+
 ## 目录结构
 
 ```text
