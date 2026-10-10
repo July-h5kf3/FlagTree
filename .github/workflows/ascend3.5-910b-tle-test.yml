@@ -21,6 +21,8 @@
 name: Ascend3.5-910B-TLE
 
 on:
+  schedule:
+    - cron: '30 15 * * *'
   push:
     branches: [ "triton_v3.5.x" ]
   pull_request:
@@ -37,7 +39,7 @@ concurrency:
 
 jobs:
   ascend35x-910b-tle-test:
-    runs-on: ascend3.5-910b-tle
+    runs-on: ascend3.5-910b
     if: ${{ github.repository == 'flagos-ai/flagtree' && github.event.pull_request.draft == false }}
     steps:
       - name: Setup environment
@@ -53,6 +55,7 @@ jobs:
 
       - name: Check if backend-relevant files changed
         id: check_backend
+        if: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
         uses: flagos-ai/FlagTree/.github/actions/check-backend-changed@main
         with:
           backend: ascend
@@ -85,6 +88,7 @@ jobs:
         run: |
           set -x
           source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          source ~/env.sh
           ## flagtree tle test
           pushd python/test/tle
           python3 test_vec_add.py

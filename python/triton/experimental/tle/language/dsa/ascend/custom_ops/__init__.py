@@ -17,11 +17,20 @@ from .registry import (
     cube_copy_l0c2gm_i32,
     cast_fp32_to_int16,
     cast_fp16_to_int8,
+
+    duplicate_bitwise_mask,
     gather_gm_to_l1,
     gather_gm_to_ub,
+    gather_mask_builtin_pattern,
+    gather_mask_custom_pattern,
+    pair_reduce_sum_continuous_mask,
+    sort32,
     sort_1d_pack,
     merge_exhaust_sort4,
+    mrgsort,
     unpack_sort,
+    compare_scalar,
+    cast_int4_to_fp16,
 )
 
 __all__ = [
@@ -34,12 +43,21 @@ __all__ = [
     "cube_copy_l0c2gm_i32",
     "cast_fp32_to_int16",
     "cast_fp16_to_int8",
+
     "SORT_IMPL_BASE",
     "SORT_IMPL_S4096_K129_512",
     "SORT_IMPL_S4096_K1_128_K2048",
+    "duplicate_bitwise_mask",
     "gather_gm_to_l1",
     "gather_gm_to_ub",
+    "gather_mask_builtin_pattern",
+    "gather_mask_custom_pattern",
+    "pair_reduce_sum_continuous_mask",
+    "sort32",
     "sort_1d_pack",
     "merge_exhaust_sort4",
+    "mrgsort",
     "unpack_sort",
+    "compare_scalar",
+    "cast_int4_to_fp16",
 ]

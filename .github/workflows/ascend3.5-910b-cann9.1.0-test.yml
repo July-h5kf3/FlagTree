@@ -21,6 +21,8 @@
 name: Ascend3.5-910B-CANN9.1.0
 
 on:
+  schedule:
+    - cron: '50 15 * * *'
   push:
     branches: [ "triton_v3.5.x" ]
   pull_request:
@@ -53,6 +55,7 @@ jobs:
 
       - name: Check if backend-relevant files changed
         id: check_backend
+        if: ${{ github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
         uses: flagos-ai/FlagTree/.github/actions/check-backend-changed@main
         with:
           backend: ascend
@@ -85,6 +88,7 @@ jobs:
         run: |
           set -x
           source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          source ~/env.sh
           ## flagtree tle-distributed tutorial
           pushd python/tutorials/tle/dsa
           PATH=/usr/local/Ascend/cann-9.1.0-shmem/bin:$PATH torchrun --nproc_per_node=2 09-ascend-allgather-gemm.py
