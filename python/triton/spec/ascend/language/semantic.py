@@ -1590,7 +1590,7 @@ class TritonSemantic(Generic[TensorTy]):
             acc_handle = self.builder.create_splat(ret_ty.to_ir(self.builder), _0)
         else:
             acc_handle = acc.handle
-            assert acc.type.shape == ret_ty.shape and acc.type.element_ty == out_dtype
+            assert acc.type.shape == ret_ty.shape and acc.type.element_ty == ret_scalar_ty
 
         if (input_precision == getattr(ir.INPUT_PRECISION, "HF32")):
             if (not lhs.dtype.is_fp32() or not rhs.dtype.is_fp32() or not ret_scalar_ty.is_fp32()):
