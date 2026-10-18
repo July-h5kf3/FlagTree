@@ -242,10 +242,11 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
   auto dShape = dTensorTy.getShape();
   Type inElemTy = aTensorTy.getElementType();
   bool isColMajor = mmaLayout.getColMajor();
-  // mma output colmajor only support fp16/bf16 for now
   if (isColMajor) {
-    assert((inElemTy.isF16() || inElemTy.isBF16()) &&
-           "MMA Output colmajor now only support fp16/bf16");
+    assert((inElemTy.isF16() || inElemTy.isBF16() ||
+            (inElemTy.isSignlessInteger(8) &&
+             dTensorTy.getElementType().isSignlessInteger(32))) &&
+           "MMA column-major output requires FP16, BF16 or INT8");
   }
 
   // elems loaded of each thread per replica for M.
@@ -500,16 +501,25 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
       cast_ha_value = builder.bitcast(a4_v, operandType);
       cast_hb_value = builder.bitcast(b4_v, operandType);
     }
-    args_value.push_back(cast_ha_value); // a4_v
-    args_value.push_back(cast_hb_value); // b4_v
+    // Transpose the product by swapping the native operands.
+    if (isColMajor) {
+      args_value.push_back(cast_hb_value);
+      args_value.push_back(cast_ha_value);
+    } else {
+      args_value.push_back(cast_ha_value);
+      args_value.push_back(cast_hb_value);
+    }
 
     Value v4_v = builder.undef(v4_t);
     for (size_t ii = 0; ii < retElemsPerMMA; ++ii) {
-      v4_v = builder.insert_element(
-          v4_t, v4_v,
-          fc[(m * colsPerThread + retElemsPerMMA * n + ii) * elemsM * elemsN +
-             a * elemsN + b],
-          builder.i32_val(ii));
+      unsigned index = isColMajor
+                           ? m * colsPerThread * elemsM * elemsN +
+                                 retElemsPerMMA * n * elemsN * elemsM +
+                                 ii * elemsN + a * elemsN * retElemsPerMMA + b
+                           : (m * colsPerThread + retElemsPerMMA * n + ii) *
+                                     elemsM * elemsN +
+                                 a * elemsN + b;
+      v4_v = builder.insert_element(v4_t, v4_v, fc[index], builder.i32_val(ii));
     }
     args_value.push_back(v4_v); // c
     ValueRange valueRange(args_value);
@@ -519,8 +529,14 @@ LogicalResult convertDot(const LLVMTypeConverter *typeConverter,
     for (int i = 0; i < retElemsPerMMA; ++i) {
       Value v1_value =
           builder.extract_element(resTy, v4_value, builder.i32_val(i));
-      fc[(m * colsPerThread + retElemsPerMMA * n + i) * elemsM * elemsN +
-         a * elemsN + b] = v1_value;
+      unsigned index =
+          isColMajor
+              ? m * colsPerThread * elemsM * elemsN +
+                    retElemsPerMMA * n * elemsN * elemsM + i * elemsN +
+                    a * elemsN * retElemsPerMMA + b
+              : (m * colsPerThread + retElemsPerMMA * n + i) * elemsM * elemsN +
+                    a * elemsN + b;
+      fc[index] = v1_value;
     }
   };
 

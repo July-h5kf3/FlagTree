@@ -229,11 +229,16 @@ py::object layoutToGluon(Attribute layout) {
         dotOp.getOpIdx(), layoutToGluon(dotOp.getParent()), dotOp.getKWidth());
   } else if (auto mma = dyn_cast<ttg::MACAMmaEncodingAttr>(layout)) {
     SmallVector<unsigned> standardStride{1, 1};
-    if (mma.getColMajor() || mma.getIsATrans() || mma.getIsBTrans() ||
+    if (mma.getIsATrans() || mma.getIsBTrans() ||
         mma.getElementsStride() != ArrayRef<unsigned>(standardStride) ||
         !getCgaLayoutBases(mma.getCTALayout()).empty())
       throw py::value_error(
-          "Gluon requires a standard row-major MetaX MMA layout");
+          "Gluon requires a standard MetaX MMA operand load layout");
+    if (mma.getColMajor())
+      return layouts.MacaMmaLayout(
+          toStdVector(mma.getWarpsPerCTA()), toStdVector(mma.getElementsMNK()),
+          std::vector<unsigned>{mma.getVersionMajor(), mma.getVersionMinor()},
+          py::arg("col_major") = true);
     return layouts.MacaMmaLayout(
         toStdVector(mma.getWarpsPerCTA()), toStdVector(mma.getElementsMNK()),
         std::vector<unsigned>{mma.getVersionMajor(), mma.getVersionMinor()});
@@ -321,6 +326,7 @@ PLUGIN_EXPORT void init_gluon_ir(py::module &&m) {
 
 #ifdef __FLAGTREE_PLUGIN__
   m.attr("supports_maca_async_copy") = py::bool_(true);
+  m.attr("supports_maca_int8_col_major") = py::bool_(true);
 #endif
 
   py::class_<GluonOpBuilder, TritonOpBuilder>(
@@ -408,20 +414,23 @@ PLUGIN_EXPORT void init_gluon_ir(py::module &&m) {
              return self.getChecked<ttg::DotOperandEncodingAttr>(
                  self.getContext(), opIdx, parent, kWidth);
            })
-      .def("get_maca_mma_layout",
-           [](GluonOpBuilder &self, std::vector<unsigned> &warpsPerCta,
-              std::vector<unsigned> &elementsMnk,
-              std::vector<unsigned> &version) -> Attribute {
-             if (warpsPerCta.size() != 2 || elementsMnk.size() != 3 ||
-                 version.size() != 2)
-               throw py::value_error("invalid MetaX MMA layout dimensions");
-             auto ctx = self.getContext();
-             auto ctaLayout = buildCtaLayoutAttr(ctx, {}, 2);
-             SmallVector<unsigned> stride{1, 1};
-             return self.getChecked<ttg::MACAMmaEncodingAttr>(
-                 ctx, version[0], version[1], warpsPerCta, elementsMnk, 0,
-                 ctaLayout, false, false, stride);
-           })
+      .def(
+          "get_maca_mma_layout",
+          [](GluonOpBuilder &self, std::vector<unsigned> &warpsPerCta,
+             std::vector<unsigned> &elementsMnk, std::vector<unsigned> &version,
+             bool colMajor) -> Attribute {
+            if (warpsPerCta.size() != 2 || elementsMnk.size() != 3 ||
+                version.size() != 2)
+              throw py::value_error("invalid MetaX MMA layout dimensions");
+            auto ctx = self.getContext();
+            auto ctaLayout = buildCtaLayoutAttr(ctx, {}, 2);
+            SmallVector<unsigned> stride{1, 1};
+            return self.getChecked<ttg::MACAMmaEncodingAttr>(
+                ctx, version[0], version[1], warpsPerCta, elementsMnk, colMajor,
+                ctaLayout, false, false, stride);
+          },
+          py::arg("warps_per_cta"), py::arg("elements_mnk"), py::arg("version"),
+          py::arg("col_major") = false)
       .def("get_mma_layout",
            [](GluonOpBuilder &self, std::vector<unsigned> &version,
               std::vector<unsigned> &warpsPerCta,

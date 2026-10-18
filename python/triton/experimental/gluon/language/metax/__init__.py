@@ -25,17 +25,19 @@ __all__ = ["MacaMmaLayout", "mma", "async_copy"]
 
 @dataclass(frozen=True)
 class MacaMmaLayout(DistributedLayout):
-    """Register layout of a row-major MetaX MMA accumulator on 64-lane warps.
+    """Register layout of a MetaX MMA accumulator on 64-lane warps.
 
     ``elements_per_thread`` is the MMA encoding's [M, N, K] fragment shape;
     [1, 1, 4] supports C550 INT8 and FP16/BF16 instructions. ``version`` is
     [major, minor], with [2, 0] selecting the C550 instruction encoding.
-    Multi-CTA, transposed-load and column-major encodings are not supported.
+    Column-major output supports INT8, FP16 and BF16. Multi-CTA and transposed
+    operand loads are not supported.
     """
 
     warps_per_cta: List[int]
     elements_per_thread: List[int] = field(default_factory=lambda: [1, 1, 4])
     version: List[int] = field(default_factory=lambda: [2, 0])
+    col_major: bool = False
 
     def __post_init__(self):
         warps = [_unwrap_if_constexpr(value) for value in _unwrap_if_constexpr(self.warps_per_cta)]
@@ -50,15 +52,25 @@ class MacaMmaLayout(DistributedLayout):
         if len(version) != 2 or version[0] != 2 or version[1] < 0:
             raise ValueError("MetaX MMA version must be [2, nonnegative minor]")
         object.__setattr__(self, "version", version)
+        col_major = _unwrap_if_constexpr(self.col_major)
+        if not isinstance(col_major, bool):
+            raise TypeError("col_major must be a bool")
+        object.__setattr__(self, "col_major", col_major)
 
     def _to_ir(self, builder):
+        if self.col_major:
+            from triton._C.libtriton.gluon_ir import supports_maca_int8_col_major
+
+            if not supports_maca_int8_col_major:
+                raise ValueError("the native MetaX plugin does not support column-major MMA")
+            return builder.get_maca_mma_layout(self.warps_per_cta, self.elements_per_thread, self.version, True)
         return builder.get_maca_mma_layout(self.warps_per_cta, self.elements_per_thread, self.version)
 
     def mangle(self):
-        return f"MACAMMA_{self.version}_{self.warps_per_cta}_{self.elements_per_thread}_MACAMMA"
+        return f"MACAMMA_{self.version}_{self.warps_per_cta}_{self.elements_per_thread}_{self.col_major}_MACAMMA"
 
     def __hash__(self):
-        return hash((tuple(self.version), tuple(self.warps_per_cta), tuple(self.elements_per_thread)))
+        return hash((tuple(self.version), tuple(self.warps_per_cta), tuple(self.elements_per_thread), self.col_major))
 
     @property
     def rank(self):
