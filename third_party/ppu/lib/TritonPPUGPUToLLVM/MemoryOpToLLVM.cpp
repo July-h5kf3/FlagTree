@@ -195,6 +195,75 @@ LogicalResult lowerPPULdMatrix(
   if (cvt.hasInDim(kBlock))
     return failure();
 
+  // Keep packed INT8 words intact through the register transpose.
+  auto directModule =
+      rewriter.getBlock()->getParent()->getParentOfType<ModuleOp>();
+  if (Opb8bLdmatrix && tensorTy.getElementType().isInteger(8)) {
+    auto inputBases = regL.getBases();
+    if (inputBases[kReg].size() >= 2 && inputBases[kLane].size() >= 4) {
+      // mat.trans.b8 exchanges byte bits 0/1 with lane bits 2/3.
+      std::swap(inputBases[kReg][0], inputBases[kLane][2]);
+      std::swap(inputBases[kReg][1], inputBases[kLane][3]);
+      LinearLayout inputLayout(inputBases, regL.getOutDims(), false);
+      auto inputToShared = inputLayout.invertAndCompose(memL);
+      auto outputNames = llvm::to_vector(inputToShared.getOutDimNames());
+      auto offsetIt = llvm::find(outputNames, kOffset);
+      unsigned offsetIndex = std::distance(outputNames.begin(), offsetIt);
+      bool contiguous = offsetIt != outputNames.end();
+      auto registerBases = inputToShared.getBases().find(kReg)->second;
+      for (unsigned bit = 0; bit < 2 && contiguous; ++bit) {
+        for (unsigned dim = 0; dim < outputNames.size(); ++dim) {
+          int expected = dim == offsetIndex ? (1 << bit) : 0;
+          contiguous &= registerBases[bit][dim] == expected;
+        }
+      }
+      unsigned count = regL.getInDimSize(kReg);
+      if (contiguous && count >= 4 && count % 4 == 0) {
+        StringRef name("__flagtree_ppu_intrinsic__mat.trans.b8");
+        LLVM::LLVMFuncOp nativeTranspose;
+        if (Operation *existing = directModule.lookupSymbol(name)) {
+          nativeTranspose = cast<LLVM::LLVMFuncOp>(existing);
+        } else {
+          RewriterBase::InsertionGuard guard(rewriter);
+          rewriter.setInsertionPointToStart(directModule.getBody());
+          auto functionType = LLVM::LLVMFunctionType::get(i32_ty, {i32_ty});
+          nativeTranspose =
+              LLVM::LLVMFuncOp::create(rewriter, loc, name, functionType);
+          nativeTranspose.setPassthroughAttr(
+              rewriter.getArrayAttr({rewriter.getStringAttr("nounwind"),
+                                     rewriter.getStringAttr("convergent")}));
+          nativeTranspose.setMemoryEffectsAttr(LLVM::MemoryEffectsAttr::get(
+              ctx, LLVM::ModRefInfo::NoModRef, LLVM::ModRefInfo::NoModRef,
+              LLVM::ModRefInfo::NoModRef));
+        }
+        auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+        SmallVector<Value> values;
+        for (unsigned index = 0; index < count; index += 4) {
+          auto offsets = applyLinearLayout(loc, rewriter, inputToShared,
+                                           {{kReg, b.i32_val(index)},
+                                            {kLane, laneId},
+                                            {kWarp, warpId},
+                                            {kBlock, b.i32_val(0)}});
+          Value address = b.gep(smemPtrTy, llvmElemTy, smemBase,
+                                offsets[offsetIndex].second,
+                                LLVM::GEPNoWrapFlags::inbounds);
+          Value word = b.load(i32_ty, address);
+          Value changed =
+              createLLVMCallOp(rewriter, loc, nativeTranspose, ValueRange{word})
+                  .getResult();
+          Value bytes = b.bitcast(changed, vec_ty(llvmElemTy, 4));
+          for (unsigned byte = 0; byte < 4; ++byte)
+            values.push_back(
+                b.extract_element(llvmElemTy, bytes, b.i32_val(byte)));
+        }
+        auto packedType = LLVM::LLVMStructType::getLiteral(
+            ctx, SmallVector<Type>(values.size(), llvmElemTy));
+        src = packLLElements(loc, typeConverter, values, rewriter, packedType);
+        return success();
+      }
+    }
+  }
+
   auto srcVals = SmallVector<Value>{};
 
   // Remove broadcasting on the register dimension
