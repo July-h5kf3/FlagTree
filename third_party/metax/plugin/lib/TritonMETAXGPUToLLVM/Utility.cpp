@@ -5,12 +5,11 @@
 #include "triton/Tools/LinearLayout.h"
 
 namespace mlir::triton::gpu {
-SmallVector<Value> emitSwizzleColOffsets(RewriterBase &rewriter, Operation *op,
-                                         RankedTensorType srcTy,
-                                         ArrayRef<int64_t> shape,
-                                         Attribute swizzledSharedEnc,
-                                         Attribute noSwizzledSharedEnc,
-                                         unsigned vec) {
+SmallVector<Value> emitSwizzleColOffsets(
+    RewriterBase &rewriter, Operation *op, RankedTensorType srcTy,
+    ArrayRef<int64_t> shape, Attribute swizzledSharedEnc,
+    Attribute noSwizzledSharedEnc, unsigned vec, Value affineSwizzledOffset,
+    Value affineNoSwizzledOffset) {
   // LL0: reg -> noswizzle smem offset
   // LL1: reg -> swizzle smem offset
   // colOffset = sharedSwizzledOffset - sharedNoSwizzledOffset
@@ -50,6 +49,12 @@ SmallVector<Value> emitSwizzleColOffsets(RewriterBase &rewriter, Operation *op,
     Value sharedNoSwizzledOffset =
         applyLinearLayout(loc, rewriter, regToNoSwiSmemOffset, indices)[0]
             .second;
+
+    if (affineSwizzledOffset)
+      sharedSwizzledOffset = b.xor_(sharedSwizzledOffset, affineSwizzledOffset);
+    if (affineNoSwizzledOffset)
+      sharedNoSwizzledOffset =
+          b.xor_(sharedNoSwizzledOffset, affineNoSwizzledOffset);
 
     auto colOffset = b.sub(sharedSwizzledOffset, sharedNoSwizzledOffset);
     colOffsets.push_back(colOffset);

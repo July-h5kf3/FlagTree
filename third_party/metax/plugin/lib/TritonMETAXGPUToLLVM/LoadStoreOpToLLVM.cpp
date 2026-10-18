@@ -1325,10 +1325,16 @@ struct AsyncCopyGlobalToLocalOpConversion
           resSharedLayout.getCTALayout());
       noSwizzleDstTy =
           MemDescType::get(dstTy.getShape(), dstTy.getElementType(),
-                           noSwizzleSharedEnc, dstTy.getMemorySpace());
+                           noSwizzleSharedEnc, dstTy.getMemorySpace(),
+                           dstTy.getMutableMemory(), dstTy.getAllocShape());
+      // Preserve the allocation geometry and origin of shared subviews.
+      auto affineSwizzledOffset = smemObj.getShmemOffset(loc, rewriter, dstTy);
+      auto affineNoSwizzledOffset =
+          smemObj.getShmemOffset(loc, rewriter, noSwizzleDstTy);
       auto colOffsets = triton::gpu::emitSwizzleColOffsets(
-          rewriter, op, srcTy, dstTy.getShape(), resSharedLayout,
-          noSwizzleSharedEnc, minVec);
+          rewriter, op, srcTy, dstTy.getAllocShape().take_back(dstTy.getRank()),
+          resSharedLayout, noSwizzleSharedEnc, minVec, affineSwizzledOffset,
+          affineNoSwizzledOffset);
       getCopyAsyncSwizzledGvmPtrs(rewriter, op, resElemTy, srcSwiAddrs,
                                   srcElems, colOffsets, minVec);
     }

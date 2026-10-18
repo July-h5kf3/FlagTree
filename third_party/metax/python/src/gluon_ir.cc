@@ -326,6 +326,7 @@ PLUGIN_EXPORT void init_gluon_ir(py::module &&m) {
 
 #ifdef __FLAGTREE_PLUGIN__
   m.attr("supports_maca_async_copy") = py::bool_(true);
+  m.attr("supports_maca_async_copy_subviews") = py::bool_(true);
   m.attr("supports_maca_int8_col_major") = py::bool_(true);
 #endif
 
