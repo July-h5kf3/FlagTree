@@ -116,8 +116,9 @@ LogicalResult lowerLdStMatrix(
 LogicalResult lowerPPULdMatrix(
     Location loc, RankedTensorType tensorTy, MemDescType memDescType,
     bool transpose, Value &src, // Output for ldmatrix
-    Value smemBase, Type llvmElemTy, ConversionPatternRewriter &rewriter,
-    const ppu::TargetInfo &targetInfo, const LLVMTypeConverter *typeConverter,
+    Value smemBase, Value affineOffset, Type llvmElemTy,
+    ConversionPatternRewriter &rewriter, const ppu::TargetInfo &targetInfo,
+    const LLVMTypeConverter *typeConverter,
     std::pair<size_t, Type> *const llvmOpCount = nullptr) {
   // Lower load via ppu.ldmatrix
   if (!targetInfo.supportLdMatrix())
@@ -165,7 +166,7 @@ LogicalResult lowerPPULdMatrix(
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   auto *ctx = tensorTy.getContext();
   auto regL = toLinearLayout(tensorTy.getShape(), tensorTy.getEncoding());
-  auto memL = toLinearLayout(memDescType.getShape(), memDescType.getEncoding());
+  auto memL = toLinearLayout(memDescType);
   auto cvt = minimalCvtLayout(memDescType, tensorTy);
 
   auto S = [ctx](StringRef v) { return StringAttr::get(ctx, v); };
@@ -244,9 +245,10 @@ LogicalResult lowerPPULdMatrix(
                                             {kLane, laneId},
                                             {kWarp, warpId},
                                             {kBlock, b.i32_val(0)}});
-          Value address = b.gep(smemPtrTy, llvmElemTy, smemBase,
-                                offsets[offsetIndex].second,
-                                LLVM::GEPNoWrapFlags::inbounds);
+          Value address = b.gep(
+              smemPtrTy, llvmElemTy, smemBase,
+              b.xor_(offsets[offsetIndex].second, affineOffset).getResult(),
+              LLVM::GEPNoWrapFlags::inbounds);
           Value word = b.load(i32_ty, address);
           Value changed =
               createLLVMCallOp(rewriter, loc, nativeTranspose, ValueRange{word})
@@ -263,6 +265,9 @@ LogicalResult lowerPPULdMatrix(
       }
     }
   }
+
+  if (SharedMemoryObject::getMaskSpanOffsets(memDescType))
+    return failure();
 
   auto srcVals = SmallVector<Value>{};
 
@@ -461,13 +466,16 @@ public:
       }
     }
 
+    Value affineOffset =
+        smemObj.getShmemOffset(op.getLoc(), rewriter, memDescType);
+
     // Try to lower to ppu.ldmatrix
     bool lowered = false;
     Value val;
     for (bool transpose : {false, true}) {
       lowered = lowerPPULdMatrix(op.getLoc(), dstTy, memDescType, transpose,
-                                 val, smemBase, llvmElemTy, rewriter,
-                                 targetInfo, getTypeConverter())
+                                 val, smemBase, affineOffset, llvmElemTy,
+                                 rewriter, targetInfo, getTypeConverter())
                     .succeeded();
       if (lowered) {
         rewriter.replaceOp(op, val);
