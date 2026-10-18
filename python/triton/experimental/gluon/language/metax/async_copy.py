@@ -28,4 +28,13 @@ including when a nonzero number of outstanding groups was requested.
 # native copy and synchronization instructions.
 from ..nvidia.ampere.async_copy import async_copy_global_to_shared, commit_group, wait_group
 
-__all__ = ["async_copy_global_to_shared", "commit_group", "wait_group"]
+__all__ = ["async_copy_global_to_shared", "commit_group", "wait_group", "is_supported"]
+
+
+def is_supported() -> bool:
+    """Check the loaded native plugin, which may predate these Python APIs."""
+    try:
+        from triton._C.libtriton.gluon_ir import supports_maca_async_copy
+    except ImportError:
+        return False
+    return bool(supports_maca_async_copy)

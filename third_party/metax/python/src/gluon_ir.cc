@@ -319,6 +319,10 @@ template <typename CondT> static void check(CondT &&cond, const char *msg) {
 PLUGIN_EXPORT void init_gluon_ir(py::module &&m) {
   using ret = py::return_value_policy;
 
+#ifdef __FLAGTREE_PLUGIN__
+  m.attr("supports_maca_async_copy") = py::bool_(true);
+#endif
+
   py::class_<GluonOpBuilder, TritonOpBuilder>(
       m, "GluonOpBuilder", py::module_local(), py::dynamic_attr())
       .def(py::init<MLIRContext *>())
