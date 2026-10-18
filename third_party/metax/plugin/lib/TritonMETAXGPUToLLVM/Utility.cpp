@@ -292,7 +292,36 @@ Value llGetPid(Location loc, RewriterBase &rewriter, ModuleOp moduleOp,
 
 Value permute(Location loc, RewriterBase &rewriter, Value a, Value b,
               Value selector) {
-  llvm_unreachable("unsupported permute codepath");
+  auto builder = TritonLLVMOpBuilder(loc, rewriter);
+  Value control = builder.i32_val(0);
+  for (unsigned byte = 0; byte < 4; ++byte) {
+    auto index = builder.and_(builder.lshr(selector, builder.i32_val(byte * 4)),
+                              builder.i32_val(7));
+    control =
+        builder.or_(control, builder.shl(index, builder.i32_val(byte * 8)));
+  }
+  // MACA selects bytes 0..3 from its second operand; PTX selects from its
+  // first.
+  auto op = rewriter.getInsertionBlock()->getTerminator();
+  auto permuted = createBuiltinFunc(rewriter, loc, op, "llvm.mxc.byte.perm",
+                                    i32_ty, ValueRange{b, a, control});
+  Value result = builder.i32_val(0);
+  for (unsigned byte = 0; byte < 4; ++byte) {
+    auto selected =
+        builder.and_(builder.lshr(permuted, builder.i32_val(byte * 8)),
+                     builder.i32_val(255));
+    auto sign =
+        builder.and_(builder.lshr(permuted, builder.i32_val(byte * 8 + 7)),
+                     builder.i32_val(1));
+    auto fill = builder.and_(builder.sub(builder.i32_val(0), sign),
+                             builder.i32_val(255));
+    auto replicate = builder.icmp_ne(
+        builder.and_(selector, builder.i32_val(8 << (byte * 4))),
+        builder.i32_val(0));
+    auto value = builder.select(replicate, fill, selected);
+    result = builder.or_(result, builder.shl(value, builder.i32_val(byte * 8)));
+  }
+  return result;
 }
 
 void createSyncWarp(Location loc, OpBuilder &rewriter) {

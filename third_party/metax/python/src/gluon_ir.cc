@@ -133,6 +133,7 @@ struct GluonLayouts {
   py::handle SliceLayout;
   py::handle DistributedLinearLayout;
   py::handle DotOperandLayout;
+  py::handle MacaMmaLayout;
   py::handle NVMMADistributedLayout;
   py::handle TensorMemoryScalesLayout;
   py::handle TensorMemoryLayout;
@@ -148,6 +149,8 @@ struct GluonLayouts {
         py::module::import("triton.experimental.gluon.language._layouts");
     auto amdLayouts =
         py::module::import("triton.experimental.gluon.language.amd._layouts");
+    auto macaLayouts =
+        py::module::import("triton.experimental.gluon.language.metax");
     auto blackwellLayouts = py::module::import(
         "triton.experimental.gluon.language.nvidia.blackwell");
     AutoLayout = py::object(layouts.attr("AutoLayout")).release();
@@ -157,6 +160,7 @@ struct GluonLayouts {
     DistributedLinearLayout =
         py::object(layouts.attr("DistributedLinearLayout")).release();
     DotOperandLayout = py::object(layouts.attr("DotOperandLayout")).release();
+    MacaMmaLayout = py::object(macaLayouts.attr("MacaMmaLayout")).release();
     NVMMADistributedLayout =
         py::object(layouts.attr("NVMMADistributedLayout")).release();
     TensorMemoryScalesLayout =
@@ -223,6 +227,16 @@ py::object layoutToGluon(Attribute layout) {
   } else if (auto dotOp = dyn_cast<ttg::DotOperandEncodingAttr>(layout)) {
     return layouts.DotOperandLayout(
         dotOp.getOpIdx(), layoutToGluon(dotOp.getParent()), dotOp.getKWidth());
+  } else if (auto mma = dyn_cast<ttg::MACAMmaEncodingAttr>(layout)) {
+    SmallVector<unsigned> standardStride{1, 1};
+    if (mma.getColMajor() || mma.getIsATrans() || mma.getIsBTrans() ||
+        mma.getElementsStride() != ArrayRef<unsigned>(standardStride) ||
+        !getCgaLayoutBases(mma.getCTALayout()).empty())
+      throw py::value_error(
+          "Gluon requires a standard row-major MetaX MMA layout");
+    return layouts.MacaMmaLayout(
+        toStdVector(mma.getWarpsPerCTA()), toStdVector(mma.getElementsMNK()),
+        std::vector<unsigned>{mma.getVersionMajor(), mma.getVersionMinor()});
   } else if (auto mma = dyn_cast<ttg::NvidiaMmaEncodingAttr>(layout)) {
     auto cgaBases = getCgaLayoutBases(mma.getCTALayout());
     return layouts.NVMMADistributedLayout(
@@ -389,6 +403,20 @@ PLUGIN_EXPORT void init_gluon_ir(py::module &&m) {
               unsigned kWidth) -> Attribute {
              return self.getChecked<ttg::DotOperandEncodingAttr>(
                  self.getContext(), opIdx, parent, kWidth);
+           })
+      .def("get_maca_mma_layout",
+           [](GluonOpBuilder &self, std::vector<unsigned> &warpsPerCta,
+              std::vector<unsigned> &elementsMnk,
+              std::vector<unsigned> &version) -> Attribute {
+             if (warpsPerCta.size() != 2 || elementsMnk.size() != 3 ||
+                 version.size() != 2)
+               throw py::value_error("invalid MetaX MMA layout dimensions");
+             auto ctx = self.getContext();
+             auto ctaLayout = buildCtaLayoutAttr(ctx, {}, 2);
+             SmallVector<unsigned> stride{1, 1};
+             return self.getChecked<ttg::MACAMmaEncodingAttr>(
+                 ctx, version[0], version[1], warpsPerCta, elementsMnk, 0,
+                 ctaLayout, false, false, stride);
            })
       .def("get_mma_layout",
            [](GluonOpBuilder &self, std::vector<unsigned> &version,

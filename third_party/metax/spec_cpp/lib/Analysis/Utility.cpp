@@ -1,4 +1,5 @@
 #include "triton/Analysis/Utility.h"
+#include "triton/Analysis/MetaXUtils.h"
 
 #include <deque>
 
@@ -1135,6 +1136,10 @@ bool cvtNeedsWarpShuffle(RankedTensorType srcTy, RankedTensorType dstTy) {
 }
 
 bool cvtNeedsSharedMemory(RankedTensorType srcTy, RankedTensorType dstTy) {
+#ifdef __FLAGTREE_PLUGIN__
+  if (METAX::isPackedInt8MmaToDot(srcTy, dstTy))
+    return false;
+#endif
   return !cvtReordersRegisters(srcTy, dstTy) &&
          !cvtNeedsWarpShuffle(srcTy, dstTy);
 }
