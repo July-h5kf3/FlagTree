@@ -210,6 +210,7 @@ class HGGCOptions:
     maxnreg: Optional[int] = None
     ppu_llc_options: Optional[str] = knobs.ppu.ppu_llc_options
     ir_override: Optional[str] = None  # filename of a user-defined IR (*.{ttir|ttgir|llir|tix})
+    ppu_fold_global_load_offsets: bool = False
     enable_fp_fusion: bool = True
     enable_reflect_ftz: bool = True  # ftz in libdevice
     launch_cooperative_grid: bool = False
@@ -534,6 +535,10 @@ class PPUBackend(BaseBackend):
             llvm.link_extern_libs(llvm_mod, paths)
 
         llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3)
+
+        if options.ppu_fold_global_load_offsets and capability == 80:
+            block_warps = src.get_int_attr("ttg.total-num-warps") or options.num_warps
+            metadata["global_load_offsets_folded"] = ppu.fold_global_load_offsets(llvm_mod, block_warps * 32)
 
         # Get some metadata
         total_num_warps = src.get_int_attr("ttg.total-num-warps")

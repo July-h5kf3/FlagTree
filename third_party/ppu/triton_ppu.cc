@@ -23,6 +23,7 @@
 
 #include "Dialect/PPUGPU/IR/Dialect.h"
 #include "Dialect/TritonPPUGPU/IR/Dialect.h"
+#include "GlobalLoadOffsets.h"
 #include "PPUGPUToLLVM/Passes.h"
 #include "TritonPPUGPUToLLVM/Passes.h"
 #include "TritonPPUGPUTransforms/Passes.h"
@@ -109,6 +110,7 @@ static void checkMatmulConstraints(const std::string &A_dtype,
 }
 
 void init_triton_ppu(py::module &&m) {
+  m.def("fold_global_load_offsets", &::triton::ppu::foldGlobalLoadOffsets);
   auto passes = m.def_submodule("passes");
   init_triton_ppu_passes_ttgpuir(passes.def_submodule("ttgpuir"));
   init_triton_ppu_passes_ttppugpuir(passes.def_submodule("ttppugpuir"));
