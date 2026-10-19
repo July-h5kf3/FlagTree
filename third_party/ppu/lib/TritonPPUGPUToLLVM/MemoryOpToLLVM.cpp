@@ -91,7 +91,8 @@ LogicalResult lowerPackedI8SharedStore(
   std::optional<LinearLayout> store;
   unsigned laneStart = 2, offsetIndex = 0;
   // Native byte transpose exchanges register byte bits with lane bits 2/3.
-  // Conjugating it by the lane permutation below also supports lane bits 0/1.
+  // For lane bits 0/1, permute source lanes before the transpose and invert
+  // that permutation through the store addresses.
   for (unsigned candidateLane : {2u, 0u}) {
     auto candidateBases = bases;
     std::swap(candidateBases[kReg][0], candidateBases[kLane][candidateLane]);
@@ -165,11 +166,12 @@ LogicalResult lowerPackedI8SharedStore(
     Value changed =
         createLLVMCallOp(rewriter, loc, nativeTranspose, ValueRange{word})
             .getResult();
-    if (laneStart == 0)
-      changed = LLVM::PPU::shuffleIdx(loc, rewriter, changed, shuffledLane);
+    // The lane permutation is an involution, so remap the address instead of
+    // shuffling the transposed value a second time.
+    Value storeLane = laneStart == 0 ? shuffledLane : laneId;
     auto offsets = applyLinearLayout(loc, rewriter, *store,
                                      {{kReg, b.i32_val(index)},
-                                      {kLane, laneId},
+                                      {kLane, storeLane},
                                       {kWarp, warpId},
                                       {kBlock, b.i32_val(0)}});
     Value address =
