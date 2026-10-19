@@ -4,7 +4,6 @@
 #include "Utility.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/IR/PatternMatch.h"
-#include "triton/Analysis/MetaXUtils.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -20,59 +19,6 @@ using namespace mlir::triton::gpu;
 using mlir::LLVM::METAX::lowerLdStMatrix;
 
 constexpr int kPtrBitWidth = 64;
-struct ConvertPackedInt8MmaToDot
-    : public ConvertOpToLLVMPattern<triton::gpu::ConvertLayoutOp> {
-  const METAX::TargetInfo &targetInfo;
-
-  ConvertPackedInt8MmaToDot(LLVMTypeConverter &converter,
-                            const METAX::TargetInfo &targetInfo,
-                            PatternBenefit benefit)
-      : ConvertOpToLLVMPattern(converter, benefit), targetInfo(targetInfo) {}
-
-  LogicalResult
-  matchAndRewrite(ConvertLayoutOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto srcTy = op.getSrc().getType();
-    auto dstTy = op.getType();
-    if (!METAX::isPackedInt8MmaToDot(srcTy, dstTy))
-      return failure();
-    auto loc = op.getLoc();
-    auto b = TritonLLVMOpBuilder(loc, rewriter);
-    auto lane = getLaneId(rewriter, loc);
-    auto headByte = b.and_(lane, b.i32_val(3));
-    auto sourceBase = b.or_(b.shl(b.and_(lane, b.i32_val(12)), b.i32_val(2)),
-                            b.shl(b.lshr(lane, b.i32_val(4)), b.i32_val(2)));
-    auto selector =
-        b.or_(b.mul(headByte, b.i32_val(0x1111)), b.i32_val(0x4040));
-    auto inputs = unpackLLElements(loc, adaptor.getSrc(), rewriter);
-    SmallVector<Value> outputs;
-    assert(inputs.size() % 4 == 0);
-    for (unsigned base = 0; base < inputs.size(); base += 4) {
-      Value packed = b.i32_val(0);
-      for (unsigned byte = 0; byte < 4; ++byte)
-        packed = b.or_(packed, b.shl(b.zext(i32_ty, inputs[base + byte]),
-                                     b.i32_val(byte * 8)));
-      SmallVector<Value> words;
-      for (unsigned token = 0; token < 4; ++token)
-        words.push_back(targetInfo.shuffleIdxIntrinsic(
-            rewriter, loc, packed, b.add(sourceBase, b.i32_val(token)), op));
-      auto first =
-          targetInfo.permute(rewriter, loc, words[0], words[1], selector);
-      auto second =
-          targetInfo.permute(rewriter, loc, words[2], words[3], selector);
-      auto result =
-          targetInfo.permute(rewriter, loc, first, second, b.i32_val(0x5410));
-      auto bytes = b.bitcast(result, vec_ty(i8_ty, 4));
-      for (unsigned byte = 0; byte < 4; ++byte)
-        outputs.push_back(b.extract_element(i8_ty, bytes, b.i32_val(byte)));
-    }
-    auto result =
-        packLLElements(loc, getTypeConverter(), outputs, rewriter, dstTy);
-    rewriter.replaceOp(op, result);
-    return success();
-  }
-};
-
 struct ConvertLayoutOpSwizzlingConversion
     : public ConvertOpToLLVMPattern<triton::gpu::ConvertLayoutOp> {
   const METAX::TargetInfo &targetInfo;
@@ -564,8 +510,6 @@ struct IGLPOpConversion : public ConvertOpToLLVMPattern<triton::gpu::IGLPOp> {
 void mlir::triton::METAX::populateConvertLayoutOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, const TargetInfo &targetInfo,
     RewritePatternSet &patterns, PatternBenefit benefit) {
-  patterns.add<ConvertPackedInt8MmaToDot>(typeConverter, targetInfo,
-                                          benefit.getBenefit() + 2);
   // Give this convertLayoutOpConversion a higher benefit as it only matches
   // optimized or cross CTA cases
   // patterns.add<ConvertLayoutOpConversion,

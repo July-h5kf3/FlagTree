@@ -328,7 +328,6 @@ PLUGIN_EXPORT void init_gluon_ir(py::module &&m) {
   m.attr("supports_maca_async_copy") = py::bool_(true);
   m.attr("supports_maca_async_copy_subviews") = py::bool_(true);
   m.attr("supports_maca_int8_col_major") = py::bool_(true);
-  m.attr("supports_maca_native_barriers") = py::bool_(true);
 #endif
 
   py::class_<GluonOpBuilder, TritonOpBuilder>(
@@ -622,17 +621,6 @@ PLUGIN_EXPORT void init_gluon_ir(py::module &&m) {
            [](GluonOpBuilder &self, int num) {
              ValueRange tokens;
              self.create<ttg::AsyncWaitOp>(tokens, num);
-           })
-      .def("create_maca_wait_all",
-           [](GluonOpBuilder &self) {
-             self.create<ttg::GVMArriveOp>(
-                 self.getBuilder().getI32IntegerAttr(0));
-             self.create<ttg::BarrierOp>();
-           })
-      .def("create_maca_block_barrier",
-           [](GluonOpBuilder &self) {
-             self.create<ttg::BarrierSharedOp>();
-             self.create<ttg::BarrierOp>();
            })
       .def("create_convert_layout",
            [](GluonOpBuilder &self, Type resultTy, Value value) -> Value {
