@@ -189,7 +189,9 @@ LogicalResult lowerPPULdMatrix(
 
   bool Opb8bLdmatrix =
       isPPU0010 && bitwidth == 8 && dotEnc.getOpIdx() == 1 && transpose;
-  if (bitwidth == 8 && transpose && !Opb8bLdmatrix)
+  bool packedInt8Transpose = isPPU0010 && bitwidth == 8 && transpose &&
+                             tensorTy.getElementType().isInteger(8);
+  if (bitwidth == 8 && transpose && !Opb8bLdmatrix && !packedInt8Transpose)
     return failure();
 
   // Inter block stmatrix is not supported
@@ -199,7 +201,7 @@ LogicalResult lowerPPULdMatrix(
   // Keep packed INT8 words intact through the register transpose.
   auto directModule =
       rewriter.getBlock()->getParent()->getParentOfType<ModuleOp>();
-  if (Opb8bLdmatrix && tensorTy.getElementType().isInteger(8)) {
+  if (packedInt8Transpose) {
     auto inputBases = regL.getBases();
     if (inputBases[kReg].size() >= 2 && inputBases[kLane].size() >= 4) {
       // mat.trans.b8 exchanges byte bits 0/1 with lane bits 2/3.
@@ -265,6 +267,10 @@ LogicalResult lowerPPULdMatrix(
       }
     }
   }
+
+  // The legacy byte-transpose path only supports operand B.
+  if (bitwidth == 8 && transpose && !Opb8bLdmatrix)
+    return failure();
 
   if (SharedMemoryObject::getMaskSpanOffsets(memDescType))
     return failure();
