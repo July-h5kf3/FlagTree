@@ -18,9 +18,8 @@ from typing import List
 from .. import _core as gl
 from .._core import _unwrap_if_constexpr, builtin
 from .._layouts import DistributedLayout, DotOperandLayout
-from . import async_copy
 
-__all__ = ["MacaMmaLayout", "mma", "async_copy"]
+__all__ = ["MacaMmaLayout", "mma"]
 
 
 @dataclass(frozen=True)
