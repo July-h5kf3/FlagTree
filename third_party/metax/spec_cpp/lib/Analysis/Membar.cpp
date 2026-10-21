@@ -166,6 +166,14 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
                             FuncBlockInfoMapT *funcBlockInfoMap,
                             OpBuilder *builder) {
 #ifdef USE_MACA
+  // Inline native synchronization must remain visible to shared-memory
+  // analysis.
+  if (auto barrier = op->getAttrOfType<BoolAttr>("maca.shared_barrier");
+      barrier && barrier.getValue() && !isMemoryEffectFree(op) &&
+      isa<triton::ExternElementwiseOp, triton::ElementwiseInlineAsmOp>(op)) {
+    blockInfo->sync();
+    return;
+  }
   bool disableOptMACA = std::getenv("TRITON_DISABLE_MACA_OPT_MMA");
   if (!disableOptMACA) {
     if (isa<triton::gpu::LocalLoadOp>(op)) {

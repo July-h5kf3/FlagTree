@@ -207,6 +207,16 @@ struct FuncOpConversion : public ConvertOpToLLVMPattern<triton::FuncOp> {
     // for `nvvm.annotation` metadata.
 #ifdef USE_MACA
     newFuncOp->setAttr("maca.maxntid", rewriter.getI32ArrayAttr(64 * numWarps));
+    if (triton::isKernel(funcOp)) {
+      // Match MCC register allocation to the threads used by the launcher.
+      SmallVector<Attribute> passthrough;
+      if (auto existing = newFuncOp.getPassthroughAttr())
+        passthrough.append(existing.begin(), existing.end());
+      passthrough.push_back(rewriter.getArrayAttr(
+          {rewriter.getStringAttr("metaxgpu-max-block-size"),
+           rewriter.getStringAttr(std::to_string(64 * numWarps))}));
+      newFuncOp.setPassthroughAttr(rewriter.getArrayAttr(passthrough));
+    }
 #else
     newFuncOp->setAttr(NVVM::NVVMDialect::getReqntidAttrName(),
                        rewriter.getDenseI32ArrayAttr(32 * numWarps));

@@ -64,12 +64,20 @@ lowerLocalLdPerm(Location loc, MLIRContext *ctx,
 
   int ord = getOrder(srcTy)[0];
   int smemNumCols = srcTy.getShape()[ord];
-  // create LL permTile = [2, elemVec]
+  int rowsPerTile = bitwidth == 8 ? 4 : 2;
+  if (bitwidth == 8) {
+    auto allocationShape = srcTy.getAllocShape();
+    smemNumCols =
+        allocationShape[allocationShape.size() - srcTy.getRank() + ord];
+  }
+  // A word covers four INT8 rows or two FP16/BF16 rows after transposition.
   // because permTile is not surjective for, so create by define and concat the
   // base
   auto elemsVec1D = LinearLayout::identity1D(elemsPerVec, kReg, kOffset);
   std::vector<std::vector<int32_t>> permBases = {{smemNumCols}};
-  auto outSize = llvm::NextPowerOf2(smemNumCols);
+  if (rowsPerTile == 4)
+    permBases.push_back({2 * smemNumCols});
+  auto outSize = llvm::NextPowerOf2(smemNumCols * (rowsPerTile / 2));
   for (auto &basis : elemsVec1D.getBases().lookup(kReg)) {
     permBases.push_back(basis);
     outSize = std::max<int32_t>(outSize, llvm::NextPowerOf2(basis[0]));
@@ -158,7 +166,7 @@ lowerLocalLdPerm(Location loc, MLIRContext *ctx,
     auto regIdxI8 = regIdx * (bitwidth / 8);
     Value offset = b.xor_(regBaseI8, b.i32_val(regIdxI8));
 
-    for (int j = 0; j < nAdditive; j += 2 * elemsPerVec) {
+    for (int j = 0; j < nAdditive; j += rowsPerTile * elemsPerVec) {
       // firstKVec = load <elemsPerVec/2 * i32> （k==0）
       // secondKVec = load <elemsPerVec/2 * i32> （k==1)
       // for _ from 0 to elemsPerVec/2:
@@ -178,6 +186,42 @@ lowerLocalLdPerm(Location loc, MLIRContext *ctx,
           b.add(firstInnerOffset, b.i32_val(secondRegIdxAddI8));
       auto secondVecAddr = b.gep(smemPtrTy, i8_ty, smemBase, secondInnerOffset,
                                  LLVM::GEPNoWrapFlags::inbounds);
+
+      if (bitwidth == 8) {
+        SmallVector<Value> rows;
+        auto rowType = vec_ty(i32_ty, elemsPerVec / 4);
+        for (int row = 0; row < 4; ++row) {
+          Value rowOffset =
+              b.add(firstInnerOffset, b.i32_val(row * smemNumCols));
+          auto address = b.gep(smemPtrTy, i8_ty, smemBase, rowOffset,
+                               LLVM::GEPNoWrapFlags::inbounds);
+          rows.push_back(b.load(rowType, address, elemsPerVec));
+        }
+        auto permute = [&](Value first, Value second, unsigned selector) {
+          return targetInfo.permute(rewriter, loc, first, second,
+                                    b.i32_val(selector));
+        };
+        for (int word = 0; word < elemsPerVec / 4; ++word) {
+          SmallVector<Value> words;
+          for (auto row : rows)
+            words.push_back(b.extract_element(row, b.i32_val(word)));
+          auto firstLow = permute(words[0], words[1], 0x5410);
+          auto firstHigh = permute(words[0], words[1], 0x7632);
+          auto secondLow = permute(words[2], words[3], 0x5410);
+          auto secondHigh = permute(words[2], words[3], 0x7632);
+          SmallVector<Value> columns{permute(firstLow, secondLow, 0x6420),
+                                     permute(firstLow, secondLow, 0x7531),
+                                     permute(firstHigh, secondHigh, 0x6420),
+                                     permute(firstHigh, secondHigh, 0x7531)};
+          for (int column = 0; column < 4; ++column) {
+            auto bytes = b.bitcast(columns[column], vec_ty(i8_ty, 4));
+            for (int row = 0; row < 4; ++row)
+              outVals[i + j + (word * 4 + column) * 4 + row] =
+                  b.extract_element(bytes, b.i32_val(row));
+          }
+        }
+        continue;
+      }
 
       // emit lds
       Type i32VecTy = vec_ty(i32_ty, elemsPerVec / 2);
@@ -554,8 +598,11 @@ public:
         auto elemMNK = mmaEnc.getElementsMNK();
         elemsPerVec = elemMNK[dotOpEnc.getOpIdx()];
         int elemsK = elemMNK[2];
-        if (regOrder != smemOrder && elemBytes == 2 && elemsPerVec % 2 == 0 &&
-            elemsK % 2 == 0) {
+        bool packedInt8 =
+            elemBytes == 1 && elemsPerVec % 4 == 0 && elemsK % 4 == 0;
+        bool pairedHalf =
+            elemBytes == 2 && elemsPerVec % 2 == 0 && elemsK % 2 == 0;
+        if (regOrder != smemOrder && (packedInt8 || pairedHalf)) {
           canMatrixPerm = true;
         }
       }
@@ -563,7 +610,8 @@ public:
 
     SmallVector<Value> outVals;
     if (canMatrixPerm) {
-      if (std::getenv("TRITON_DISABLE_SPLIT_PERM") == nullptr &&
+      if (elemBytes == 2 &&
+          std::getenv("TRITON_DISABLE_SPLIT_PERM") == nullptr &&
           op.getMmaMode() == TT_MODE) {
         // only lds and perm as a standalone operation.
         outVals = lowerLocalLdswithoutPerm(loc, ctx, cvt, llvmElemTy, memDescTy,

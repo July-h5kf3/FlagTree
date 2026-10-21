@@ -33,7 +33,9 @@ def min_dot_size(target: GPUTarget):
         assert lhs_bitwidth == rhs_bitwidth, "lhs and rhs bitwidth must be the same"
         # For small M/N the input we can still use tensorcores with padding.
         if lhs_bitwidth == 8:
-            return (1, 1, 32)
+            # C550 INT8 uses k16; FP8 and newer INT8 encodings need k32.
+            is_c550_int8 = lhs_type.scalar.is_int8() and rhs_type.scalar.is_int8() and target.arch % 10 < 6
+            return (1, 1, 16 if is_c550_int8 else 32)
         else:
             return (1, 1, 16)
 

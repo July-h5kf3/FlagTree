@@ -20,12 +20,13 @@ using namespace mlir::triton;
 namespace mlir::triton::gpu {
 class MemDescType;
 
-SmallVector<Value> emitSwizzleColOffsets(RewriterBase &rewriter, Operation *op,
-                                         RankedTensorType srcTy,
-                                         ArrayRef<int64_t> shape,
-                                         Attribute swizzledSharedEnc,
-                                         Attribute noSwizzledSharedEnc,
-                                         unsigned vec);
+SmallVector<Value>
+emitSwizzleColOffsets(RewriterBase &rewriter, Operation *op,
+                      RankedTensorType srcTy, ArrayRef<int64_t> shape,
+                      Attribute swizzledSharedEnc,
+                      Attribute noSwizzledSharedEnc, unsigned vec,
+                      Value affineSwizzledOffset = Value(),
+                      Value affineNoSwizzledOffset = Value());
 } // namespace mlir::triton::gpu
 
 namespace mlir {

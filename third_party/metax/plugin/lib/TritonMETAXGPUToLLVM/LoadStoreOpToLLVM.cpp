@@ -1242,6 +1242,8 @@ struct AsyncCopyGlobalToLocalOpConversion
     auto funcOp = op->getParentOfType<FunctionOpInterface>();
 
     auto srcTy = op.getSrc().getType();
+    if (other && !matchPattern(other, m_Zero()))
+      return op.emitError("MetaX async copy only supports zero filling");
     if (!isa<BlockedEncodingAttr>(srcTy.getEncoding()))
       return rewriter.notifyMatchFailure(op,
                                          "requires Blocked encoding for src");
@@ -1289,10 +1291,8 @@ struct AsyncCopyGlobalToLocalOpConversion
     // If contiguity > vector size, we can have one pointer maintaining the
     // start of the vector and the other pointer moving to the next vector.
     unsigned inVec = getContiguity(op.getSrc());
-    // TODO: check MaskAlignment? swizzleTensorOp and ldg.bsm must have same
-    // minVec value to ensure correctness if (mask) {
-    //   inVec = std::min(inVec, getMaskAlignment(mask));
-    // }
+    if (mask)
+      inVec = std::min(inVec, getMaskAlignment(mask));
     inVec = std::min(inVec, 128 / resElemTy.getIntOrFloatBitWidth());
 
     unsigned outVec = resSharedLayout.getVec();
@@ -1301,81 +1301,87 @@ struct AsyncCopyGlobalToLocalOpConversion
     if (maxPhase == 1) {
       minVec = inVec;
     }
+    if (minVec * resElemTy.getIntOrFloatBitWidth() < 32)
+      return rewriter.notifyMatchFailure(
+          op, "MetaX async copy requires at least four aligned bytes");
 
-    bool hasSwizzling = maxPhase > 1;
-    // If dst shared layout has swizzle, move swizzle pattern to src pointers.
-    // Because we only apply swizzling on contiguous dimension, and the
-    // colOffset on contiguous dimension satisfy condition below:
-    //    sharedSwizzledOffset = sharedNoSwizzledOffset + colOffset
-    //    blockedSwizzledIndex = blockedNoSwizzledIndex + colOffset
-    // So we can move swizzle pattern to src pointers by simply adding colOffset
-    //
-    // the src and dst layout of AsyncCopyGlobalToLocalOp
-    //             blockedNoSwizzledIndex
-    // |---tid0---|---tid1---|---tid2---|---tid3---|
-    //             sharedSwizzledOffset
-    // |---tid1---|---tid0---|---tid3---|---tid2---|
-    //
-    // after moving swizzle pattern to src pointers:
-    //             blockedSwizzledIndex
-    // |---tid1---|---tid0---|---tid3---|---tid2---|
-    //             sharedNoSwizzledOffset
-    // |---tid0---|---tid1---|---tid2---|---tid3---|
-
+    // LDG-to-shared writes consecutive lane-sized vectors from a uniform
+    // per-warp shared base. Move the shared swizzle into the source pointers.
+    // The predicate must be invariant across that swizzle.
     auto noSwizzleDstTy = dstTy;
     SmallVector<Value> srcSwiAddrs = srcElems;
-
-    if (hasSwizzling) {
-      // 1. Get noSwizzleSharedLayout
+    if (maxPhase > 1) {
+      auto *pointerInfo = axisAnalysisPass.getAxisInfo(op.getSrc());
+      if (!pointerInfo ||
+          pointerInfo->getContiguity(resSharedLayout.getOrder()[0]) <
+              outVec * maxPhase)
+        return op.emitError(
+            "MetaX async copy requires globally contiguous swizzle spans");
+      if (mask && getMaskAlignment(mask) < outVec * maxPhase)
+        return rewriter.notifyMatchFailure(
+            op, "MetaX async copy mask must be invariant across the swizzle");
       auto noSwizzleSharedEnc = SwizzledSharedEncodingAttr::get(
-          op->getContext(), outVec, 1, 1, resSharedLayout.getOrder(),
+          ctx, outVec, 1, 1, resSharedLayout.getOrder(),
           resSharedLayout.getCTALayout());
       noSwizzleDstTy =
           MemDescType::get(dstTy.getShape(), dstTy.getElementType(),
-                           noSwizzleSharedEnc, dstTy.getMemorySpace());
-      // 2. Get colOffset (size == srcElems.size() / minVec)
-      SmallVector<Value> colOffsets = triton::gpu::emitSwizzleColOffsets(
-          rewriter, op, srcTy, dstTy.getShape(), resSharedLayout,
-          noSwizzleSharedEnc, minVec);
-      // 3. Get blockedSwizzledIndex
+                           noSwizzleSharedEnc, dstTy.getMemorySpace(),
+                           dstTy.getMutableMemory(), dstTy.getAllocShape());
+      // Preserve the allocation geometry and origin of shared subviews.
+      auto affineSwizzledOffset = smemObj.getShmemOffset(loc, rewriter, dstTy);
+      auto affineNoSwizzledOffset =
+          smemObj.getShmemOffset(loc, rewriter, noSwizzleDstTy);
+      auto colOffsets = triton::gpu::emitSwizzleColOffsets(
+          rewriter, op, srcTy, dstTy.getAllocShape().take_back(dstTy.getRank()),
+          resSharedLayout, noSwizzleSharedEnc, minVec, affineSwizzledOffset,
+          affineNoSwizzledOffset);
       getCopyAsyncSwizzledGvmPtrs(rewriter, op, resElemTy, srcSwiAddrs,
                                   srcElems, colOffsets, minVec);
     }
 
-    // zip(srcSwiAddr, mask)
+    // Keep each source pointer paired with its original predicate.
     SmallVector<Value> vals;
     auto structTy =
         LLVM::LLVMStructType::getLiteral(ctx, ArrayRef<Type>{ptrTy, i1_ty});
     for (int i = 0; i < srcElems.size(); i++) {
       Value packedArr = rewriter.create<LLVM::UndefOp>(loc, structTy);
       packedArr = b.insert_val(packedArr, srcSwiAddrs[i], 0);
-      auto maskElem = llMask ? maskElems[i] : b.false_val();
+      auto maskElem = llMask ? maskElems[i] : b.true_val();
       packedArr = b.insert_val(packedArr, maskElem, 1);
       vals.push_back(packedArr);
     }
 
-    // 4. calculate cvt from swizzledBlockedLayout to noSwizzledSharedLayout
+    // Map distributed elements to shared byte offsets.
     // Build src to shared layout and remove broadcasted registers
     auto srcLayout = triton::gpu::toLinearLayout(srcTy);
     auto removeBroadcastSrc = actionRemoveBroadcastedRegs(srcLayout);
     srcLayout = removeBroadcastSrc.apply(srcLayout);
-    srcSwiAddrs = removeBroadcastSrc.apply(srcSwiAddrs);
+    vals = removeBroadcastSrc.apply(vals);
 
-    LinearLayout noSwiSmemLayout = triton::gpu::toLinearLayout(noSwizzleDstTy);
-    auto cvt = srcLayout.invertAndCompose(noSwiSmemLayout);
+    auto sharedLayout = triton::gpu::toLinearLayout(noSwizzleDstTy);
+    auto cvt = srcLayout.invertAndCompose(sharedLayout);
+    if (!cvt.isTrivialOver({str_attr("block")}))
+      return op.emitError(
+          "MetaX async copy does not support multi-CTA layouts");
     cvt = cvt.sublayout(
         {str_attr("register"), str_attr("lane"), str_attr("warp")},
         {str_attr("offset")});
+    auto laneBases = cvt.getBases().lookup(str_attr("lane"));
+    for (unsigned bit = 0; bit < laneBases.size(); ++bit)
+      if (laneBases[bit][0] != (minVec << bit))
+        return rewriter.notifyMatchFailure(
+            op, "MetaX async copy requires contiguous shared vectors across "
+                "the 64 lanes of each warp");
 
     // 5. emit ldg.bsm using lowerLdSt
     // TODO: laneID???
     Value threadPred = emitRedundantThreadPredicate(getFreeVariableMasks(srcTy),
                                                     rewriter, loc, targetInfo);
 
-    auto emitLdgBsm = [&b, op, threadPred, ptrTy, minVec](
-                          RewriterBase &rewriter, Location loc,
-                          ArrayRef<Value> vals, Value shmemAddr, int startIdx,
-                          VectorType vecTy) -> SmallVector<Value> {
+    auto emitLdgBsm = [&b, op, ptrTy](RewriterBase &rewriter, Location loc,
+                                      ArrayRef<Value> vals, Value shmemAddr,
+                                      int startIdx,
+                                      VectorType vecTy) -> SmallVector<Value> {
       assert(isa<VectorType>(vecTy));
       auto *ctx = rewriter.getContext();
       auto valueElemTy = vecTy.getElementType();
@@ -1386,8 +1392,8 @@ struct AsyncCopyGlobalToLocalOpConversion
       Type gvmi8Ptr = ptr_ty(ctx, 1);
       Value gvmi8Addr = b.bitcast(gvmAddr, gvmi8Ptr);
 
-      auto cond = maybeAnd(rewriter, loc, threadPred, maskElem);
-      Value maskVal = b.zext(IntegerType::get(rewriter.getContext(), 32), cond);
+      Value maskVal =
+          b.zext(IntegerType::get(rewriter.getContext(), 32), maskElem);
       std::string icmp = "llvm.mxc.icmp.i64.i32";
       StringRef icmpName(icmp);
       Value cmpModel = b.i32_val(34);
@@ -1411,12 +1417,21 @@ struct AsyncCopyGlobalToLocalOpConversion
       rangeValueLdgBsm[7] = b.int_val(1, 1); // enable async
       ValueRange ldgBsmValue(rangeValueLdgBsm);
 
+      // Native MACA LDG-to-shared intrinsics use 32-bit words, including when
+      // the copied tensor contains INT8 or FP16/BF16 elements.
+      unsigned words =
+          vecTy.getNumElements() * valueElemTy.getIntOrFloatBitWidth() / 32;
+      auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+      Value laneByteOffset =
+          b.mul(laneId, b.i32_val(-static_cast<int>(words * 4)));
+      rangeValueLdgBsm[0] =
+          b.gep(ptr_ty(ctx, 3), i8_ty, shmemAddr, laneByteOffset);
+      ldgBsmValue = ValueRange(rangeValueLdgBsm);
       std::string ldgPredicator = "llvm.mxc.ldg.predicator.bsm";
-      appendIntrinsicModifer(ldgPredicator, minVec, valueElemTy);
+      appendIntrinsicModifer(ldgPredicator, words, i32_ty);
       StringRef ldgBsmFuncName(ldgPredicator);
 
-      // RetType of llvm.mxc.ldg.predicator.f32 should be float
-      Type retTy = minVec > 1 ? vec_ty(valueElemTy, minVec) : valueElemTy;
+      Type retTy = words > 1 ? vec_ty(i32_ty, words) : Type(i32_ty);
       mlir::LLVM::createBuiltinFunc<triton::gpu::AsyncCopyGlobalToLocalOp>(
           rewriter, loc, op, ldgBsmFuncName, retTy, ldgBsmValue);
       return {};
@@ -1425,14 +1440,27 @@ struct AsyncCopyGlobalToLocalOpConversion
     auto affineOffset = smemObj.getShmemOffset(loc, rewriter, noSwizzleDstTy);
     auto maskSpanAffineOffset =
         SharedMemoryObject::getMaskSpanOffsets(noSwizzleDstTy);
+    // A masked-off redundant lane must not zero another lane's destination.
+    // Branch around the copy for redundant lanes; the data predicate alone
+    // controls zero filling on the lanes that own the shared-memory elements.
+    auto *currentBlock = rewriter.getInsertionBlock();
+    auto *continuation = currentBlock->splitBlock(rewriter.getInsertionPoint());
+    auto *copyBlock = rewriter.createBlock(
+        currentBlock->getParent(), std::next(Region::iterator(currentBlock)));
+    rewriter.setInsertionPointToEnd(currentBlock);
+    rewriter.create<LLVM::CondBrOp>(loc, threadPred, copyBlock, continuation);
+    rewriter.setInsertionPointToStart(copyBlock);
     auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
     lowerLdSt(
         loc, ctx, cvt, vals, resElemTy, smemObj.getBase(),
         [](Value v) { return v; }, affineOffset, maskSpanAffineOffset, laneId,
         warpId, rewriter, targetInfo, minVec, emitLdgBsm);
 
+    rewriter.create<LLVM::BrOp>(loc, ValueRange{}, continuation);
+    rewriter.setInsertionPointToStart(continuation);
+
     // Drop the result token.
-    rewriter.replaceOp(op, llDst);
+    rewriter.replaceOp(op, b.i32_val(0));
     return success();
   }
 };
