@@ -206,9 +206,14 @@ LogicalResult SquadDotOp::verify() {
   auto instrShape = mmaEnc.getInstrShape();
   if (instrShape.size() != 3)
     return emitError("SQMMA result encoding must carry a 3D instrShape");
+  bool matchesK = getK() == static_cast<int32_t>(instrShape[2]);
+#ifdef __TLE__
+  // Explicit TLE chains retain the first dot's C encoding across dtypes.
+  // K does not affect C ownership and is verified against the current dtype.
+  matchesK |= (*this)->hasAttr("musa_tle.explicit_sqmma");
+#endif // __TLE__
   if (getM() != static_cast<int32_t>(instrShape[0]) ||
-      getN() != static_cast<int32_t>(instrShape[1]) ||
-      getK() != static_cast<int32_t>(instrShape[2]))
+      getN() != static_cast<int32_t>(instrShape[1]) || !matchesK)
     return emitError(
         "SQMMA m/n/k attrs must match the #ttg.musa_sqmma instrShape");
   if (retTy.getEncoding() != retEnc)
