@@ -566,12 +566,8 @@ static unsigned getDotInstructionK(triton::DotOp,
                                    MUSASqmmaEncodingAttr encoding) {
   return encoding.getInstrShape()[2];
 }
-static unsigned getDotInstructionK(triton::musa::SquadDotOp op,
-                                   MUSASqmmaEncodingAttr) {
-  return op.getK();
-}
-static unsigned getDotInstructionK(triton::mtgpu::SqmmaOp op,
-                                   MUSASqmmaEncodingAttr) {
+template <typename DotLikeOp>
+static unsigned getDotInstructionK(DotLikeOp op, MUSASqmmaEncodingAttr) {
   return op.getK();
 }
 
