@@ -562,6 +562,15 @@ getDotAccumulationMode(triton::mtgpu::SqmmaOp op) {
       static_cast<int>(op.getAccMode()));
 }
 
+static unsigned getDotInstructionK(triton::DotOp,
+                                   MUSASqmmaEncodingAttr encoding) {
+  return encoding.getInstrShape()[2];
+}
+template <typename DotLikeOp>
+static unsigned getDotInstructionK(DotLikeOp op, MUSASqmmaEncodingAttr) {
+  return op.getK();
+}
+
 template <typename DotLikeOp, typename DotLikeAdaptor>
 LogicalResult convertSQMMADotImpl(DotLikeOp op, DotLikeAdaptor adaptor,
                                   const LLVMTypeConverter *typeConverter,
@@ -594,7 +603,8 @@ LogicalResult convertSQMMADotImpl(DotLikeOp op, DotLikeAdaptor adaptor,
 
   const unsigned instM = instrShape[0];
   const unsigned instN = instrShape[1];
-  const unsigned instK = instrShape[2];
+  // A reused FP32 accumulator may retain a preceding dtype's encoding K.
+  const unsigned instK = getDotInstructionK(op, mmaEnc);
 
   Value opA = getDotOperandA(op);
   Value opB = getDotOperandB(op);
