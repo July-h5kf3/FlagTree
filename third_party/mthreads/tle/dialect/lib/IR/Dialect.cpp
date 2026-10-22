@@ -540,11 +540,8 @@ LogicalResult SqmmaOp::verify() {
   auto dTy = dyn_cast<RankedTensorType>(getD().getType());
   if (!aTy || !bTy || !cTy || !dTy)
     return emitOpError("expects memdesc A/B and ranked tensor accumulator");
-  unsigned rank = aTy.getRank();
-  if ((rank != 2 && rank != 3) || bTy.getRank() != rank ||
-      cTy.getRank() != rank)
-    return emitOpError(
-        "expects matching rank-2 or rank-3 A, B, and accumulator operands");
+  if (aTy.getRank() != 2 || bTy.getRank() != 2 || cTy.getRank() != 2)
+    return emitOpError("expects rank-2 A, B, and accumulator operands");
   if (!isa<ttg::SharedMemorySpaceAttr>(aTy.getMemorySpace()) ||
       !isa<ttg::SharedMemorySpaceAttr>(bTy.getMemorySpace()))
     return emitOpError("expects A and B in shared memory");
@@ -562,13 +559,9 @@ LogicalResult SqmmaOp::verify() {
   ArrayRef<int64_t> aShape = aTy.getShape();
   ArrayRef<int64_t> bShape = bTy.getShape();
   ArrayRef<int64_t> cShape = cTy.getShape();
-  if (rank == 3 && (aShape[0] != bShape[0] || aShape[0] != cShape[0]))
-    return emitOpError(
-        "expects matching batch dimensions for A, B, and accumulator");
-  if (aShape.back() != bShape[rank - 2] ||
-      cShape[rank - 2] != aShape[rank - 2] || cShape.back() != bShape.back())
-    return emitOpError(
-        "expects A[...,M,K] * B[...,K,N] and accumulator[...,M,N]");
+  if (aShape[1] != bShape[0] || cShape[0] != aShape[0] ||
+      cShape[1] != bShape[1])
+    return emitOpError("expects A[M,K] * B[K,N] and accumulator[M,N]");
   if (!getIsAsync())
     return emitOpError("requires isAsync=true");
   if (getMaxNumImpreciseAcc() != 0)

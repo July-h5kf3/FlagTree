@@ -44,26 +44,20 @@ def validate_operands(a, b, acc) -> None:
         if not hasattr(operand_type, "storage"):
             raise ValueError(f"initial mthreads TLE wgmma requires shared-memory memdesc {name}")
         shape = tuple(int(_unwrap(dim)) for dim in operand_type.shape)
-        if len(shape) not in (2, 3):
-            raise ValueError(f"mthreads TLE wgmma requires rank-2 or rank-3 {name}, got {shape}")
+        if len(shape) != 2:
+            raise ValueError(f"initial mthreads TLE wgmma requires rank-2 {name}, got {shape}")
         if operand.dtype not in (tl.float16, tl.bfloat16, tl.float8e4nv):
             raise ValueError("mthreads TLE wgmma requires f16, bf16, or fp8e4nv "
                              f"{name}, got {operand.dtype}")
     if a.dtype != b.dtype:
         raise ValueError("mthreads TLE wgmma requires matching A/B dtypes, "
                          f"got {a.dtype} and {b.dtype}")
-    a_batch = tuple(int(_unwrap(dim)) for dim in a.type.shape[:-2])
-    b_batch = tuple(int(_unwrap(dim)) for dim in b.type.shape[:-2])
-    if a_batch != b_batch:
-        raise ValueError("mthreads TLE wgmma requires matching batch dimensions, "
-                         f"got {a_batch} and {b_batch}")
     if acc is not None and getattr(acc, "dtype", None) != tl.float32:
         raise ValueError("mthreads TLE wgmma requires an f32 accumulator")
 
 
 def _transpose_smem_operand(operand, semantic):
-    order = list(range(len(operand.type.shape)))
-    order[-2], order[-1] = order[-1], order[-2]
+    order = [1, 0]
     handle = semantic.builder.create_memdesc_trans(operand.handle, order)
     shape = [operand.type.shape[index] for index in order]
 

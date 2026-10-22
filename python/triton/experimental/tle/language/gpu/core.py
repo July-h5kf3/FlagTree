@@ -885,10 +885,9 @@ def wgmma(
     A may be a shared-memory TLE buffer or a register tensor. B must currently
     be a shared-memory TLE buffer. ``trans_a`` and ``trans_b`` are rank-2
     descriptor/tensor transpose requests; shared-memory transposes are emitted
-    as descriptor-only views. MThreads requires shared A/B buffers and also
-    accepts rank-3 operands with matching batch dimensions, transposing only
-    their last two axes. Its FP32 accumulator may be reused across FP16,
-    BF16, and E4M3FN calls with the same result shape and compatible C layouts.
+    as descriptor-only views. MThreads requires shared A/B buffers. Its FP32
+    accumulator may be reused across FP16, BF16, and E4M3FN calls with the same
+    result shape and compatible C layouts.
 
     The returned accumulator is an async WGMMA dependency value. Use
     ``tle.gpu.wgmma_wait(pendings, acc)`` before consuming it with ordinary
@@ -902,11 +901,8 @@ def wgmma(
     else:
         a, b = _canonicalize_wgmma_operands(a, b, trans_a, trans_b, _semantic)
 
-    a_shape = [int(tl._unwrap_if_constexpr(dim)) for dim in a.type.shape]
-    b_shape = [int(tl._unwrap_if_constexpr(dim)) for dim in b.type.shape]
-    m, k = a_shape[-2:]
-    k_b, n = b_shape[-2:]
-    result_shape = a_shape[:-2] + [m, n]
+    m, k = [int(tl._unwrap_if_constexpr(dim)) for dim in a.type.shape]
+    k_b, n = [int(tl._unwrap_if_constexpr(dim)) for dim in b.type.shape]
     if k != k_b:
         raise ValueError(f"wgmma shape mismatch: a is {a.type.shape}, b is {b.type.shape}")
     if mthreads_enabled:
@@ -950,7 +946,7 @@ def wgmma(
         mthreads_wgmma.validate_options(max_num_imprecise_acc, out_dtype)
 
     ret_scalar_ty = _wgmma_ret_scalar_ty(a.dtype, out_dtype)
-    ret_ty = tl.block_type(ret_scalar_ty, result_shape)
+    ret_ty = tl.block_type(ret_scalar_ty, [m, n])
     builder = _semantic.builder
 
     acc = tl._unwrap_if_constexpr(acc)
@@ -960,8 +956,8 @@ def wgmma(
     else:
         if not isinstance(acc, tl.tensor):
             raise ValueError(f"wgmma acc must be a tl.tensor or None, got {type(acc).__name__}")
-        if tuple(int(tl._unwrap_if_constexpr(dim)) for dim in acc.type.shape) != tuple(result_shape):
-            raise ValueError(f"wgmma acc shape must be {tuple(result_shape)}, got {acc.type.shape}")
+        if tuple(int(tl._unwrap_if_constexpr(dim)) for dim in acc.type.shape) != (m, n):
+            raise ValueError(f"wgmma acc shape must be {(m, n)}, got {acc.type.shape}")
         if acc.dtype != ret_scalar_ty:
             raise ValueError(f"wgmma acc dtype must be {ret_scalar_ty}, got {acc.dtype}")
         acc_handle = acc.handle

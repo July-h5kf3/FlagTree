@@ -407,9 +407,9 @@ struct TritonMUSAGPUTLELowerSqmmaPass
         return signalPassFailure();
       }
       unsigned numWarps = ttg::maybeLookupNumWarps(dot).value_or(0);
-      auto config = selectSqmmaConfig(
-          aTy.getShape()[aTy.getRank() - 2], bTy.getShape().back(),
-          aTy.getShape().back(), numWarps, *operandType);
+      auto config =
+          selectSqmmaConfig(aTy.getShape()[0], bTy.getShape()[1],
+                            aTy.getShape()[1], numWarps, *operandType);
       if (!config) {
         dot.emitOpError("cannot select a supported SQMMA configuration");
         return signalPassFailure();

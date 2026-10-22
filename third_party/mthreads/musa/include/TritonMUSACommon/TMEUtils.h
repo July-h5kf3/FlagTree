@@ -565,21 +565,8 @@ inline LinearLayout buildPH1TMESharedLinearLayout(
         applyPH1TMESwizzleToByteAddress(elemOffset * elemBytes, sg, ss, sl);
     assert((logicalByteOffset % elemBytes) == 0 &&
            "PH1 TME swizzle must preserve element alignment");
-    SmallVector<int32_t> coords;
-    if (shape.size() == 3 && order.back() == 0) {
-      // Each batch has the same grouped matrix storage as a 2D SQMMA
-      // operand. Wide TLE transfers are segmented into that layout below.
-      SmallVector<int64_t, 2> matrixShape{shapePerCTA[1], shapePerCTA[2]};
-      SmallVector<unsigned, 2> matrixOrder{order[0] - 1, order[1] - 1};
-      int64_t matrixElems = matrixShape[0] * matrixShape[1];
-      int64_t offset = logicalByteOffset / elemBytes;
-      coords = decodePH1TMELinearOffsetToCoords(
-          offset % matrixElems, matrixShape, matrixOrder, elemBytes);
-      coords.insert(coords.begin(), static_cast<int32_t>(offset / matrixElems));
-    } else {
-      coords = decodePH1TMELinearOffsetToCoords(logicalByteOffset / elemBytes,
-                                                shapePerCTA, order, elemBytes);
-    }
+    auto coords = decodePH1TMELinearOffsetToCoords(
+        logicalByteOffset / elemBytes, shapePerCTA, order, elemBytes);
     offsetBases.emplace_back(coords.begin(), coords.end());
   }
 
@@ -624,10 +611,7 @@ resolveCanonicalPH1TMESharedCarrierConfig(ttg::MemDescType localType) {
     return failure();
 
   auto order = swizzled.getOrder();
-  unsigned rank = localType.getRank();
-  // A leading batch axis preserves the canonical per-matrix swizzle.
-  if ((rank != 2 && rank != 3) || order.size() != rank ||
-      (rank == 3 && order.back() != 0))
+  if (localType.getShape().size() != 2 || order.size() < 2)
     return failure();
 
   if (swizzled.getVec() == 1 && swizzled.getPerPhase() == 1 &&
@@ -958,46 +942,6 @@ getTLETMECopySegments(ttg::MemDescType type, ArrayRef<int32_t> blockShape) {
     return segments;
   }
   TLETMECopySegment whole{shape, SmallVector<int64_t>(shape.size(), 0), 0};
-  if (shape.size() == 3) {
-    auto order = ttg::getOrder(type);
-    auto elemBytes = inferElemBytesFromMemDescType(type);
-    if (!elemBytes || order.size() != 3 || order.back() != 0 ||
-        shape[order.front()] * *elemBytes <= 256)
-      return SmallVector<TLETMECopySegment>{whole};
-
-    // A full 3D TME transfer packs wide rows differently from SQMMA's
-    // 256-byte groups. Reuse the 2D plan for each batch without extra buffers.
-    auto swizzled =
-        dyn_cast<ttg::SwizzledSharedEncodingAttr>(type.getEncoding());
-    if (!swizzled)
-      return failure();
-    SmallVector<unsigned, 2> matrixOrder{order[0] - 1, order[1] - 1};
-    auto cga = getDefaultTMECGALayout(type.getContext(), 2, 1, matrixOrder);
-    auto encoding = ttg::SwizzledSharedEncodingAttr::get(
-        type.getContext(), swizzled.getVec(), swizzled.getPerPhase(),
-        swizzled.getMaxPhase(), matrixOrder, cga);
-    auto matrixShape = type.getShape().take_back(2);
-    auto allocShape = type.getAllocShape().take_back(2);
-    auto matrixType = ttg::MemDescType::get(
-        matrixShape, type.getElementType(), encoding, type.getMemorySpace(),
-        type.getMutableMemory(), allocShape);
-    auto matrixSegments =
-        getTLETMECopySegments(matrixType, blockShape.drop_front());
-    if (failed(matrixSegments))
-      return failure();
-    SmallVector<TLETMECopySegment> segments;
-    for (int64_t batch = 0; batch < shape[0]; ++batch) {
-      for (auto segment : *matrixSegments) {
-        segment.shape.insert(segment.shape.begin(), 1);
-        segment.offsets.insert(segment.offsets.begin(), batch);
-        segment.sharedOffset += batch * allocShape[0] * allocShape[1];
-        ++segment.rowAxis;
-        ++segment.leadingAxis;
-        segments.push_back(std::move(segment));
-      }
-    }
-    return segments;
-  }
   if (shape.size() != 2)
     return SmallVector<TLETMECopySegment>{whole};
 

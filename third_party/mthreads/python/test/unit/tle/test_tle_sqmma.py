@@ -595,7 +595,7 @@ def test_mthreads_tle_sqmma_staged_transpose_ir():
 
 
 def test_mthreads_tle_sqmma_transpose_validates_before_building_view():
-    with pytest.raises(CompilationError, match="matching batch dimensions"):
+    with pytest.raises(CompilationError, match="requires rank-2 a"):
         compile_to_ttir(_tle_sqmma_trans_invalid_rank_kernel, {"out": "*fp32"})
 
 
