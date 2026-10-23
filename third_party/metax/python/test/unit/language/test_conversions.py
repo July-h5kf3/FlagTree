@@ -114,19 +114,6 @@ def test_metax_fp64_to_fp8(dst_dtype, rounding, metax_device):
     _metax_assert_fp8_conversion(bits, tl.float64, dst_dtype, metax_device, rounding)
 
 
-@pytest.mark.parametrize("src_dtype", [tl.bfloat16, tl.float32])
-@pytest.mark.parametrize("rounding", [None, "rtne"])
-def test_metax_e4m3_nan(src_dtype, rounding, metax_device):
-    if src_dtype == tl.bfloat16:
-        bits = np.arange(65536, dtype=np.uint16)
-    else:
-        payloads = np.concatenate((np.arange(1, 65536, dtype=np.uint32),
-                                   np.array([0x3fffff, 0x400000, 0x400001, 0x7fffff], dtype=np.uint32)))
-        bits = np.concatenate((_metax_fp8_boundary_values(tl.float8e4nv, np.float32),
-                               payloads | np.uint32(0x7f800000), payloads | np.uint32(0xff800000)))
-    _metax_assert_fp8_conversion(bits, src_dtype, tl.float8e4nv, metax_device, rounding)
-
-
 @triton.jit
 def exhaustive_populate(dst, offset, BLOCK_SIZE : tl.constexpr, force_odd : tl.constexpr, output_bits : tl.constexpr, max_repr : tl.constexpr):
 

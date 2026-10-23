@@ -815,7 +815,7 @@ struct FpToFpOpConversion
     intVal = b.and_(intVal, srcFpInfo.toLLVMIntValue(absoluteMask));
 
     uint32_t expFullMask = ((1U << srcExponentBits) - 1U) << srcMantissaBits;
-    uint32_t mantFullMask = (1U << srcMantissaBits) - 1U;
+    uint32_t mantFullMask = 1U << srcMantissaBits - 1U;
     Value isNaNOrInf =
         b.icmp_eq(b.and_(intVal, srcFpInfo.toLLVMIntValue(expFullMask)),
                   srcFpInfo.toLLVMIntValue(expFullMask));
