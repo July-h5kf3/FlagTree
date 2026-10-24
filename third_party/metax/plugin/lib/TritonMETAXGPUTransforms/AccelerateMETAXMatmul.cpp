@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <optional>
 
 #define DEBUG_TYPE "TritonMETAXGPUAccelerateMatmulPass"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -153,6 +154,31 @@ public:
 
     // for FMA, should retain the blocked layout.
     int versionMajor = computeCapabilityToMMAVersion(computeCapability);
+    auto aType = dotOp.getA().getType();
+    auto bType = dotOp.getB().getType();
+    bool isFp8 =
+        isa<Float8E4M3FNType, Float8E5M2Type>(aType.getElementType()) &&
+        isa<Float8E4M3FNType, Float8E5M2Type>(bType.getElementType());
+    if (isFp8 && (!supportMMA(dotOp, versionMajor, computeCapability % 10) ||
+                  aType.getElementType() != bType.getElementType())) {
+      // All finite E4M3FN/E5M2 values are exactly representable in FP16.
+      // Use the existing FP16 MMA path on older targets and for mixed FP8.
+      dotOp.emitWarning("using non-native FP8 dot on MetaX target ")
+          << computeCapability << ": converting " << aType.getElementType()
+          << " x " << bType.getElementType()
+          << " to f16 x f16 with f32 accumulation";
+      auto a = rewriter.create<triton::FpToFpOp>(
+          dotOp.getLoc(), aType.cloneWith(std::nullopt, rewriter.getF16Type()),
+          dotOp.getA());
+      auto b = rewriter.create<triton::FpToFpOp>(
+          dotOp.getLoc(), bType.cloneWith(std::nullopt, rewriter.getF16Type()),
+          dotOp.getB());
+      rewriter.modifyOpInPlace(dotOp, [&] {
+        dotOp->setOperand(0, a);
+        dotOp->setOperand(1, b);
+      });
+      return success();
+    }
     if (!supportMMA(dotOp, versionMajor, computeCapability % 10))
       return failure();
 

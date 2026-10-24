@@ -1485,6 +1485,12 @@ class TritonSemantic(Generic[TensorTy]):
             max_num_imprecise_acc: int, out_dtype: tl.dtype) -> TensorTy:
         assert lhs.type.is_block() and rhs.type.is_block()
 
+        if lhs.dtype in (tl.float8e4nv, tl.float8e5) and rhs.dtype in (tl.float8e4nv, tl.float8e5):
+            if out_dtype != tl.float32:
+                raise ValueError(f"MetaX FP8 dot requires out_dtype=float32, got {out_dtype}")
+            if acc is not None and acc.dtype != tl.float32:
+                raise ValueError(f"MetaX FP8 dot requires a float32 accumulator, got {acc.dtype}")
+
         if lhs.dtype.is_fp8() and rhs.dtype.is_fp8():
             # All combinations of supported fp8 x fp8 are permitted
             pass

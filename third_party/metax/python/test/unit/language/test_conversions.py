@@ -41,13 +41,6 @@ def launch_type_convert_triton(src, src_dtype, dst_dtype, device, rounding=None,
     return dst
 
 
-@pytest.fixture
-def metax_device(device):
-    if triton.runtime.driver.active.get_current_target().backend != "maca":
-        pytest.skip("requires the MetaX backend")
-    return device
-
-
 def _metax_cast_bits(bits, src_dtype, dst_dtype, device, rounding=None):
     # Transfer integer storage so signaling NaNs reach the kernel unchanged.
     src = torch.from_numpy(bits.view(getattr(np, f"int{bits.dtype.itemsize * 8}")))
