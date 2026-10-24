@@ -180,9 +180,16 @@ void LayoutRematerialization::cleanup() {
     op->erase();
 }
 
+bool isMacaE4M3FNPromotion(Operation *op) {
+  return op->hasAttr("maca.keep_e4m3fn_decode_layout");
+}
+
 // Return true if the op is an op with a layout we don't want to change. We will
 // propagate the layout starting from anchor ops.
 bool isLayoutAnchor(Operation *op) {
+  // Software E4M3FN decoding is expensive after dot-operand replication.
+  if (isMacaE4M3FNPromotion(op))
+    return true;
   if (isa<DescriptorOpInterface>(op))
     return true;
   if (isa<LoadOp, StoreOp>(op))
@@ -754,6 +761,8 @@ Operation *LayoutPropagation::rewriteOp(Operation *op) {
 }
 
 bool canBeRemat(Operation *op) {
+  if (isMacaE4M3FNPromotion(op))
+    return false;
   if (isa<LoadOp, StoreOp>(op))
     return !isExpensiveLoadOrStore(op);
   if (isa<AtomicRMWOp, AtomicCASOp, DotOp>(op))
@@ -1316,6 +1325,8 @@ void LayoutRematerialization::hoistConvertDotOperand(
   // We hoist over any operation that can be done without data movement between
   // threads We do views and elementwise pure ops for now
   auto noDataMovement = [](Operation *op) {
+    if (isMacaE4M3FNPromotion(op))
+      return false;
     return (op->hasTrait<OpTrait::Elementwise>() && isMemoryEffectFree(op)) ||
            isa<BroadcastOp, Fp4ToFpOp, ConvertLayoutOp, UpcastFpOpInterface>(
                op) ||

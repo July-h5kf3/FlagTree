@@ -5702,13 +5702,18 @@ _metax_fp8_pairs = list(itertools.product([tl.float8e4nv, tl.float8e5], repeat=2
 
 
 @pytest.mark.parametrize("lhs_dtype,rhs_dtype,pattern,block",
-                         [(a, b, "finite", block) for a, b in _metax_fp8_pairs for block in (32, 64)] +
+                         [(a, b, "finite", block)
+                          for a, b in _metax_fp8_pairs
+                          for block in (32, 64)] + [(a, b, "finite_row", 64) for a, b in _metax_fp8_pairs] +
                          [(a, b, pattern, 32)
                           for a, b in _metax_fp8_pairs
                           for pattern in ("subnormal", "rhs_subnormal", "nan")] + [(tl.float8e5, b, pattern, 32)
                                                                                    for b in (tl.float8e4nv, tl.float8e5)
                                                                                    for pattern in ("inf", "-inf")])
 def test_metax_fp8_dot(lhs_dtype, rhs_dtype, pattern, block, metax_device):
+    is_row_major = pattern == "finite_row"
+    if is_row_major:
+        pattern = "finite"
     m = n = block
     k = 2 * block
     rng = np.random.default_rng(20261023)
@@ -5716,7 +5721,7 @@ def test_metax_fp8_dot(lhs_dtype, rhs_dtype, pattern, block, metax_device):
     b_pattern = "finite" if pattern == "finite" else "subnormal" if pattern == "rhs_subnormal" else "one"
     a, av = _metax_fp8_dot_operand(lhs_dtype, (m, k), a_pattern, rng, metax_device)
     b, bv = _metax_fp8_dot_operand(rhs_dtype, (k, n), b_pattern, rng, metax_device)
-    if block == 64:
+    if block == 64 and not is_row_major:
         b = b.T.contiguous().T
     out = torch.empty((m, n), dtype=torch.float32, device=metax_device)
     initial_acc = 1.25 if pattern == "finite" else 0.
@@ -5737,6 +5742,14 @@ def test_metax_fp8_dot(lhs_dtype, rhs_dtype, pattern, block, metax_device):
     is_native = target.arch // 10 == 8 and target.arch % 10 >= 6 and lhs_dtype == rhs_dtype
     suffix = ("32f8" if lhs_dtype == tl.float8e4nv else "32bf8") if is_native else "16f16"
     assert "llvm.mxc.mma.f32.16x16x" + suffix in kernel.asm["llir"]
+    if is_row_major and target.arch == 80:
+        promotions = [line for line in kernel.asm["ttgir"].splitlines() if "tt.fp_to_fp" in line and "f8E4M3FN" in line]
+        if rhs_dtype == tl.float8e4nv:
+            if lhs_dtype == rhs_dtype:
+                assert re.search(r"use.opt.maca.mma\s*=\s*1", kernel.asm["ttgir"])
+            assert promotions and all("#ttg.dot_op" not in line for line in promotions)
+        elif lhs_dtype == tl.float8e4nv:
+            assert promotions and all("#ttg.dot_op" in line for line in promotions)
 
 
 @pytest.mark.parametrize("acc_dtype,out_dtype,error", [

@@ -167,12 +167,33 @@ public:
           << computeCapability << ": converting " << aType.getElementType()
           << " x " << bType.getElementType()
           << " to f16 x f16 with f32 accumulation";
-      auto a = rewriter.create<triton::FpToFpOp>(
-          dotOp.getLoc(), aType.cloneWith(std::nullopt, rewriter.getF16Type()),
-          dotOp.getA());
-      auto b = rewriter.create<triton::FpToFpOp>(
-          dotOp.getLoc(), bType.cloneWith(std::nullopt, rewriter.getF16Type()),
-          dotOp.getB());
+      auto promote = [&](Value operand) -> Value {
+        auto operandType = cast<RankedTensorType>(operand.getType());
+        Value src = operand;
+        auto layout = operand.getDefiningOp<ConvertLayoutOp>();
+        if (layout && isa<Float8E4M3FNType>(operandType.getElementType()) &&
+            isa<Float8E4M3FNType>(bType.getElementType()) &&
+            isa<BlockedEncodingAttr>(layout.getSrc().getType().getEncoding()))
+          src = layout.getSrc();
+        // Decode E4M3FN before duplicating values into the dot layout.
+        // Keeping ConvertLayoutOp next to dot also enables FP16 MMA matching.
+        // Keep E4M3FN x E5M2 on its original path to preserve load pipelining.
+        auto srcType = cast<RankedTensorType>(src.getType());
+        Value value = rewriter.create<triton::FpToFpOp>(
+            dotOp.getLoc(),
+            srcType.cloneWith(std::nullopt, rewriter.getF16Type()), src);
+        if (src != operand) {
+          value.getDefiningOp()->setAttr("maca.keep_e4m3fn_decode_layout",
+                                         rewriter.getUnitAttr());
+          value = rewriter.create<ConvertLayoutOp>(
+              dotOp.getLoc(),
+              operandType.cloneWith(std::nullopt, rewriter.getF16Type()),
+              value);
+        }
+        return value;
+      };
+      Value a = promote(dotOp.getA());
+      Value b = promote(dotOp.getB());
       rewriter.modifyOpInPlace(dotOp, [&] {
         dotOp->setOperand(0, a);
         dotOp->setOperand(1, b);
