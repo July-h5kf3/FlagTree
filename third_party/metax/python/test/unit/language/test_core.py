@@ -5656,7 +5656,8 @@ def matmul_kernel(  #
         BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #
         low_precision_acc: tl.constexpr,  #
         num_stages: tl.constexpr = 3,  #
-        initial_acc: tl.constexpr = 0., acc_dtype: tl.constexpr = tl.float32, out_dtype: tl.constexpr = tl.float32  #
+        initial_acc: tl.constexpr = 0., acc_dtype: tl.constexpr = tl.float32, out_dtype: tl.constexpr = tl.float32,
+        mask_k: tl.constexpr = False  #
 ):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -5669,8 +5670,12 @@ def matmul_kernel(  #
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
     accumulator = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_N), initial_acc, dtype=acc_dtype)
     for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=num_stages):
-        a = tl.load(a_ptrs)
-        b = tl.load(b_ptrs)
+        if mask_k:
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.)
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.)
+        else:
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
         accumulator = tl.dot(a, b, acc=accumulator, out_dtype=out_dtype, max_num_imprecise_acc=low_precision_acc)
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -5701,21 +5706,26 @@ def _metax_fp8_dot_operand(dtype, shape, pattern, rng, device):
 _metax_fp8_pairs = list(itertools.product([tl.float8e4nv, tl.float8e5], repeat=2))
 
 
-@pytest.mark.parametrize("lhs_dtype,rhs_dtype,pattern,block",
-                         [(a, b, "finite", block)
+@pytest.mark.parametrize("lhs_dtype,rhs_dtype,pattern,block,scenario",
+                         [(a, b, "finite", block, "")
                           for a, b in _metax_fp8_pairs
-                          for block in (32, 64)] + [(a, b, "finite_row", 64) for a, b in _metax_fp8_pairs] +
-                         [(a, b, pattern, 32)
+                          for block in (32, 64)] + [(a, b, pattern, 64, scenario)
+                                                    for a, b in _metax_fp8_pairs
+                                                    for pattern, scenario in (("finite_row", ""),
+                                                                              ("finite_row_tail", ""),
+                                                                              ("finite_row", "fullstage"))] +
+                         [(a, b, pattern, 32, "")
                           for a, b in _metax_fp8_pairs
-                          for pattern in ("subnormal", "rhs_subnormal", "nan")] + [(tl.float8e5, b, pattern, 32)
+                          for pattern in ("subnormal", "rhs_subnormal", "nan")] + [(tl.float8e5, b, pattern, 32, "")
                                                                                    for b in (tl.float8e4nv, tl.float8e5)
                                                                                    for pattern in ("inf", "-inf")])
-def test_metax_fp8_dot(lhs_dtype, rhs_dtype, pattern, block, metax_device):
-    is_row_major = pattern == "finite_row"
+def test_metax_fp8_dot(lhs_dtype, rhs_dtype, pattern, block, scenario, metax_device):
+    has_tail = pattern == "finite_row_tail"
+    is_row_major = pattern in ("finite_row", "finite_row_tail")
     if is_row_major:
         pattern = "finite"
     m = n = block
-    k = 2 * block
+    k = 2 * block + (8 if has_tail else 0)
     rng = np.random.default_rng(20261023)
     a_pattern = "one" if pattern == "rhs_subnormal" else pattern
     b_pattern = "finite" if pattern == "finite" else "subnormal" if pattern == "rhs_subnormal" else "one"
@@ -5727,7 +5737,7 @@ def test_metax_fp8_dot(lhs_dtype, rhs_dtype, pattern, block, metax_device):
     initial_acc = 1.25 if pattern == "finite" else 0.
     kernel = matmul_kernel[(1, )](triton.reinterpret(a, lhs_dtype), triton.reinterpret(b, rhs_dtype), out, m, n, k,
                                   *a.stride(), *b.stride(), *out.stride(), block, block, block, 0, num_warps=4,
-                                  num_stages=2, initial_acc=initial_acc)
+                                  num_stages=2, initial_acc=initial_acc, mask_k=has_tail, scenario=scenario)
     actual = out.cpu().numpy().astype(np.float64)
     with np.errstate(invalid="ignore"):
         expected = av @ bv + initial_acc
@@ -5743,13 +5753,14 @@ def test_metax_fp8_dot(lhs_dtype, rhs_dtype, pattern, block, metax_device):
     suffix = ("32f8" if lhs_dtype == tl.float8e4nv else "32bf8") if is_native else "16f16"
     assert "llvm.mxc.mma.f32.16x16x" + suffix in kernel.asm["llir"]
     if is_row_major and target.arch == 80:
-        promotions = [line for line in kernel.asm["ttgir"].splitlines() if "tt.fp_to_fp" in line and "f8E4M3FN" in line]
-        if rhs_dtype == tl.float8e4nv:
-            if lhs_dtype == rhs_dtype:
-                assert re.search(r"use.opt.maca.mma\s*=\s*1", kernel.asm["ttgir"])
-            assert promotions and all("#ttg.dot_op" not in line for line in promotions)
-        elif lhs_dtype == tl.float8e4nv:
+        promotions = [line for line in kernel.asm["ttgir"].splitlines() if "tt.fp_to_fp" in line and "xf8" in line]
+        if rhs_dtype == tl.float8e5:
             assert promotions and all("#ttg.dot_op" in line for line in promotions)
+        else:
+            assert re.search(r"use.opt.maca.mma\s*=\s*1", kernel.asm["ttgir"])
+            assert promotions and all("#ttg.dot_op" not in line for line in promotions)
+            prologue = kernel.asm["ttgir"].split("scf.for", 1)[0]
+            assert "tt.fp_to_fp" in prologue and "ttg.local_store" in prologue
 
 
 @pytest.mark.parametrize("acc_dtype,out_dtype,error", [
@@ -5771,7 +5782,7 @@ def _metax_fp8_dot_source(lhs_dtype, rhs_dtype):
     signature = {name: "i32" for name in matmul_kernel.arg_names[:12]}
     signature.update(a_ptr=f"*{lhs_dtype}", b_ptr=f"*{rhs_dtype}", c_ptr="*fp32")
     constants = dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=32, BLOCK_SIZE_K=32, low_precision_acc=0, num_stages=2,
-                     initial_acc=1.25, acc_dtype=tl.float32, out_dtype=tl.float32)
+                     initial_acc=1.25, acc_dtype=tl.float32, out_dtype=tl.float32, mask_k=False)
     return ASTSource(matmul_kernel, signature, constexprs=constants)
 
 
@@ -5783,7 +5794,9 @@ def test_metax_fp8_dot_diagnostic(metax_device, fresh_triton_cache, monkeypatch,
 
 
 @pytest.mark.parametrize("lhs_dtype,rhs_dtype", _metax_fp8_pairs)
-def test_metax_fp8_dot_xcore1600(lhs_dtype, rhs_dtype, metax_device, fresh_triton_cache, tmp_path, monkeypatch):
+@pytest.mark.parametrize("scenario", ["", "fullstage"])
+def test_metax_fp8_dot_xcore1600(lhs_dtype, rhs_dtype, scenario, metax_device, fresh_triton_cache, tmp_path,
+                                 monkeypatch):
     import os
     from pathlib import Path
     import shlex
@@ -5798,7 +5811,7 @@ def test_metax_fp8_dot_xcore1600(lhs_dtype, rhs_dtype, metax_device, fresh_trito
     wrapper.chmod(0o755)
     monkeypatch.setenv("TRITON_COMPILER_OPT_PATH", str(tmp_path))
     kernel = triton.compile(_metax_fp8_dot_source(lhs_dtype, rhs_dtype), target=GPUTarget("maca", 86, 64),
-                            options={"num_warps": 4, "num_stages": 2})
+                            options={"num_warps": 4, "num_stages": 2, "scenario": scenario})
     assert b"maca-mxc-metax-macahca--xcore1600" in kernel.asm["mcfatbin"]
     machine = machine_log.read_text()
     if lhs_dtype == rhs_dtype:

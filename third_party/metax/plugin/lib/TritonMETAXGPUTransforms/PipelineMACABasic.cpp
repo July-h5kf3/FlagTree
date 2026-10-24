@@ -374,7 +374,8 @@ LogicalResult LoopPipeliner::checkOpUses(SetVector<Operation *> &ops) {
         Operation *use = *loadOp.getResult().getUsers().begin();
 
         // Advance to the first conversion as long as the use resides in shared
-        // memory and it has a single use itself
+        // memory and it has a single use itself. Also follow FP8 promotions
+        // deliberately kept in blocked layout before the dot conversion.
         while (use) {
           if (use->getNumResults() != 1 || !use->getResult(0).hasOneUse())
             break;
@@ -382,8 +383,11 @@ LogicalResult LoopPipeliner::checkOpUses(SetVector<Operation *> &ops) {
               dyn_cast<RankedTensorType>(use->getResult(0).getType());
           auto memType =
               dyn_cast<ttg::MemDescType>(use->getResult(0).getType());
-          if (tensorType && !mlir::isa<ttg::SwizzledSharedEncodingAttr>(
-                                tensorType.getEncoding()))
+          bool isFp8Promotion = use->hasAttr("maca.keep_fp8_decode_layout");
+          if (tensorType &&
+              !mlir::isa<ttg::SwizzledSharedEncodingAttr>(
+                  tensorType.getEncoding()) &&
+              !isFp8Promotion)
             break;
           if (memType && !mlir::isa<ttg::SwizzledSharedEncodingAttr>(
                              memType.getEncoding()))
@@ -1338,8 +1342,10 @@ void LoopPipeliner::prefetchNextIteration(scf::ForOp newForOp,
   Operation *arriveOp = nullptr;
   Operation *barrierOp = builder.create<ttg::BarrierSharedOp>(anchor);
   if (isFullStage) {
-    auto mmaElemTy =
-        dyn_cast<RankedTensorType>(validCvts[0].getType()).getElementType();
+    // FP8 shared buffers may be decoded after local_load. Schedule for the
+    // actual MMA input type rather than the shared-memory element type.
+    auto dot = *forOp.getBody()->getOps<triton::DotOp>().begin();
+    auto mmaElemTy = dot.getA().getType().getElementType();
     // mma_other_inst_num - 2 because other instruction like ldg may insert
     // between mma and other instructions.
     int mma_other_inst_num = getMmaInstNum(mmaElemTy);

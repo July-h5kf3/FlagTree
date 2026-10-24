@@ -91,12 +91,15 @@ def test_metax_e4m3_rtz(src_dtype, metax_device):
 
 
 @pytest.mark.parametrize("src_dtype", [tl.float8e4nv, tl.float8e5])
-def test_metax_fp8_to_fp64(src_dtype, metax_device):
-    bits = np.arange(256, dtype=np.uint8)
-    result = _metax_cast_bits(bits, src_dtype, tl.float64, metax_device).view(np.float64)
-    expected = _decode_float_to_fp64(bits, src_dtype)
+@pytest.mark.parametrize("dst_dtype,np_type,uint_type", [(tl.float16, np.float16, np.uint16),
+                                                        (tl.float64, np.float64, np.uint64)])
+def test_metax_fp8_upcast(src_dtype, dst_dtype, np_type, uint_type, metax_device):
+    # Include every adjacent pair to detect interference between packed lanes.
+    bits = np.arange(65536, dtype=np.uint16).view(np.uint8)
+    result = _metax_cast_bits(bits, src_dtype, dst_dtype, metax_device).view(np_type)
+    expected = _decode_float_to_fp64(bits, src_dtype).astype(np_type)
     is_nan = np.isnan(expected)
-    np.testing.assert_array_equal(result[~is_nan].view(np.uint64), expected[~is_nan].view(np.uint64))
+    np.testing.assert_array_equal(result[~is_nan].view(uint_type), expected[~is_nan].view(uint_type))
     assert np.isnan(result[is_nan]).all()
 
 
