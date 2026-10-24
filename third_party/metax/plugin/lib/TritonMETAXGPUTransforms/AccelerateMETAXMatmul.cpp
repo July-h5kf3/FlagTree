@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <optional>
 
 #define DEBUG_TYPE "TritonMETAXGPUAccelerateMatmulPass"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -153,6 +154,58 @@ public:
 
     // for FMA, should retain the blocked layout.
     int versionMajor = computeCapabilityToMMAVersion(computeCapability);
+    auto aType = dotOp.getA().getType();
+    auto bType = dotOp.getB().getType();
+    bool isFp8 =
+        isa<Float8E4M3FNType, Float8E5M2Type>(aType.getElementType()) &&
+        isa<Float8E4M3FNType, Float8E5M2Type>(bType.getElementType());
+    if (isFp8 && (!supportMMA(dotOp, versionMajor, computeCapability % 10) ||
+                  aType.getElementType() != bType.getElementType())) {
+      // All finite E4M3FN/E5M2 values are exactly representable in FP16.
+      // Use the existing FP16 MMA path on older targets and for mixed FP8.
+      dotOp.emitWarning("using non-native FP8 dot on MetaX target ")
+          << computeCapability << ": converting " << aType.getElementType()
+          << " x " << bType.getElementType()
+          << " to f16 x f16 with f32 accumulation";
+      bool keepPackedOperands = isa<Float8E5M2Type>(bType.getElementType());
+      auto promote = [&](Value operand) -> Value {
+        auto operandType = cast<RankedTensorType>(operand.getType());
+        Value src = operand;
+        auto layout = operand.getDefiningOp<ConvertLayoutOp>();
+        if (layout && !keepPackedOperands &&
+            isa<BlockedEncodingAttr>(layout.getSrc().getType().getEncoding()))
+          src = layout.getSrc();
+        // Decode FP8 before duplicating values into the dot layout.
+        // Keeping ConvertLayoutOp next to dot also enables FP16 MMA matching.
+        // Keep E5M2 RHS operands packed to avoid regressions with some tiles.
+        auto srcType = cast<RankedTensorType>(src.getType());
+        Value value = rewriter.create<triton::FpToFpOp>(
+            dotOp.getLoc(),
+            srcType.cloneWith(std::nullopt, rewriter.getF16Type()), src);
+        if (src != operand) {
+          value.getDefiningOp()->setAttr("maca.keep_fp8_decode_layout",
+                                         rewriter.getUnitAttr());
+          // Retain the existing schedule for two E4M3FN decoders and for
+          // larger warp counts; prefetching regresses measured C550 tiles.
+          if (aType.getElementType() != bType.getElementType() &&
+              triton::gpu::lookupNumWarps(dotOp) == 4)
+            value.getDefiningOp()->setAttr("maca.pipeline_fp8_decode",
+                                           rewriter.getUnitAttr());
+          value = rewriter.create<ConvertLayoutOp>(
+              dotOp.getLoc(),
+              operandType.cloneWith(std::nullopt, rewriter.getF16Type()),
+              value);
+        }
+        return value;
+      };
+      Value a = promote(dotOp.getA());
+      Value b = promote(dotOp.getB());
+      rewriter.modifyOpInPlace(dotOp, [&] {
+        dotOp->setOperand(0, a);
+        dotOp->setOperand(1, b);
+      });
+      return success();
+    }
     if (!supportMMA(dotOp, versionMajor, computeCapability % 10))
       return failure();
 

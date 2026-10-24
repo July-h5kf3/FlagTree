@@ -2201,7 +2201,8 @@ int getMmaInstNum(Type type) {
     return 8;
   } else if (type.isF16() || type.isBF16()) {
     return 4;
-  } else if (type.isSignlessInteger(8)) {
+  } else if (type.isSignlessInteger(8) ||
+             isa<Float8E4M3FNType, Float8E5M2Type>(type)) {
     return 2;
   } else {
     assert(false && "invalid dtype for mma");
