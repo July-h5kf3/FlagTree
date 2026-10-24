@@ -5759,8 +5759,9 @@ def test_metax_fp8_dot(lhs_dtype, rhs_dtype, pattern, block, scenario, metax_dev
         else:
             assert re.search(r"use.opt.maca.mma\s*=\s*1", kernel.asm["ttgir"])
             assert promotions and all("#ttg.dot_op" not in line for line in promotions)
-            prologue = kernel.asm["ttgir"].split("scf.for", 1)[0]
-            assert "tt.fp_to_fp" in prologue and "ttg.local_store" in prologue
+            if lhs_dtype != rhs_dtype:
+                prologue = kernel.asm["ttgir"].split("scf.for", 1)[0]
+                assert "tt.fp_to_fp" in prologue and "ttg.local_store" in prologue
 
 
 @pytest.mark.parametrize("acc_dtype,out_dtype,error", [

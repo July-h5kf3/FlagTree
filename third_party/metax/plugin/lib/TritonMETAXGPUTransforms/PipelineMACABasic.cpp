@@ -383,7 +383,7 @@ LogicalResult LoopPipeliner::checkOpUses(SetVector<Operation *> &ops) {
               dyn_cast<RankedTensorType>(use->getResult(0).getType());
           auto memType =
               dyn_cast<ttg::MemDescType>(use->getResult(0).getType());
-          bool isFp8Promotion = use->hasAttr("maca.keep_fp8_decode_layout");
+          bool isFp8Promotion = use->hasAttr("maca.pipeline_fp8_decode");
           if (tensorType &&
               !mlir::isa<ttg::SwizzledSharedEncodingAttr>(
                   tensorType.getEncoding()) &&

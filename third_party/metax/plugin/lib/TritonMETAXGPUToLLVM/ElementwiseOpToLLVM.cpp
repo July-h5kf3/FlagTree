@@ -272,6 +272,63 @@ static Value Fp8E4M3FNUZ_to_Fp16_oneValue(Location loc,
   return b.bitcast(io, f16_ty);
 }
 
+static Value Fp8E4M3FN_to_Fp16_oneValue(Location loc,
+                                        ConversionPatternRewriter &rewriter,
+                                        Value v) {
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  auto fp8x2VecTy = vec_ty(i8_ty, 2);
+  Value a = b.undef(fp8x2VecTy);
+  a = b.insert_element(fp8x2VecTy, a, b.int_val(8, 0), b.i32_val(0));
+  a = b.insert_element(fp8x2VecTy, a, v, b.i32_val(1));
+  a = b.bitcast(a, i16_ty);
+  Value v_16 = a;
+
+  // Get sign and absolute value
+  Value sign = b.and_(a, b.int_val(16, 0x8000));
+  a = b.and_(a, b.int_val(16, 0x7FFF));
+
+  Value vAbs = b.and_(v_16, b.int_val(16, 0x7FFF));
+
+  // Compute renorm shift
+  Value renorm_shift = b.int_val(16, 0);
+  renorm_shift = b.select(b.icmp_ule(vAbs, b.int_val(16, 0x0700)),
+                          b.int_val(16, 1), renorm_shift);
+  renorm_shift = b.select(b.icmp_ule(vAbs, b.int_val(16, 0x0300)),
+                          b.int_val(16, 2), renorm_shift);
+  renorm_shift = b.select(b.icmp_eq(vAbs, b.int_val(16, 0x0100)),
+                          b.int_val(16, 3), renorm_shift);
+
+  // Right shift 1 bit to adjust the positions of exponent and mantissa
+  a = b.shl(a, renorm_shift);
+  a = b.lshr(a, b.int_val(16, 1));
+
+  // Adjust exponent compensator, (15 - 7 - renorm_shift) << 10
+  Value exponent_compensator =
+      b.shl(b.sub(b.int_val(16, 8), renorm_shift), b.int_val(16, 10));
+  a = b.add(a, exponent_compensator);
+
+  // Check NaN
+  a = b.select(b.icmp_eq(vAbs, b.int_val(16, 0x7F00)), b.int_val(16, 0x7E00),
+               a);
+
+  // Check Zero
+  a = b.select(b.icmp_eq(vAbs, b.int_val(16, 0x0000)), b.int_val(16, 0x0000),
+               a);
+
+  // Check denorms and zero
+  // Here we use a LUT to map S.0000.000 ~ S.0000.111 to its corresponding fp16
+  // value
+  // constexpr size_t lutSize = 8;
+  // static constexpr int denormsAndZeroLut[lutSize] = {
+  //     0x0000, 0x1800, 0x1C00, 0x1E00, 0x2000, 0x2100, 0x2200, 0x2300};
+
+  // Set sign
+  a = b.or_(a, sign);
+  a = b.bitcast(a, f16_ty);
+
+  return a;
+}
+
 static SmallVector<Value>
 Fp8E4M3FNUZ_to_Fp16(Location loc, ConversionPatternRewriter &rewriter,
                     const SmallVector<Value> &v, triton::FpToFpOp op) {
@@ -284,36 +341,9 @@ Fp8E4M3FNUZ_to_Fp16(Location loc, ConversionPatternRewriter &rewriter,
 static SmallVector<Value>
 Fp8E4M3FN_to_Fp16_SW(Location loc, ConversionPatternRewriter &rewriter,
                      const SmallVector<Value> &values, triton::FpToFpOp op) {
-  auto b = TritonLLVMOpBuilder(loc, rewriter);
-  auto bytesTy = vec_ty(i8_ty, 4);
-  auto halvesTy = vec_ty(f16_ty, 2);
-  Value scale = b.bitcast(b.i32_val(0x5C005C00), halvesTy);
-  SmallVector<Value> results;
-  for (unsigned i = 0; i < 4; i += 2) {
-    Value bytes = b.undef(bytesTy);
-    bytes = b.insert_element(bytesTy, bytes, b.i8_val(0), b.i32_val(0));
-    bytes = b.insert_element(bytesTy, bytes, values[i], b.i32_val(1));
-    bytes = b.insert_element(bytesTy, bytes, b.i8_val(0), b.i32_val(2));
-    bytes = b.insert_element(bytesTy, bytes, values[i + 1], b.i32_val(3));
-    Value raw = b.bitcast(bytes, i32_ty);
-    Value magnitude = b.and_(raw, b.i32_val(0x7F007F00));
-    Value sign = b.and_(raw, b.i32_val(0x80008000));
-    Value bits = b.or_(b.lshr(magnitude, b.i32_val(1)), sign);
-    // This FP16 reinterpretation is exactly E4M3FN / 256, including its
-    // subnormals. A packed IEEE FP16 multiply restores every finite value.
-    Value converted = b.fmul(halvesTy, b.bitcast(bits, halvesTy), scale);
-    bits = b.bitcast(converted, i32_ty);
-    // Only magnitude 0x7f sets bit 15 in its lane after adding 0x0100.
-    // The multiply maps it to +/-480 (0x5f80); XOR 0x2180 makes a signed qNaN.
-    Value nan =
-        b.and_(b.add(magnitude, b.i32_val(0x01000100)), b.i32_val(0x80008000));
-    Value correction =
-        b.or_(b.lshr(nan, b.i32_val(8)),
-              b.or_(b.lshr(nan, b.i32_val(7)), b.lshr(nan, b.i32_val(2))));
-    converted = b.bitcast(b.xor_(bits, correction), halvesTy);
-    results.push_back(b.extract_element(f16_ty, converted, b.i32_val(0)));
-    results.push_back(b.extract_element(f16_ty, converted, b.i32_val(1)));
-  }
+  SmallVector<Value> results(2);
+  results[0] = Fp8E4M3FN_to_Fp16_oneValue(loc, rewriter, values[0]);
+  results[1] = Fp8E4M3FN_to_Fp16_oneValue(loc, rewriter, values[1]);
   return results;
 }
 
@@ -1481,7 +1511,7 @@ struct FpToFpOpConversion
         std::getenv("TRITON_DISABLE_FAST_F8_F16_CVT") == nullptr;
     return (computeCapability >= 89 && enableFastCvt)
                ? std::make_pair(Fp8E4M3FN_to_Fp16_HW, 2)
-               : std::make_pair(Fp8E4M3FN_to_Fp16_SW, 4);
+               : std::make_pair(Fp8E4M3FN_to_Fp16_SW, 2);
   }
 
   static std::pair<ConverterT, size_t> Fp8E5M2_to_Fp16(int computeCapability) {
@@ -1542,8 +1572,9 @@ struct FpToFpOpConversion
 
     auto undefRounding = static_cast<RoundingMode>(-1);
 
-    static DenseMap<std::tuple<TypeID, TypeID, RoundingMode>,
-                    std::pair<ConverterT, size_t>>
+    // Converter selection depends on this pattern's target architecture.
+    DenseMap<std::tuple<TypeID, TypeID, RoundingMode>,
+             std::pair<ConverterT, size_t>>
         srcMap = {
             // F8 -> F16
             {{F8E4M3FNTyID, F16TyID, undefRounding},

@@ -185,6 +185,12 @@ public:
         if (src != operand) {
           value.getDefiningOp()->setAttr("maca.keep_fp8_decode_layout",
                                          rewriter.getUnitAttr());
+          // Retain the existing schedule for two E4M3FN decoders and for
+          // larger warp counts; prefetching regresses measured C550 tiles.
+          if (aType.getElementType() != bType.getElementType() &&
+              triton::gpu::lookupNumWarps(dotOp) == 4)
+            value.getDefiningOp()->setAttr("maca.pipeline_fp8_decode",
+                                           rewriter.getUnitAttr());
           value = rewriter.create<ConvertLayoutOp>(
               dotOp.getLoc(),
               operandType.cloneWith(std::nullopt, rewriter.getF16Type()),
