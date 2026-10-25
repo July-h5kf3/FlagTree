@@ -1,5 +1,5 @@
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
-from triton._C.libtriton import ir, passes, llvm, hcu, distributed, tle
+from triton._C.libtriton import ir, passes, llvm, hcu, distributed, tle, gluon_ir
 from triton import knobs
 from triton.runtime.errors import HSACOError
 from dataclasses import dataclass
@@ -56,6 +56,7 @@ class HIPOptions:
     backend_name: str = 'hip'
     instrumentation_mode: str = ""
     optimize_epilogue: bool = True
+    enable_mmac_i8_shared: bool = False
     # 0: mfma
     # 1: mmac legacy
     # 2: mmac interleave
@@ -401,6 +402,52 @@ class HIPBackend(BaseBackend):
         return mod
 
     @staticmethod
+    def swizzle_mmac_inputs(mod, options):
+        if not (options.enable_mmac_i8_shared and options.arch == "gfx936" and options.num_warps == 4
+                and options.num_ctas == 1):
+            return 0
+        # Preserve global loads and MMAC fragments for INT8 content and BF16 RoPE.
+        builder = gluon_ir.GluonOpBuilder(mod.context)
+        registers_by_width = {
+            128: [[0, 1], [0, 2], [0, 4], [0, 32], [0, 64], [16, 0], [32, 0]],
+            64: [[0, 1], [0, 2], [0, 16], [0, 32], [16, 0], [32, 0]],
+        }
+        layouts = []
+        for element, columns, vector in [(builder.get_int8_ty(), 128, 8), (builder.get_bf16_ty(), 64, 4)]:
+            registers = registers_by_width[columns]
+            lanes = [[1, 0], [2, 0], [4, 0], [8, 0], [0, vector], [0, vector * 2]]
+            shape = [64, columns]
+            source_layout = builder.get_blocked_layout([1, vector * 2], [8, 8], [4, 1], [1, 0], [])
+            target_layout = builder.get_distributed_linear_layout(registers, lanes, [[0, 0], [0, 0]], [], shape)
+            shared_layout = builder.get_swizzled_shared_layout(vector, 1, 16, [1, 0], [])
+            layouts.append((
+                builder.get_distributed_ty(element, shape, source_layout),
+                builder.get_distributed_ty(element, shape, target_layout),
+                builder.get_shared_mem_desc_ty(element, shape, shared_layout, shape),
+            ))
+        matches = []
+
+        def collect(op):
+            if op.get_name() != 'ttg.convert_layout':
+                return
+            for source_type, target_type, shared_type in layouts:
+                if op.get_operand(0).get_type() == source_type and op.get_result(0).get_type() == target_type:
+                    matches.append((op, target_type, shared_type))
+
+        mod.walk(collect)
+        if not matches:
+            return 0
+        for op, target_type, shared_type in matches:
+            builder.set_insertion_point_after(op)
+            shared = builder.create_local_alloc(shared_type, op.get_operand(0))
+            loaded = builder.create_local_load(target_type, shared)
+            op.get_result(0).replace_all_uses_with(loaded)
+        pm = ir.pass_manager(mod.context)
+        passes.common.add_canonicalizer(pm)
+        pm.run(mod, 'swizzle_mmac_inputs')
+        return len(matches)
+
+    @staticmethod
     def make_ttgir(mod, metadata, options):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
@@ -512,6 +559,7 @@ class HIPBackend(BaseBackend):
         if 1:  #use_async_copy:
             hcu.passes.ttgpuir.add_update_async_wait_count(pm, options.arch)
         pm.run(mod, 'make_ttgir')
+        HIPBackend.swizzle_mmac_inputs(mod, options)
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
 
