@@ -12,6 +12,184 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from triton import CompilationError
 
 
+@triton.jit
+def _metax_fp8_descriptor_transfer(A, B, X, Y, I, M, N, STRIDE, HOST: tl.constexpr, OP: tl.constexpr,
+                                   PADDING: tl.constexpr):
+    height: tl.constexpr = 1 if OP == "gather" or OP == "scatter" else 16
+    if HOST:
+        a, b = A, B
+    else:
+        a = tl.make_tensor_descriptor(X, [M, N], [STRIDE, 1], [height, 64], padding_option=PADDING)
+        b = tl.make_tensor_descriptor(Y, [M, N], [STRIDE, 1], [height, 64], padding_option=PADDING)
+    rows, cols = tl.arange(0, 16), tl.arange(0, 64)
+    if OP == "load":
+        value = a.load([-8, 32])
+        tl.store(Y + rows[:, None] * 64 + cols[None, :], value)
+    elif OP == "store":
+        value = tl.load(X + rows[:, None] * 64 + cols[None, :])
+        b.store([-8, 32], value)
+    elif OP == "gather":
+        indices = tl.load(I + rows)
+        value = a.gather(indices, 32)
+        tl.store(Y + rows[:, None] * 64 + cols[None, :], value)
+    elif OP == "scatter":
+        indices = tl.load(I + rows)
+        value = tl.load(X + rows[:, None] * 64 + cols[None, :])
+        b.scatter(value, indices, 32)
+    else:
+        offsets = [tl.program_id(0) * 16, tl.program_id(1) * 64]
+        b.store(offsets, a.load(offsets))
+
+
+@pytest.mark.parametrize("dtype", [tl.float8e4nv, tl.float8e5])
+@pytest.mark.parametrize("host", [False, True])
+@pytest.mark.parametrize("operation,padding", [(op, pad)
+                                               for op in ("load", "gather", "roundtrip")
+                                               for pad in ("zero", "nan")] + [("store", "zero"), ("scatter", "zero")])
+def test_metax_fp8_tensor_descriptor(dtype, host, operation, padding, metax_device):
+    from triton.runtime.interpreter import _decode_float_to_fp64
+
+    m, n, stride, guard = 37, 80, 96, 32
+    rng = np.random.default_rng(20261025)
+    bits = np.resize(np.arange(256, dtype=np.uint8), m * stride)
+    rng.shuffle(bits)
+    torch_dtype = torch.float8_e4m3fn if dtype == tl.float8e4nv else torch.float8_e5m2
+    x = torch.from_numpy(bits).to(metax_device).view(torch_dtype)
+    raw = torch.full((m * stride + 2 * guard, ), 165, dtype=torch.uint8, device=metax_device)
+    y = raw[guard:-guard].view(torch_dtype)
+    indices = np.array([-2, 0, 2, 5, 7, 9, 11, 13, 15, 17, 23, 29, 34, 36, 37, 41], dtype=np.int32)
+    index_tensor = torch.from_numpy(indices).to(metax_device)
+    height = 1 if operation in ("gather", "scatter") else 16
+    a = TensorDescriptor(x, [m, n], [stride, 1], [height, 64], padding) if host else None
+    b = TensorDescriptor(y, [m, n], [stride, 1], [height, 64], padding) if host else None
+    grid = (triton.cdiv(m, 16), triton.cdiv(n, 64)) if operation == "roundtrip" else (1, )
+    kernel = _metax_fp8_descriptor_transfer[grid](a, b, x, y, index_tensor, m, n, stride, host, operation, padding,
+                                                  num_warps=4)
+    expected = np.full(raw.numel(), 165, dtype=np.uint8)
+    nan_mask = np.zeros(raw.numel(), dtype=bool)
+    for row in range(16 if operation != "roundtrip" else m):
+        for col in range(64 if operation != "roundtrip" else n):
+            if operation in ("load", "gather"):
+                src_row = row - 8 if operation == "load" else int(indices[row])
+                dst = guard + row * 64 + col
+                if 0 <= src_row < m and col + 32 < n:
+                    expected[dst] = bits[src_row * stride + col + 32]
+                else:
+                    expected[dst] = 0
+                    nan_mask[dst] = padding == "nan"
+            elif operation in ("store", "scatter"):
+                dst_row = row - 8 if operation == "store" else int(indices[row])
+                if 0 <= dst_row < m and col + 32 < n:
+                    expected[guard + dst_row * stride + col + 32] = bits[row * 64 + col]
+            else:
+                expected[guard + row * stride + col] = bits[row * stride + col]
+    actual = raw.cpu().numpy()
+    np.testing.assert_array_equal(actual[~nan_mask], expected[~nan_mask])
+    assert np.isnan(_decode_float_to_fp64(actual[nan_mask], dtype)).all()
+    assert "tt.make_tensor_descriptor" not in kernel.asm["ttir"]
+    assert "tt.descriptor_" not in kernel.asm["ttir"]
+    assert "tt.fp_to_fp" not in kernel.asm["ttir"]
+
+
+@pytest.mark.parametrize("dtype", [tl.float8e4nv, tl.float8e5])
+def test_metax_tensor_descriptor_diagnostic(dtype, metax_device, fresh_triton_cache):
+    raw = torch.empty((4096, ), dtype=torch.uint8, device=metax_device)
+    tensor = triton.reinterpret(raw, dtype)
+    output = triton.reinterpret(torch.empty_like(raw), dtype)
+    with pytest.warns(UserWarning, match="non-native synchronous pointer"):
+        _metax_fp8_descriptor_transfer[(1, )](None, None, tensor, output, raw, 64, 64, 64, False, "load", "zero",
+                                              num_warps=4)
+
+
+@triton.jit
+def _metax_descriptor_rank(A, B, X, Y, HOST: tl.constexpr, SHAPE: tl.constexpr, STRIDES: tl.constexpr,
+                           BLOCK: tl.constexpr, RANK: tl.constexpr):
+    if HOST:
+        a, b = A, B
+    else:
+        a = tl.make_tensor_descriptor(X, SHAPE, STRIDES, BLOCK)
+        b = tl.make_tensor_descriptor(Y, SHAPE, STRIDES, BLOCK)
+    if RANK == 1:
+        offsets = [0]
+    elif RANK == 3:
+        offsets = [0, 0, 0]
+    else:
+        offsets = [0, 0, 0, 0, 0]
+    b.store(offsets, a.load(offsets))
+
+
+@pytest.mark.parametrize("dtype", [tl.float8e4nv, tl.float8e5])
+@pytest.mark.parametrize("host", [False, True])
+@pytest.mark.parametrize("shape,strides,block", [
+    ((47, ), (1, ), (64, )),
+    ((3, 5, 19), (160, 32, 1), (4, 8, 32)),
+    ((2, 3, 2, 3, 17), (576, 192, 96, 32, 1), (2, 4, 2, 4, 32)),
+])
+def test_metax_fp8_descriptor_rank(dtype, host, shape, strides, block, metax_device):
+    count = shape[0] * strides[0]
+    bits = (np.arange(count, dtype=np.uint32) * 73 + 41).astype(np.uint8)
+    torch_dtype = torch.float8_e4m3fn if dtype == tl.float8e4nv else torch.float8_e5m2
+    source = torch.full((count + 64, ), 165, dtype=torch.uint8, device=metax_device)
+    source[32:-32] = torch.from_numpy(bits).to(metax_device)
+    raw = torch.full_like(source, 165)
+    x, y = source[32:-32].view(torch_dtype), raw[32:-32].view(torch_dtype)
+    a = TensorDescriptor(x, list(shape), list(strides), list(block)) if host else None
+    b = TensorDescriptor(y, list(shape), list(strides), list(block)) if host else None
+    _metax_descriptor_rank[(1, )](a, b, x, y, host, shape, strides, block, len(shape), num_warps=4)
+    expected = np.full(raw.numel(), 165, dtype=np.uint8)
+    indices = np.indices(shape).reshape(len(shape), -1)
+    offsets = (indices * np.array(strides)[:, None]).sum(axis=0)
+    expected[32 + offsets] = bits[offsets]
+    np.testing.assert_array_equal(raw.cpu().numpy(), expected)
+
+
+@pytest.mark.parametrize("dtype", [tl.float8e4nv, tl.float8e5])
+def test_metax_fp8_descriptor_runtime_shape(dtype, metax_device):
+    torch_dtype = torch.float8_e4m3fn if dtype == tl.float8e4nv else torch.float8_e5m2
+    kernels = []
+    for m, n, stride in ((37, 80, 96), (31, 64, 112)):
+        bits = (np.arange(m * stride, dtype=np.uint32) * 73 + 41).astype(np.uint8)
+        x = torch.from_numpy(bits).to(metax_device).view(torch_dtype)
+        raw = torch.full((m * stride + 64, ), 165, dtype=torch.uint8, device=metax_device)
+        y = raw[32:-32].view(torch_dtype)
+        a = TensorDescriptor(x, [m, n], [stride, 1], [16, 64])
+        b = TensorDescriptor(y, [m, n], [stride, 1], [16, 64])
+        index = torch.empty((16, ), dtype=torch.int32, device=metax_device)
+        k = _metax_fp8_descriptor_transfer[(triton.cdiv(m, 16), triton.cdiv(n,
+                                                                            64))](a, b, x, y, index, m, n, stride, True,
+                                                                                  "roundtrip", "zero", num_warps=4)
+        kernels.append(k.hash)
+        expected = np.full(raw.numel(), 165, dtype=np.uint8)
+        view = expected[32:-32].reshape(m, stride)
+        view[:, :n] = bits.reshape(m, stride)[:, :n]
+        np.testing.assert_array_equal(raw.cpu().numpy(), expected)
+    assert kernels[0] == kernels[1]
+
+
+@triton.jit
+def _metax_descriptor_invalid(X, KIND: tl.constexpr):
+    rows: tl.constexpr = 16 if KIND == "block" else 1
+    desc = tl.make_tensor_descriptor(X, [64, 64], [64, 1], [rows, 64])
+    if KIND == "block":
+        desc.gather(tl.arange(0, 16), 0)
+    else:
+        indices = tl.full((2, 8), 0, tl.int32)
+        value = tl.full((16, 64), 0, X.dtype.element_ty)
+        desc.scatter(value, indices, 0)
+
+
+@pytest.mark.parametrize("dtype", [tl.float8e4nv, tl.float8e5])
+@pytest.mark.parametrize("kind,error", [("block", "descriptor block must have 1 row"),
+                                        ("indices", "x offsets must be 1D")])
+def test_metax_fp8_descriptor_invalid(dtype, kind, error):
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+
+    source = ASTSource(_metax_descriptor_invalid, {"X": f"*{dtype}"}, constexprs={"KIND": kind})
+    with pytest.raises(CompilationError, match=error):
+        triton.compile(source, target=GPUTarget("maca", 80, 64), options={"num_warps": 4})
+
+
 @pytest.mark.interpreter
 @pytest.mark.parametrize("dtype_str", tma_dtypes)
 @pytest.mark.parametrize("num_ctas", [1, 2])

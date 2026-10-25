@@ -7,7 +7,7 @@ import pytest
 import triton
 import triton.language as tl
 
-from triton._internal_testing import is_cuda, is_hip, is_hip_cdna2, is_hip_cdna3, is_hip_cdna4, is_hip_gfx12
+from triton._internal_testing import is_cuda, is_hip, is_hip_cdna2, is_hip_cdna3, is_hip_cdna4, is_hip_gfx12, is_interpreter
 from triton._C.libtriton import ir
 from triton.runtime.interpreter import _decode_float_to_fp64, _encode_fp64_to_float
 
@@ -39,6 +39,71 @@ def launch_type_convert_triton(src, src_dtype, dst_dtype, device, rounding=None,
     dst = torch.empty(src.shape, dtype=matching_int(dst_dtype), device=device)
     type_convert_triton[(src.shape[0] // BLOCK_SIZE,)](triton.reinterpret(src, src_dtype), triton.reinterpret(dst, dst_dtype), rounding, BLOCK_SIZE)
     return dst
+
+
+@triton.jit
+def _metax_fp8_zero_memory(X, Y, KIND: tl.constexpr, ZERO: tl.constexpr = 0):
+    i = tl.arange(0, 512)
+    if KIND == "load":
+        value = tl.load(X + i, i < 256, other=ZERO)
+        tl.store(Y + i, value)
+    elif KIND == "scalar":
+        tl.store(Y, ZERO)
+    elif KIND == "block":
+        block = tl.make_block_ptr(Y, (512,), (1,), (0,), (512,), (0,))
+        tl.store(block, ZERO)
+    elif KIND == "masked_store":
+        tl.store(Y + i, ZERO, i < 259)
+    elif KIND == "local":
+        zero = 0
+        tl.store(Y + i, zero)
+    elif KIND == "tensor":
+        zero = tl.full((512,), 0, tl.int32)
+        tl.store(Y + i, zero)
+    else:
+        tl.store(Y + i, ZERO)
+
+
+@pytest.mark.interpreter
+@pytest.mark.parametrize("dtype", [tl.float8e4nv, tl.float8e5])
+@pytest.mark.parametrize("kind", ["load", "scalar", "block", "masked_store", "store", "local"])
+def test_metax_fp8_zero_memory(dtype, kind, device):
+    if not is_interpreter() and triton.runtime.driver.active.get_current_target().backend != "maca":
+        pytest.skip("requires the MetaX backend")
+    source = torch.arange(256, dtype=torch.int64).to(torch.uint8)
+    x = source.to(device)
+    raw = torch.full((576,), 165, dtype=torch.uint8, device=device)
+    _metax_fp8_zero_memory[(1,)](triton.reinterpret(x, dtype), triton.reinterpret(raw[32:544], dtype), kind)
+    expected = torch.full((576,), 165, dtype=torch.uint8)
+    n = 1 if kind == "scalar" else 259 if kind == "masked_store" else 512
+    expected[32:32+n] = 0
+    if kind == "load":
+        expected[32:288] = source
+    np.testing.assert_array_equal(raw.cpu().numpy(), expected.numpy())
+
+
+@pytest.mark.interpreter
+@pytest.mark.parametrize("dtype", [tl.float8e4nv, tl.float8e5])
+def test_metax_fp8_zero_integer_tensor(dtype, device):
+    if not is_interpreter() and triton.runtime.driver.active.get_current_target().backend != "maca":
+        pytest.skip("requires the MetaX backend")
+    raw = torch.full((576,), 165, dtype=torch.uint8, device=device)
+    value = triton.reinterpret(raw[32:544], dtype)
+    _metax_fp8_zero_memory[(1,)](value, value, "tensor")
+    expected = torch.full((576,), 165, dtype=torch.uint8)
+    expected[32:544] = 0
+    np.testing.assert_array_equal(raw.cpu().numpy(), expected.numpy())
+
+
+@pytest.mark.parametrize("dtype", [tl.float8e4nv, tl.float8e5])
+def test_metax_fp8_nonzero_integer_rejected(dtype):
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+
+    source = ASTSource(_metax_fp8_zero_memory, {"X": f"*{dtype}", "Y": f"*{dtype}"},
+                       constexprs={"KIND": "store", "ZERO": 1})
+    with pytest.raises(triton.CompilationError, match="cannot cast"):
+        triton.compile(source, target=GPUTarget("maca", 80, 64), options={"num_warps": 4})
 
 
 def _metax_cast_bits(bits, src_dtype, dst_dtype, device, rounding=None):

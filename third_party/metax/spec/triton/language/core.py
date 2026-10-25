@@ -2703,6 +2703,9 @@ def make_tensor_descriptor(
 
     """
 
+    shape = _unwrap_if_constexpr(shape)
+    strides = _unwrap_if_constexpr(strides)
+    block_shape = _unwrap_if_constexpr(block_shape)
     padding_option = _unwrap_if_constexpr(padding_option)
     return _semantic.make_tensor_descriptor(base, shape, strides, block_shape, padding_option)
 

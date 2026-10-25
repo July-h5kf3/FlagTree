@@ -817,6 +817,18 @@ class TritonSemantic(Generic[TensorTy]):
                                  "Source scalar type is " + str(src_sca_ty) + " and destination type is " +
                                  str(dst_sca_ty))
 
+        if src_sca_ty.is_int() and dst_sca_ty in (tl.float8e4nv, tl.float8e5):
+            if isinstance(input.handle, ir.value):
+                # GPU compilation only accepts a provably constant integer zero.
+                is_zero = input.handle.is_constant_zero()
+            else:
+                from triton.runtime.interpreter import TensorHandle
+                # The interpreter evaluates its reference values directly.
+                is_zero = isinstance(input.handle, TensorHandle) and not (input.handle.data != 0).any()
+            if is_zero:
+                zero = self.scalar_constant(0, dst_sca_ty)
+                return self.splat(zero, src_ty.get_block_shapes()) if src_ty.is_block() else zero
+
         if (src_sca_ty.is_fp8e4b15() or dst_sca_ty.is_fp8e4b15()):
             assert self.builder.codegen_fns.get(
                 "convert_custom_types") is not None, "target doesn't provide conversion for this type."
@@ -1092,12 +1104,16 @@ class TritonSemantic(Generic[TensorTy]):
             # Load by a tensor of pointers or a pointer of scalar: `block_type<pointer_type<>>` or `pointer_type<>`
             return self._load_legacy(ptr, mask, other, boundary_check, padding, cache, eviction, is_volatile)
 
+    def _warn_descriptor_lowering(self) -> None:
+        warnings.warn("MetaX tensor descriptors use non-native synchronous pointer load/store lowering.", UserWarning)
+
     def descriptor_load(self, desc: tl.tensor_descriptor_base, offsets, cache_modifier: str,
                         eviction_policy: str) -> TensorTy:
         assert isinstance(desc, tl.tensor_descriptor_base)
         ndim = len(desc.block_shape)
         assert len(offsets) == ndim, f"expected {ndim} offsets, but got {len(offsets)}"
 
+        self._warn_descriptor_lowering()
         offsets = self._convert_to_ir_values(offsets, require_i64=False)
         x = self.builder.create_descriptor_load(desc.handle, offsets, self._str_to_load_cache_modifier(cache_modifier),
                                                 self._str_to_eviction_policy(eviction_policy))
@@ -1111,6 +1127,7 @@ class TritonSemantic(Generic[TensorTy]):
 
     def descriptor_store(self, desc: tl.tensor_descriptor_base, value: TensorTy, offsets) -> TensorTy:
         self.validate_store_like(desc, value, offsets)
+        self._warn_descriptor_lowering()
         # implicitly cast to the descriptor's type
         value = self.cast(value, desc.dtype)
         offsets = self._convert_to_ir_values(offsets, require_i64=False)
@@ -1187,6 +1204,7 @@ class TritonSemantic(Generic[TensorTy]):
             1] >= min_cols, f"descriptor gather of {dtype} must have at least {min_cols} columns, but got {desc.block_shape[1]}"
 
         type = tl.block_type(desc.dtype, [x_offsets.shape[0], desc.block_shape[1]])
+        self._warn_descriptor_lowering()
         y_offset = self._convert_to_ir_values((y_offset, ), require_i64=False)[0]
         x = self.builder.create_descriptor_gather(desc.handle, x_offsets.handle, y_offset, type.to_ir(self.builder))
         return self.tensor(x, type)
@@ -1199,7 +1217,7 @@ class TritonSemantic(Generic[TensorTy]):
         assert desc.block_shape[0] == 1, f"descriptor block must have 1 row, but got {desc.block_shape}"
 
         # Validate offsets.
-        assert len(x_offsets.shape) == 1, f"x offsets must be 1D, but got {x_offsets.shapae}"
+        assert len(x_offsets.shape) == 1, f"x offsets must be 1D, but got {x_offsets.shape}"
 
         # Validate minimum block size.
         assert x_offsets.shape[0] >= 8, f"descriptor scatter must have at least 8 rows, but got {x_offsets.shape}"
@@ -1208,6 +1226,7 @@ class TritonSemantic(Generic[TensorTy]):
         assert desc.block_shape[
             1] >= min_cols, f"descriptor scatter of {dtype} must have at least {min_cols} columns, but got {desc.block_shape[1]}"
 
+        self._warn_descriptor_lowering()
         y_offset = self._convert_to_ir_values((y_offset, ), require_i64=False)[0]
         self.builder.create_descriptor_scatter(desc.handle, value.handle, x_offsets.handle, y_offset)
         return self.tensor(None, tl.void)
@@ -1225,6 +1244,8 @@ class TritonSemantic(Generic[TensorTy]):
         assert val.type.is_block(), "Value argument must be block type or a scalar"
         assert block_shape == val.type.get_block_shapes(
         ), f"Block shape({block_shape}) and value shape({val.type.get_block_shapes()}) mismatch"
+        if val.dtype.is_int() and ptr.type.element_ty.element_ty in (tl.float8e4nv, tl.float8e5):
+            val = self.cast(val, ptr.type.element_ty.element_ty)
         assert ptr.type.element_ty.element_ty == val.type.element_ty, f"Block element type({ptr.type.element_ty.element_ty}) and value element type({val.type.element_ty}) mismatch"
 
         elt_ty = ptr.type.element_ty.element_ty
