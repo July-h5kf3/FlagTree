@@ -1692,13 +1692,55 @@ class TritonSemantic(Generic[TensorTy]):
             self.builder.create_dot_scaled(lhs.handle, lhs_scale_handle, lhs_format_enum, rhs.handle, rhs_scale_handle,
                                            rhs_format_enum, fast_math, lhs_k_pack, rhs_k_pack, acc_handle), ret_ty)
 
+    def fp_to_fp4(self, src: TensorTy, axis: int, rounding: Optional[str]) -> TensorTy:
+        if src.dtype not in (tl.float16, tl.bfloat16, tl.float32, tl.float64):
+            raise ValueError(f"fp_to_fp4 requires FP16/BF16/FP32/FP64 input, got {src.dtype}")
+        shape = src.type.get_block_shapes() if src.type.is_block() else []
+        rank = len(shape)
+        if not isinstance(axis, int) or not -rank <= axis < rank:
+            raise ValueError(f"fp_to_fp4 axis {axis} must be in [-{rank}, {rank})")
+        axis %= rank
+        if shape[axis] % 2:
+            raise ValueError(f"fp_to_fp4 packing dimension must be even, got {shape[axis]}")
+        rounding = "rtne" if rounding is None else rounding
+        if rounding not in ("rtne", "rtz"):
+            raise ValueError(f"fp_to_fp4 rounding must be rtne or rtz, got {rounding}")
+        warnings.warn("MetaX fp_to_fp4 uses non-native GPU software encoding.", UserWarning)
+
+        # Half formats widen exactly. Keep FP64 comparisons in FP64 so adjacent
+        # values around E2M1 midpoints are not rounded onto those midpoints.
+        if src.dtype in (tl.float16, tl.bfloat16):
+            src = self.cast(src, tl.float32)
+        int_ty = tl.uint64 if src.dtype == tl.float64 else tl.uint32
+        width = int_ty.primitive_bitwidth
+        bits = self.bitcast(src, int_ty)
+        sign = self.cast(self.lshr(bits, self.scalar_constant(width - 1, int_ty)), tl.uint8)
+        sign = self.shl(sign, self.scalar_constant(3, tl.uint8))
+        magnitude = self.bitcast(self.and_(bits, self.scalar_constant((1 << (width - 1)) - 1, int_ty)), src.dtype)
+        codes = self.full(shape, 0, tl.uint8)
+        thresholds = (.25, .75, 1.25, 1.75, 2.5, 3.5, 5.) if rounding == "rtne" else (.5, 1., 1.5, 2., 3., 4., 6.)
+        for code, threshold in enumerate(thresholds, 1):
+            boundary = self.scalar_constant(threshold, src.dtype)
+            above = self.greater_equal(magnitude, boundary) if rounding == "rtz" else self.greater_than(
+                magnitude, boundary)
+            if rounding == "rtne" and code % 2 == 0:
+                above = self.logical_or(above, self.equal(magnitude, boundary))
+            codes = self.where(above, self.scalar_constant(code, tl.uint8), codes)
+        codes = self.where(self.not_equal(magnitude, magnitude), self.scalar_constant(7, tl.uint8), codes)
+        codes = self.or_(codes, sign)
+        paired = self.reshape(codes, shape[:axis] + [shape[axis] // 2, 2] + shape[axis + 1:], can_reorder=False)
+        # Move the pair dimension last for the existing split operation.
+        order = [d for d in range(rank + 1) if d != axis + 1] + [axis + 1]
+        low, high = self.split(self.permute(paired, order))
+        return self.or_(low, self.shl(high, self.scalar_constant(4, tl.uint8)))
+
     def fp4_to_fp_scaled(self, src: TensorTy, scale: TensorTy, elem_type: tl.dtype, axis: int) -> TensorTy:
         assert src.type.is_block(), "src must be a tensor"
         assert scale.type.is_block(), "scale must be a tensor"
         assert src.dtype.is_int8() or src.dtype.is_uint8(), f"src must have int8 or uint8 dtype, got {src.dtype}"
         assert scale.dtype.is_int8() or scale.dtype.is_uint8(
         ), f"scale must have int8 or uint8 dtype, got {scale.dtype}"
-        assert elem_type in (tl.bfloat16, ), f"elem_type must be tl.bfloat16, got {elem_type}"
+        assert elem_type in (tl.float16, tl.bfloat16), f"elem_type must be tl.float16 or tl.bfloat16, got {elem_type}"
 
         rank = len(src.type.shape)
         assert rank > 0, "src must have rank > 0"
@@ -1708,9 +1750,20 @@ class TritonSemantic(Generic[TensorTy]):
             axis += rank
 
         shape = list(src.type.shape)
+        scale_shape = scale.type.shape
         for d in range(rank):
-            assert scale.type.shape[d] == shape[d], (
-                f"scale.shape[{d}] must match src.shape[{d}] ({shape[d]}), got {scale.type.shape[d]}")
+            if d != axis:
+                assert scale_shape[d] == shape[
+                    d], f"scale.shape[{d}] must match src.shape[{d}] ({shape[d]}), got {scale_shape[d]}"
+        if scale_shape[axis] != shape[axis]:
+            assert shape[axis] % 16 == 0 and scale_shape[axis] == shape[axis] // 16, (
+                f"scale packing dimension must be {shape[axis]} or {shape[axis] // 16} for 32-value E8M0 groups, got {scale_shape[axis]}"
+            )
+            group_shape = shape[:axis] + [shape[axis] // 16, 1] + shape[axis + 1:]
+            expanded_shape = shape[:axis] + [shape[axis] // 16, 16] + shape[axis + 1:]
+            scale = self.reshape(scale, group_shape, can_reorder=False)
+            scale = self.broadcast_impl_shape(scale, expanded_shape)
+            scale = self.reshape(scale, shape, can_reorder=False)
         shape[axis] *= 2
         ret_ty = tl.block_type(elem_type, shape)
         return self.tensor(

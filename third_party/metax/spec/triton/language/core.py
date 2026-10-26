@@ -2463,6 +2463,19 @@ def dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None,
 
 
 @builtin
+def fp_to_fp4(src, axis=-1, fp_downcast_rounding="rtne", _semantic=None):
+    """Encode FP16/BF16/FP32/FP64 as packed E2M1 uint8 values on the GPU.
+
+    Two values along the even-sized packing axis become one byte, low nibble
+    first. RTNE (default) and RTZ are supported. Overflow, Inf and NaN saturate
+    to signed magnitude 6; signed zeros are preserved. No scale is applied.
+    MetaX uses non-native software encoding without an FP32 intermediate for
+    FP64 inputs.
+    """
+    return _semantic.fp_to_fp4(src, _unwrap_if_constexpr(axis), _unwrap_if_constexpr(fp_downcast_rounding))
+
+
+@builtin
 def fp4_to_fp_scaled(src, scale, elem_type, axis, _semantic=None):
     """
     Upcast packed fp4 (e2m1) values and multiply them by fp8 e8m0 block scales
@@ -2477,7 +2490,12 @@ def fp4_to_fp_scaled(src, scale, elem_type, axis, _semantic=None):
     :param src: int8 or uint8 tensor containing packed fp4 values.
     :param scale: int8 or uint8 tensor containing fp8 e8m0 bit patterns, one
                   scale per N packed input elements.
-    :param elem_type: output dtype, only `tl.bfloat16` supported.
+    Expanded scales with the same shape as :code:`src` are also accepted.
+    Scale code 0 represents 2**-127, and 255 produces NaN. MetaX uses a
+    non-native software path; the final FP16/BF16 conversion uses RTNE with
+    IEEE overflow and underflow behavior.
+
+    :param elem_type: output dtype, `tl.float16` or `tl.bfloat16`.
     :param axis: axis along which fp4 values are packed.
     """
     elem_type = _unwrap_if_constexpr(elem_type)
