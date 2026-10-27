@@ -10,10 +10,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
-#include "mlir/Interfaces/SideEffectInterfaces.h"
-#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
@@ -48,7 +45,7 @@ struct SelectedSqmmaConfig {
 
 static std::optional<SelectedSqmmaConfig>
 selectSqmmaConfig(unsigned m, unsigned n, unsigned k, unsigned numWarps,
-                  musa::SQMMAEltType operandType, bool preferRowReduction) {
+                  musa::SQMMAEltType operandType) {
   if (numWarps < 4 || numWarps % 4 != 0)
     return std::nullopt;
   const auto *sqTraits = musa::getMusaSqmmaArchTraits(musa::MusaArch::PH1);
@@ -81,10 +78,13 @@ selectSqmmaConfig(unsigned m, unsigned n, unsigned k, unsigned numWarps,
             continue;
           unsigned count = (m / tileM) * (n / tileN) * (k / instK);
           unsigned volume = instM * instN * instK;
-          // On a full tie keep each row inside one squad for row reductions.
-          bool preferMSplit = warpsN == 1 &&
-                              (instM >= 32 || preferRowReduction) && best &&
-                              best->warpsPerCTA[1] != 1;
+          // On a full tie prefer a pure M-split (warpsN == 1) as long as
+          // the instruction M stays >= 32: attention-style kernels reduce the
+          // dot result along axis=1, and an M-split keeps every output row
+          // inside one squad so the reduction never crosses warps. Finer M
+          // splits (instM 16) measure slower and are never preferred.
+          bool preferMSplit =
+              warpsN == 1 && instM >= 32 && best && best->warpsPerCTA[1] != 1;
           if (!best || count < bestCount ||
               (count == bestCount &&
                (volume > bestVolume ||
@@ -158,321 +158,6 @@ static ttg::LocalAllocOp findRootAlloc(Value value) {
   return {};
 }
 
-// Analyze the unchanged graph before selecting or rewriting any SQMMA.
-class RowReductionAnalysis {
-  struct SharedFlow {
-    unsigned writers = 0;
-    Value value;
-    SmallVector<Value> loads;
-    SmallVector<musa_tle::SqmmaOp> lhsDots;
-    bool ambiguous = false;
-  };
-  DenseMap<Operation *, SharedFlow> shared;
-
-  // Only a complete, untransposed single-tile allocation proves this memory
-  // edge. Multi-stage aliases and partial accesses stay on the default policy.
-  static bool isWholeView(Value value) {
-    auto root = findRootAlloc(value);
-    if (!root)
-      return false;
-    auto nonUnitShape = [](ttg::MemDescType type) {
-      SmallVector<int64_t> shape;
-      for (int64_t dim : type.getShape())
-        if (dim != 1)
-          shape.push_back(dim);
-      return shape;
-    };
-    if (nonUnitShape(cast<ttg::MemDescType>(root.getType())) !=
-        nonUnitShape(cast<ttg::MemDescType>(value.getType())))
-      return false;
-    while (value != root.getResult()) {
-      if (auto arg = dyn_cast<BlockArgument>(value)) {
-        auto part = dyn_cast_or_null<ttg::WarpSpecializePartitionsOp>(
-            arg.getOwner()->getParentOp());
-        if (!part || arg.getArgNumber() >= part.getExplicitCaptures().size())
-          return false;
-        value = part.getExplicitCaptures()[arg.getArgNumber()];
-      } else if (auto index = value.getDefiningOp<ttg::MemDescIndexOp>()) {
-        auto src = cast<ttg::MemDescType>(index.getSrc().getType());
-        if (src.getShape().front() != 1 ||
-            !matchPattern(index.getIndex(), m_Zero()))
-          return false;
-        value = index.getSrc();
-      } else if (auto slice = value.getDefiningOp<ttg::MemDescSubsliceOp>()) {
-        if (llvm::any_of(slice.getOffsets(), [](int32_t x) { return x != 0; }))
-          return false;
-        value = slice.getSrc();
-      } else {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  // Preserve the complete row dimension through supported tensor views.
-  static std::optional<unsigned> getRowAxis(Operation *op, Value input,
-                                            unsigned rowAxis) {
-    auto src = cast<RankedTensorType>(input.getType());
-    if (auto trans = dyn_cast<tt::TransOp>(op)) {
-      auto order = trans.getOrder();
-      auto found = llvm::find(order, rowAxis);
-      if (found != order.end())
-        return std::distance(order.begin(), found);
-    } else if (auto reshape = dyn_cast<tt::ReshapeOp>(op)) {
-      auto dst = cast<RankedTensorType>(reshape.getType());
-      for (const auto &[srcDims, dstDims] :
-           getReshapeDecomposition(src.getShape(), dst.getShape())) {
-        if (!llvm::is_contained(srcDims, rowAxis))
-          continue;
-        if (llvm::any_of(srcDims, [&](int64_t dim) {
-              return dim != rowAxis && src.getDimSize(dim) != 1;
-            }))
-          return std::nullopt;
-        std::optional<unsigned> result;
-        for (int64_t dim : dstDims) {
-          if (dst.getDimSize(dim) == 1)
-            continue;
-          if (result || dst.getDimSize(dim) != src.getDimSize(rowAxis))
-            return std::nullopt;
-          result = dim;
-        }
-        return result;
-      }
-    } else if (auto expand = dyn_cast<tt::ExpandDimsOp>(op)) {
-      return rowAxis + (expand.getAxis() <= rowAxis);
-    } else if (isa<tt::SplitOp>(op)) {
-      if (rowAxis + 1 < src.getRank())
-        return rowAxis;
-    } else if (isa<tt::JoinOp, tt::BroadcastOp, ttg::ConvertLayoutOp,
-                   musa_tle::SqmmaWaitOp>(op) ||
-               (op->hasTrait<OpTrait::Elementwise>() &&
-                isMemoryEffectFree(op)) ||
-               (isa<tt::ExternElementwiseOp>(op) &&
-                cast<tt::ExternElementwiseOp>(op).getPure())) {
-      return rowAxis;
-    }
-    return std::nullopt;
-  }
-
-public:
-  explicit RowReductionAnalysis(ModuleOp module) {
-    auto addWriter = [&](Value dst, Value value) {
-      auto root = findRootAlloc(dst);
-      if (!root)
-        return;
-      auto &flow = shared[root];
-      ++flow.writers;
-      flow.value = value;
-      flow.ambiguous |=
-          !isWholeView(dst) || bool(getTleExplicitMemoryEncoding(root));
-    };
-    module.walk([&](ttg::LocalAllocOp alloc) {
-      if (alloc.getSrc())
-        addWriter(alloc.getResult(), alloc.getSrc());
-    });
-    module.walk([&](ttg::LocalStoreOp store) {
-      addWriter(store.getDst(), store.getSrc());
-    });
-    module.walk([&](Operation *op) {
-      for (Value operand : op->getOperands()) {
-        if (!isa<ttg::MemDescType>(operand.getType()))
-          continue;
-        auto root = findRootAlloc(operand);
-        auto found = shared.find(root);
-        if (!root || found == shared.end())
-          continue;
-        auto &flow = found->second;
-        auto valueTy = cast<RankedTensorType>(flow.value.getType());
-        auto sameView = [&]() {
-          auto type = cast<ttg::MemDescType>(operand.getType());
-          return isWholeView(operand) &&
-                 type.getShape() == valueTy.getShape() &&
-                 type.getElementType() == valueTy.getElementType();
-        };
-        if (auto load = dyn_cast<ttg::LocalLoadOp>(op)) {
-          flow.ambiguous |= !sameView();
-          flow.loads.push_back(load.getResult());
-        } else if (auto dot = dyn_cast<musa_tle::SqmmaOp>(op)) {
-          flow.ambiguous |= operand != dot.getA() || !sameView();
-          if (operand == dot.getA())
-            flow.lhsDots.push_back(dot);
-        } else if (isa<ttg::LocalStoreOp, ttg::MemDescIndexOp,
-                       ttg::MemDescSubsliceOp, ttg::WarpSpecializePartitionsOp,
-                       ttg::WarpSpecializeOp>(op)) {
-          continue;
-        } else if (auto pointers = dyn_cast<musa_tle::LocalPointersOp>(op)) {
-          flow.ambiguous |= !pointers.getResult().use_empty();
-        } else {
-          flow.ambiguous = true;
-        }
-      }
-    });
-  }
-
-  bool matches(musa_tle::SqmmaOp producer) {
-    if (getTleExplicitValueEncoding(producer.getC()) ||
-        getTleExplicitSqmmaEncoding(producer))
-      return false;
-    for (Value operand : {producer.getA(), producer.getB()}) {
-      auto root = findRootAlloc(operand);
-      if (root && getTleExplicitMemoryEncoding(root))
-        return false;
-    }
-    struct State {
-      Value value;
-      unsigned rowAxis;
-      bool reduced;
-    };
-    SmallVector<State> worklist;
-    DenseMap<Value, unsigned> rowAxes;
-    DenseMap<Value, unsigned> visited;
-    bool conflict = false;
-    bool matched = false;
-    auto enqueue = [&](Value value, unsigned axis, bool reduced) {
-      auto type = dyn_cast<RankedTensorType>(value.getType());
-      if (!type || axis >= type.getRank() ||
-          isa<tt::PointerType>(type.getElementType())) {
-        conflict = true;
-        return;
-      }
-      auto [it, inserted] = rowAxes.try_emplace(value, axis);
-      if (!inserted && it->second != axis) {
-        conflict = true;
-        return;
-      }
-      unsigned bit = reduced ? 2 : 1;
-      if (visited[value] & bit)
-        return;
-      visited[value] |= bit;
-      worklist.push_back({value, axis, reduced});
-    };
-    enqueue(producer.getD(), 0, false);
-    while (!worklist.empty() && !conflict) {
-      State state = worklist.pop_back_val();
-      for (OpOperand &use : state.value.getUses()) {
-        Operation *user = use.getOwner();
-        for (Value operand : user->getOperands())
-          conflict |= bool(getTleExplicitValueEncoding(operand));
-        for (unsigned i = 0; i < user->getNumResults(); ++i)
-          conflict |= bool(getTleExplicitResultEncoding(user, i));
-        if (auto dot = dyn_cast<musa_tle::SqmmaOp>(user)) {
-          if (use.getOperandNumber() == 2) {
-            enqueue(dot.getD(), state.rowAxis, state.reduced);
-          } else if (use.getOperandNumber() == 0 && state.rowAxis == 0) {
-            matched |= state.reduced;
-          } else {
-            conflict = true;
-          }
-        } else if (auto dot = dyn_cast<tt::DotOpInterface>(user)) {
-          if (dot.getA() == state.value && state.rowAxis == 0)
-            matched |= state.reduced;
-          else
-            conflict = true;
-        } else if (auto reduce = dyn_cast<tt::ReduceOp>(user)) {
-          if (reduce.getAxis() == state.rowAxis) {
-            conflict = true;
-            break;
-          }
-          unsigned axis = state.rowAxis - (reduce.getAxis() < state.rowAxis);
-          for (Value result : reduce.getResults())
-            enqueue(result, axis, true);
-        } else if (auto yield = dyn_cast<scf::YieldOp>(user)) {
-          unsigned index = use.getOperandNumber();
-          if (auto loop = dyn_cast<scf::ForOp>(yield->getParentOp())) {
-            enqueue(loop.getRegionIterArg(index), state.rowAxis, state.reduced);
-            enqueue(loop.getResult(index), state.rowAxis, state.reduced);
-          } else if (auto branch = dyn_cast<scf::IfOp>(yield->getParentOp())) {
-            enqueue(branch.getResult(index), state.rowAxis, state.reduced);
-          } else {
-            conflict = true;
-          }
-        } else if (auto loop = dyn_cast<scf::ForOp>(user)) {
-          unsigned index = use.getOperandNumber();
-          if (index < 3) {
-            conflict = true;
-            break;
-          }
-          enqueue(loop.getRegionIterArg(index - 3), state.rowAxis,
-                  state.reduced);
-          enqueue(loop.getResult(index - 3), state.rowAxis, state.reduced);
-        } else if (isa<ttg::LocalStoreOp, ttg::LocalAllocOp>(user)) {
-          Value dst = isa<ttg::LocalStoreOp>(user)
-                          ? Value(cast<ttg::LocalStoreOp>(user).getDst())
-                          : Value(user->getResult(0));
-          auto root = findRootAlloc(dst);
-          auto found = shared.find(root);
-          if (!root || found == shared.end() || found->second.writers != 1 ||
-              found->second.ambiguous) {
-            conflict = true;
-            break;
-          }
-          const auto &flow = found->second;
-          for (Value load : flow.loads)
-            enqueue(load, state.rowAxis, state.reduced);
-          for (musa_tle::SqmmaOp dot : flow.lhsDots) {
-            if (state.rowAxis != 0)
-              conflict = true;
-            else
-              matched |= state.reduced;
-          }
-        } else if (isa<tt::StoreOp>(user) && use.getOperandNumber() == 1) {
-          continue;
-        } else {
-          auto axis = getRowAxis(user, state.value, state.rowAxis);
-          if (!axis) {
-            conflict = true;
-            break;
-          }
-          for (Value result : user->getResults()) {
-            auto type = dyn_cast<RankedTensorType>(result.getType());
-            auto src = cast<RankedTensorType>(state.value.getType());
-            if (!type || *axis >= type.getRank() ||
-                type.getDimSize(*axis) != src.getDimSize(state.rowAxis)) {
-              conflict = true;
-              break;
-            }
-            enqueue(result, *axis, state.reduced);
-          }
-        }
-      }
-    }
-    return matched && !conflict;
-  }
-};
-
-static DenseSet<musa_tle::SqmmaOp>
-findRowReductionDots(ModuleOp module, ArrayRef<musa_tle::SqmmaOp> dots) {
-  RowReductionAnalysis analysis(module);
-  DenseSet<musa_tle::SqmmaOp> result;
-  for (auto dot : dots)
-    if (analysis.matches(dot))
-      result.insert(dot);
-  // All directly accumulated dots must agree on the policy for their chain.
-  bool changed;
-  do {
-    changed = false;
-    for (auto dot : dots) {
-      Value acc = dot.getC();
-      while (true) {
-        if (auto wait = acc.getDefiningOp<musa_tle::SqmmaWaitOp>())
-          acc = wait.getInput();
-        else if (auto convert = acc.getDefiningOp<ttg::ConvertLayoutOp>())
-          acc = convert.getSrc();
-        else
-          break;
-      }
-      if (auto previous = acc.getDefiningOp<musa_tle::SqmmaOp>()) {
-        if (result.contains(dot) != result.contains(previous)) {
-          result.erase(dot);
-          result.erase(previous);
-          changed = true;
-        }
-      }
-    }
-  } while (changed);
-  return result;
-}
-
 static musa::SQMMALayout inferLayout(ttg::MemDescType type) {
   auto order = ttg::getOrder(type);
   bool rowMajor = !order.empty() && order.front() + 1 == type.getRank();
@@ -531,10 +216,9 @@ inferTransposeSourceType(ttg::MemDescTransOp trans, ttg::MemDescType targetTy) {
                                sourceTy.getMutableMemory(), sourceAllocShape);
 }
 
-static LogicalResult updateOperandLayout(
-    musa_tle::SqmmaOp op, unsigned operandIdx,
-    ttg::MUSASqmmaEncodingAttr mmaEnc,
-    DenseMap<Operation *, ttg::MemDescType> &physicalRootTypes) {
+static LogicalResult updateOperandLayout(musa_tle::SqmmaOp op,
+                                         unsigned operandIdx,
+                                         ttg::MUSASqmmaEncodingAttr mmaEnc) {
   Value operand = operandIdx == 0 ? op.getA() : op.getB();
   auto operandTy = cast<ttg::MemDescType>(operand.getType());
   int64_t elemBytes =
@@ -596,11 +280,6 @@ static LogicalResult updateOperandLayout(
       ttg::MemDescType::get(rootTy.getShape(), rootTy.getElementType(),
                             rootEncoding, rootTy.getMemorySpace(),
                             rootTy.getMutableMemory(), rootTy.getAllocShape());
-  auto [rootIt, inserted] =
-      physicalRootTypes.try_emplace(root.getOperation(), newRootTy);
-  if (!inserted && rootIt->second != newRootTy)
-    return op.emitOpError(
-        "SQMMA consumers require incompatible physical shared layouts");
   root.getResult().setType(newRootTy);
   landing.setType(landingTy);
   operand.setType(desiredTy);
@@ -638,11 +317,9 @@ static LogicalResult updateOperandLayout(
     musa::setSqmmaAttrs(target, operandIdx, elemBytes, rowMajor);
     return success();
   };
-  // The final view owns the logical operand contract. A staged allocation can
-  // serve both K^T and V when their physical shared layouts are identical.
-  // Propagating that view's row/column contract to the root would reject this
-  // valid reuse even though no data needs to move.
-  if (failed(checkAndSet(operand.getDefiningOp())))
+  if (failed(checkAndSet(root.getOperation())) ||
+      failed(checkAndSet(landing.getDefiningOp())) ||
+      failed(checkAndSet(operand.getDefiningOp())))
     return failure();
 
   // Keep stage views and warp-specialize explicit captures type-consistent.
@@ -657,6 +334,7 @@ static LogicalResult updateOperandLayout(
         return;
       if (index.getResult().getType() != landingTy) {
         index.getResult().setType(landingTy);
+        (void)checkAndSet(index.getOperation());
         changed = true;
       }
     });
@@ -735,7 +413,6 @@ struct TritonMUSAGPUTLELowerSqmmaPass
       module->setAttr(kEnableEncodingRematerializationAttr,
                       UnitAttr::get(module.getContext()));
 
-    auto rowReductionDots = findRowReductionDots(module, dots);
     DenseMap<musa_tle::SqmmaOp, ttg::MUSASqmmaEncodingAttr> encodings;
     for (musa_tle::SqmmaOp dot : dots) {
       if (failed(verifyAsyncUses(dot)))
@@ -748,10 +425,9 @@ struct TritonMUSAGPUTLELowerSqmmaPass
         return signalPassFailure();
       }
       unsigned numWarps = ttg::maybeLookupNumWarps(dot).value_or(0);
-      bool preferRowReduction = rowReductionDots.contains(dot);
-      auto config = selectSqmmaConfig(aTy.getShape()[0], bTy.getShape()[1],
-                                      aTy.getShape()[1], numWarps, *operandType,
-                                      preferRowReduction);
+      auto config =
+          selectSqmmaConfig(aTy.getShape()[0], bTy.getShape()[1],
+                            aTy.getShape()[1], numWarps, *operandType);
       if (!config) {
         dot.emitOpError("cannot select a supported SQMMA configuration");
         return signalPassFailure();
@@ -764,12 +440,9 @@ struct TritonMUSAGPUTLELowerSqmmaPass
     }
 
     // Infer all physical layouts before replacing any TLE SQMMA op.
-    DenseMap<Operation *, ttg::MemDescType> physicalRootTypes;
     for (musa_tle::SqmmaOp dot : dots) {
-      if (failed(
-              updateOperandLayout(dot, 0, encodings[dot], physicalRootTypes)) ||
-          failed(
-              updateOperandLayout(dot, 1, encodings[dot], physicalRootTypes)))
+      if (failed(updateOperandLayout(dot, 0, encodings[dot])) ||
+          failed(updateOperandLayout(dot, 1, encodings[dot])))
         return signalPassFailure();
     }
 
