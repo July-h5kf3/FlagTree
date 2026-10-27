@@ -275,6 +275,7 @@ void init_triton_musa_passes_ttgpuir(py::module m) {
 }
 
 void init_triton_mthreads(py::module &&m) {
+  // Preserve the capability name used by existing TLE attention callers.
   m.def("supports_tle_sqmma_row_reduction_m_split", []() {
 #ifdef __TLE__
     return true;
