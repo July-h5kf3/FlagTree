@@ -28,6 +28,7 @@
 #include "tle/dialect/include/IR/Dialect.h"
 #include "tle/dialect/include/IR/ExactSMEM.h"
 #include "tle/dialect/include/Transforms/Passes.h"
+#include "tle/dialect/include/Transforms/TleUtility.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -94,7 +95,7 @@ static LogicalResult verifyWGMMAUses(WGMMAOp op) {
   return success();
 }
 
-static RankedTensorType getMMAType(WGMMAOp op) {
+static RankedTensorType getMMAType(WGMMAOp op, Value encodedAcc) {
   auto context = op.getContext();
   auto accType = cast<RankedTensorType>(op.getC().getType());
   auto aElemType =
@@ -113,6 +114,18 @@ static RankedTensorType getMMAType(WGMMAOp op) {
                             : SmallVector<int64_t>(accType.getShape());
   SmallVector<unsigned, 3> instrShape =
       mmaVersionToInstrShape(3, retShapePerCTA, aElemType, numWarps);
+  SmallVector<unsigned, 2> warpsPerCTA;
+  if (encodedAcc) {
+    auto carriedType = cast<RankedTensorType>(encodedAcc.getType());
+    auto carried = cast<ttg::NvidiaMmaEncodingAttr>(carriedType.getEncoding());
+    // Async C keeps its physical M/N layout; K still belongs to this dtype.
+    warpsPerCTA = llvm::to_vector(carried.getWarpsPerCTA());
+    instrShape[0] = carried.getInstrShape()[0];
+    instrShape[1] = carried.getInstrShape()[1];
+  } else {
+    warpsPerCTA =
+        getNvidiaMmaV3WarpsPerCTA(op.getD(), retShapePerCTA, numWarps);
+  }
   if (auto activeN = op.getActiveNAttr();
       activeN && activeN.getInt() > instrShape[1]) {
     op.emitOpError() << "active_n=" << activeN.getInt()
@@ -120,7 +133,6 @@ static RankedTensorType getMMAType(WGMMAOp op) {
                      << instrShape[1] << " for ttg.num-warps=" << numWarps;
     return {};
   }
-  SmallVector<unsigned, 2> warpsPerCTA = {numWarps, 1};
   SmallVector<unsigned, 2> CTAsPerCGA = {1, 1};
   SmallVector<unsigned, 2> CTASplitNum = {1, 1};
   SmallVector<unsigned, 2> CTAOrder = {1, 0};
@@ -245,7 +257,9 @@ struct TritonTleLowerWGMMAPass
       for (Operation *op : worklist) {
         OpBuilder builder(op);
         if (auto wgmma = dyn_cast<WGMMAOp>(op)) {
-          RankedTensorType mmaType = getMMAType(wgmma);
+          Value encodedAcc =
+              lookupEncodedAccumulator(wgmma.getC(), encodedAccs);
+          RankedTensorType mmaType = getMMAType(wgmma, encodedAcc);
           if (!mmaType) {
             failed = true;
             return;
