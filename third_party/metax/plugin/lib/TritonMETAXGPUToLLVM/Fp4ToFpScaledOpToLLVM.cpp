@@ -54,8 +54,11 @@ public:
           results.push_back(
               LLVM::FPTruncOp::create(rewriter, loc, f16_ty, product));
         } else {
+          // Every finite E2M1 * E8M0 product is exact in BF16, including
+          // 2^-128. FP32 overflow and quiet NaNs retain their upper bits.
+          // RNE therefore needs no rounding increment or NaN repair here.
           results.push_back(LLVM::METAX::convertFp32ToBf16(
-              loc, op.getOperation(), rewriter, product));
+              loc, op.getOperation(), rewriter, product, RoundingMode::RTZ));
         }
       }
     }
