@@ -115,6 +115,34 @@ def _metax_cast_bits(bits, src_dtype, dst_dtype, device, rounding=None):
     return result.cpu().numpy()[:src.numel()].view(getattr(np, f"uint{dst_dtype.primitive_bitwidth}"))
 
 
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_metax_int32_to_bf16_rtne(num_warps, metax_device):
+    # Include both sides of every integer BF16 midpoint, exponent carries,
+    # zero and INT_MIN. A BF16 reference through FP32 would hide this bug.
+    values = [0, -2**31, -2**31 + 1, 2**31 - 2, 2**31 - 1]
+    values += list(range(-256, 257))
+    values += [sign * ((2 * mantissa + 1) * 2**(exponent - 8) + delta)
+               for exponent in range(8, 31) for mantissa in range(128, 256)
+               for delta in (-2, -1, 0, 1, 2) for sign in (-1, 1)]
+    values += [sign * (2**exponent + delta) for exponent in range(32)
+               for delta in (-2, -1, 0, 1, 2) for sign in (-1, 1)
+               if -2**31 <= sign * (2**exponent + delta) < 2**31]
+    rng = np.random.default_rng(20261028)
+    values = np.concatenate((np.array(values, dtype=np.int32),
+                             rng.integers(-2**31, 2**31, size=32768, dtype=np.int32)))
+    size = triton.cdiv(values.size, 4096) * 4096
+    padded = torch.zeros(size, dtype=torch.int32)
+    padded[:values.size] = torch.from_numpy(values)
+    output = torch.full((size + 64,), 0x5a5a, dtype=torch.int16, device=metax_device)
+    type_convert_triton[(size // 4096,)](padded.to(metax_device), triton.reinterpret(output[32:-32], tl.bfloat16),
+                                         None, 4096, num_warps=num_warps)
+    expected = np.full(size + 64, 0x5a5a, dtype=np.uint16)
+    expected[32:-32] = 0
+    expected[32:32 + values.size] = _encode_fp64_to_float(values.astype(np.float64), tl.bfloat16,
+                                                        ir.ROUNDING_MODE.RTNE)
+    np.testing.assert_array_equal(output.cpu().numpy().view(np.uint16), expected)
+
+
 def _metax_fp8_boundary_values(dtype, np_type):
     max_code = 0x7e if dtype == tl.float8e4nv else 0x7b
     representable = _decode_float_to_fp64(np.arange(max_code + 1, dtype=np.uint8), dtype)

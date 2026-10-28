@@ -2029,7 +2029,6 @@ struct CmpFOpConversion
   }
 };
 
-// Uses inline ptx to convert s8/u8 to bf16, since the
 struct SIToFPOpConversion
     : ElementwiseOpConversionBase<mlir::arith::SIToFPOp, SIToFPOpConversion> {
   using Base =
@@ -2044,6 +2043,32 @@ struct SIToFPOpConversion
     Type inElemTy = getElementType(op.getIn());
     Type outElemTy = getElementType(op.getOut());
 
+    if (outElemTy.isBF16() && inElemTy.isInteger(32)) {
+      auto b = TritonLLVMOpBuilder(loc, rewriter);
+      Value value = operands[0][0];
+      Value sign = b.and_(b.lshr(value, b.i32_val(16)), b.i32_val(0x8000));
+      // Negation wraps in i32 so INT_MIN retains its unsigned magnitude.
+      Value magnitude = b.select(b.icmp_slt(value, b.i32_val(0)),
+                                 b.sub(b.i32_val(0), value), value);
+      Value leading =
+          LLVM::CountLeadingZerosOp::create(rewriter, loc, magnitude, false);
+      // ctlz(0) is 32; mask the shift so even the zero case is poison-free.
+      Value normalized = b.shl(magnitude, b.and_(leading, b.i32_val(31)));
+      Value kept = b.lshr(normalized, b.i32_val(24));
+      Value remainder = b.and_(normalized, b.i32_val(0xffffff));
+      Value roundUp =
+          b.or_(b.icmp_ugt(remainder, b.i32_val(0x800000)),
+                b.and_(b.icmp_eq(remainder, b.i32_val(0x800000)),
+                       b.icmp_ne(b.and_(kept, b.i32_val(1)), b.i32_val(0))));
+      // The retained leading bit supplies one exponent unit. Addition also
+      // carries a rounded 0xff significand into the next exponent.
+      Value exponent = b.sub(b.i32_val(157), leading);
+      Value bits = b.add(b.shl(exponent, b.i32_val(7)),
+                         b.add(kept, b.zext(i32_ty, roundUp)));
+      bits = b.select(b.icmp_eq(magnitude, b.i32_val(0)), b.i32_val(0),
+                      b.or_(sign, bits));
+      return {b.trunc(i16_ty, bits)};
+    }
     if (outElemTy.isBF16()) {
       auto value = rewriter.create<LLVM::SIToFPOp>(loc, f32_ty, operands[0][0]);
       return {mlir::LLVM::METAX::convertFp32ToBf16(loc, value.getOperation(),
