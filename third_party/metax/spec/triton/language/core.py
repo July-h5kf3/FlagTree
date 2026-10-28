@@ -2429,12 +2429,14 @@ def dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None,
     lhs and rhs use microscaling formats described here:
     https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
 
-    Software emulation enables targeting hardware architectures without native microscaling
-    operation support. Right now for such case, microscaled lhs/rhs are upcasted to
-    :code:`bf16` element type beforehand for dot computation, with one exception:
-    for AMD CDNA3 specifically, if one of the inputs is of :code:`fp16` element type,
-    the other input is also upcasted to :code:`fp16` element type instead.
-    This behavior is experimental and may be subject to change in the future.
+    MetaX decomposes 2D operations containing E2M1 into GPU software decoding
+    and FP32 scaling, followed by BF16 MMA (FP16 MMA if either input format is
+    FP16), with FP32 accumulation/output. Inputs must be packed along K.
+    Scales are E8M0 int8/uint8 codes, one per 32 logical K values, or None
+    for unit scaling. Code 0 is 2**-127 and code 255 is NaN. Scaled operands
+    are rounded to the MMA input type with RTNE before multiplication; this
+    can underflow or overflow. C550 BF16 MMA flushes BF16 subnormal inputs
+    to zero, as in ordinary BF16 dot. No native FP4 MMA is selected.
 
     :param lhs: The first tensor to be multiplied.
     :type lhs: 2D tensor representing fp4, fp8 or bf16 elements. Fp4 elements are packed into uint8 inputs with the first element in lower bits. Fp8 are stored as uint8 or the corresponding fp8 type.

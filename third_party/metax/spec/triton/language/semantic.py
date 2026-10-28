@@ -1656,6 +1656,16 @@ class TritonSemantic(Generic[TensorTy]):
         assert rhs_format in allowed_formats, f"NYI: rhs_format {rhs_format}"
         rhs_scale_is_none = rhs_scale is None or (isinstance(rhs_scale, tl.constexpr) and rhs_scale.value is None)
         lhs_scale_is_none = lhs_scale is None or (isinstance(lhs_scale, tl.constexpr) and lhs_scale.value is None)
+        if "e2m1" in (lhs_format, rhs_format):
+            if lhs_rank != 2:
+                raise ValueError("MetaX FP4 dot_scaled requires 2D inputs")
+            if not lhs_k_pack or not rhs_k_pack:
+                raise ValueError("MetaX FP4 dot_scaled requires packing along K (lhs_k_pack=True, rhs_k_pack=True)")
+            for name, scale, is_none in (("lhs_scale", lhs_scale, lhs_scale_is_none), ("rhs_scale", rhs_scale,
+                                                                                       rhs_scale_is_none)):
+                if not is_none and (not scale.type.is_block() or scale.dtype not in (tl.uint8, tl.int8)):
+                    raise ValueError(
+                        f"MetaX FP4 dot_scaled {name} must contain E8M0 int8/uint8 codes, got {scale.type}")
         lhs = self._bitcast_to_fp_type(lhs, lhs_format)
         rhs = self._bitcast_to_fp_type(rhs, rhs_format)
 
@@ -1677,13 +1687,16 @@ class TritonSemantic(Generic[TensorTy]):
             K = K * PACKED_A
         if not rhs_k_pack:
             N = N * PACKED_B
+        if "e2m1" in (lhs_format, rhs_format) and not (lhs_scale_is_none and rhs_scale_is_none) and K % 32:
+            raise ValueError(f"MetaX FP4 dot_scaled with E8M0 scales requires K divisible by 32, got {K}")
         ret_ty = tl.block_type(out_dtype, [B, M, N] if B else [M, N])
         _0 = self.builder.get_fp32(0)
         if acc is None:
             acc_handle = self.builder.create_splat(ret_ty.to_ir(self.builder), _0)
         else:
             acc_handle = acc.handle
-            assert acc.type.shape == ret_ty.shape and acc.type.element_ty == out_dtype
+            assert acc.type.shape == ret_ty.shape, f"expected accumulator shape {ret_ty.shape}, got {acc.type.shape}"
+            assert acc.type.element_ty == out_dtype, f"expected accumulator dtype {out_dtype}, got {acc.type.element_ty}"
         rhs_scale_handle = None if rhs_scale_is_none else rhs_scale.handle
         lhs_scale_handle = None if lhs_scale_is_none else lhs_scale.handle
         self.verify_scaled_shape(M, N, K, None if lhs_scale_is_none else lhs_scale,

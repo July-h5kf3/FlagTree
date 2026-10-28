@@ -251,3 +251,190 @@ def test_metax_fp4_encode_odd_tail(rounding, metax_device):
     assert torch.equal(output.cpu(), reference)
     # The final low nibble retains -0; the padded high nibble is +0.
     assert int(output.cpu()[161]) == 8
+
+
+@triton.jit
+def _dot_scaled(A, B, SA, SB, C, Y, A0: tl.constexpr, A1: tl.constexpr, B0: tl.constexpr, B1: tl.constexpr,
+                M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, STEP: tl.constexpr, FA: tl.constexpr,
+                FB: tl.constexpr, PACK_A: tl.constexpr = True, PACK_B: tl.constexpr = True,
+                ACC_TYPE: tl.constexpr = tl.float32, OUT_TYPE: tl.constexpr = tl.float32, BATCH: tl.constexpr = False,
+                SCALE_WIDTH: tl.constexpr = 0):
+    r, c = tl.arange(0, M), tl.arange(0, N)
+    ka = tl.arange(0, STEP // 2 if FA == "e2m1" else STEP)
+    kb = tl.arange(0, STEP // 2 if FB == "e2m1" else STEP)
+    g = tl.arange(0, SCALE_WIDTH if SCALE_WIDTH else STEP // 32)
+    acc = tl.load(C + r[:, None] * N + c[None, :]).to(ACC_TYPE)
+    for start in range(0, K, STEP):
+        a = tl.load(A + r[:, None] * A0 + (start // (2 if FA == "e2m1" else 1) + ka[None, :]) * A1)
+        b = tl.load(B + (start // (2 if FB == "e2m1" else 1) + kb[:, None]) * B0 + c[None, :] * B1)
+        if SA is not None:
+            sa = tl.load(SA + r[:, None] * (K // 32) + start // 32 + g[None, :])
+        else:
+            sa = None
+        if SB is not None:
+            sb = tl.load(SB + c[:, None] * (K // 32) + start // 32 + g[None, :])
+        else:
+            sb = None
+        if BATCH:
+            a, b = a[None, :, :], b[None, :, :]
+        acc = tl.dot_scaled(a, sa, FA, b, sb, FB, acc, lhs_k_pack=PACK_A, rhs_k_pack=PACK_B, out_dtype=OUT_TYPE)
+    tl.store(Y + r[:, None] * N + c[None, :], acc)
+
+
+def _dot_operand(fmt, rows, k, offset):
+    table = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6., -0., -.5, -1., -1.5, -2., -3., -4., -6.])
+    codes = (torch.arange(rows * k).reshape(rows, k) * 7 + offset).remainder(16)
+    values = table[codes]
+    if fmt == "e2m1":
+        return (codes[:, ::2] | (codes[:, 1::2] << 4)).to(torch.uint8), values
+    dtype = {"e4m3": torch.float8_e4m3fn, "e5m2": torch.float8_e5m2, "fp16": torch.float16, "bf16": torch.bfloat16}[fmt]
+    return values.to(dtype), values
+
+
+@pytest.mark.parametrize("fa,fb", [("e2m1", "e2m1")] + [(a, b)
+                                                        for t in ("e4m3", "e5m2", "fp16", "bf16")
+                                                        for a, b in (("e2m1", t), (t, "e2m1"))])
+@pytest.mark.parametrize("scale_a,scale_b", [(True, True), (False, True), (True, False), (False, False)])
+def test_metax_fp4_dot_scaled(fa, fb, scale_a, scale_b, metax_device):
+    m, n, k, step = 32, 16, 128 if scale_a and scale_b else 64, 64
+    a, av = _dot_operand(fa, m, k, 1)
+    b, bv = _dot_operand(fb, n, k, 3)
+    if scale_a:
+        a = a.T.contiguous().T
+    if not scale_b:
+        b = b.T.contiguous().T
+    sa = ((torch.arange(m * (k // 32)).reshape(m, -1) * 3).remainder(7) + 124).to(torch.uint8)
+    sb = ((torch.arange(n * (k // 32)).reshape(n, -1) * 5).remainder(7) + 124).to(torch.uint8)
+    compute_type = torch.float16 if "fp16" in (fa, fb) else torch.bfloat16
+    av, bv = av.double(), bv.double()
+    if scale_a:
+        av *= torch.from_numpy(np.ldexp(np.ones(sa.shape), sa.numpy().astype(np.int16) - 127)).repeat_interleave(32, 1)
+    if scale_b:
+        bv *= torch.from_numpy(np.ldexp(np.ones(sb.shape), sb.numpy().astype(np.int16) - 127)).repeat_interleave(32, 1)
+    av, bv = av.to(compute_type).double(), bv.to(compute_type).double()
+    acc = torch.arange(m * n, dtype=torch.float32).reshape(m, n).remainder(13) / 8
+    expected = av @ bv.T + acc.double()
+    # FP32 accumulation error, relative to the sum of absolute products.
+    bound = (k + 2) * 2**-24 * (av.abs() @ bv.abs().T + acc.double().abs())
+    x, y = a.to(metax_device), b.T.to(metax_device)
+    # Signed byte scales exercise identical E8M0 raw bits above code 127.
+    s = sa.view(torch.int8).to(metax_device) if scale_a else None
+    t = sb.to(metax_device) if scale_b else None
+    out = torch.full((m * n + 64, ), 11., dtype=torch.float32, device=metax_device)
+    kernel = _dot_scaled[(1, )](x, y, s, t, acc.to(metax_device), out[32:-32], *x.stride(), *y.stride(), m, n, k, step,
+                                fa, fb, num_warps=4, num_stages=2)
+    actual = out.cpu()
+    assert torch.equal(actual[:32], torch.full((32, ), 11.))
+    assert torch.equal(actual[-32:], torch.full((32, ), 11.))
+    assert torch.all((actual[32:-32].reshape(m, n).double() - expected).abs() <= bound)
+    assert "tt.dot_scaled" not in kernel.asm["ttgir"]
+    assert "llvm.mxc.mma.f32." in kernel.asm["llir"]
+
+
+@triton.jit
+def _dot_control(A, B, Y):
+    r, k, c = tl.arange(0, 16), tl.arange(0, 64), tl.arange(0, 16)
+    a = tl.load(A + r[:, None] * 64 + k[None, :])
+    b = tl.load(B + k[:, None] * 16 + c[None, :])
+    y = tl.dot(a, b)
+    tl.store(Y + r[:, None] * 16 + c[None, :], y)
+
+
+@pytest.mark.parametrize("case", [
+    "scale_zero", "bf16_subnormal", "large_scale", "scale_nan", "overflow", "fp16_small_scale", "fp8_inf", "fp8_nan",
+    "fp8_scale_zero"
+])
+def test_metax_fp4_dot_scaled_special(case, metax_device):
+    m, n, k = 16, 16, 64
+    a = torch.full((m, k // 2), 0x22, dtype=torch.uint8)
+    b = torch.full((k // 2, n), 0x22, dtype=torch.uint8)
+    sa = torch.full((m, k // 32), 127, dtype=torch.uint8)
+    sb = torch.full((n, k // 32), 127, dtype=torch.uint8)
+    fb, expected = "e2m1", 64.
+    if case == "scale_zero":
+        a.fill_(0x44)
+        sa.fill_(0)
+        sb.fill_(253)
+    elif case == "bf16_subnormal":
+        sa.fill_(0)
+        sb.fill_(253)
+        expected = None
+    elif case == "large_scale":
+        a.fill_(0x11)
+        sa.fill_(254)
+        sb.fill_(1)
+    elif case == "scale_nan":
+        sa.fill_(255)
+        expected = float("nan")
+    elif case == "overflow":
+        a.fill_(0x77)
+        sa.fill_(254)
+        expected = float("inf")
+    elif case == "fp16_small_scale":
+        a.fill_(0x77)
+        sa.fill_(102)
+        fb, b, sb, expected = "fp16", torch.full((k, n), 2**15, dtype=torch.float16), None, .375
+    else:
+        fb = "e5m2"
+        value = {"fp8_inf": float("inf"), "fp8_nan": float("nan"), "fp8_scale_zero": 2**15}[case]
+        b = torch.full((k, n), value).to(torch.float8_e5m2)
+        if case == "fp8_scale_zero":
+            sb.fill_(0)
+            expected = 2**-106
+        else:
+            sb = None
+            expected = value
+    x, y = a.to(metax_device), b.to(metax_device)
+    s, t = sa.to(metax_device), sb.to(metax_device) if sb is not None else None
+    out = torch.empty((m, n), dtype=torch.float32, device=metax_device)
+    _dot_scaled[(1, )](x, y, s, t, torch.zeros_like(out), out, *x.stride(), *y.stride(), m, n, k, k, "e2m1", fb,
+                       num_warps=4, num_stages=2)
+    actual = out.cpu()
+    if expected is None:
+        # Compare with hardware MMA independently of FP4 decoding.
+        # C550 BF16 MMA flushes subnormal inputs; FP16 MMA preserves them.
+        reference = torch.empty_like(out)
+        tiny = torch.full((m, k), 2**-127, dtype=torch.bfloat16).to(metax_device)
+        large = torch.full((k, n), float(2**126), dtype=torch.bfloat16).to(metax_device)
+        _dot_control[(1, )](tiny, large, reference, num_warps=4, num_stages=2)
+        assert torch.equal(actual, reference.cpu())
+    elif np.isnan(expected):
+        assert torch.isnan(actual).all()
+    else:
+        assert torch.equal(actual, torch.full_like(actual, expected))
+
+
+def _dot_scaled_source(**kwargs):
+    constants = dict(A0=32, A1=1, B0=16, B1=1, M=16, N=16, K=64, STEP=64, FA="e2m1", FB="e2m1", PACK_A=True,
+                     PACK_B=True, ACC_TYPE=tl.float32, OUT_TYPE=tl.float32, BATCH=False, SCALE_WIDTH=0)
+    scale_type = kwargs.pop("scale_type", "u8")
+    constants.update(kwargs)
+    return ASTSource(_dot_scaled,
+                     {"A": "*u8", "B": "*u8", "SA": "*" + scale_type, "SB": "*u8", "C": "*fp32", "Y": "*fp32"},
+                     constants)
+
+
+@pytest.mark.parametrize("options,error", [
+    ({"PACK_A": False}, "requires packing along K"),
+    ({"PACK_B": False}, "requires packing along K"),
+    ({"BATCH": True}, "requires 2D inputs"),
+    ({"scale_type": "fp8e4nv"}, "must contain E8M0 int8/uint8 codes"),
+    ({"scale_type": "i32"}, "must contain E8M0 int8/uint8 codes"),
+    ({"ACC_TYPE": tl.float16}, "expected accumulator dtype fp32"),
+    ({"OUT_TYPE": tl.float16}, "Only float32 is supported for out_dtype"),
+    ({"SCALE_WIDTH": 1}, "lhs_scale must be a tensor of shape"),
+    ({"K": 16, "STEP": 16, "SCALE_WIDTH": 1}, "requires K divisible by 32"),
+])
+def test_metax_fp4_dot_scaled_invalid(options, error):
+    with pytest.raises(CompilationError, match=error):
+        triton.compile(_dot_scaled_source(**options), target=GPUTarget("maca", 80, 64))
+
+
+@pytest.mark.parametrize("arch", [80, 86])
+def test_metax_fp4_dot_scaled_diagnostic(arch, fresh_triton_cache, monkeypatch, capfd):
+    monkeypatch.setenv("MLIR_ENABLE_DIAGNOSTICS", "warnings")
+    kernel = triton.compile(_dot_scaled_source(), target=GPUTarget("maca", arch, 64))
+    assert "non-native FP4 dot_scaled on MetaX" in capfd.readouterr().err
+    assert "tt.dot_scaled" not in kernel.asm["ttgir"]
+    assert "llvm.mxc.mma.f32." in kernel.asm["llir"]
+    assert "llvm.mxc.scmma" not in kernel.asm["llir"]
