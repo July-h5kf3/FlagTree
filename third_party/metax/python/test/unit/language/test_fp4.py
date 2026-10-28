@@ -10,6 +10,118 @@ from triton.compiler.errors import CompilationError
 
 
 @triton.jit
+def _copy_packed(X, Y, N: tl.constexpr, XI: tl.constexpr, XS: tl.constexpr, YI: tl.constexpr, YS: tl.constexpr):
+    i = tl.program_id(0) * 256 + tl.arange(0, 256)
+    value = tl.load(X + XI + i * XS, i < N, other=0)
+    tl.store(Y + YI + i * YS, value, i < N)
+
+
+@triton.jit
+def _copy_packed_words(X, Y, N: tl.constexpr):
+    # Only complete, aligned words use int32 pointers. Copy the tail as bytes.
+    _copy_packed(X.to(tl.pointer_type(tl.int32)), Y.to(tl.pointer_type(tl.int32)), N // 4, 0, 1, 0, 1)
+    i = N // 4 * 4 + tl.program_id(0) * 256 + tl.arange(0, 256)
+    value = tl.load(X + i, i < N, other=0)
+    tl.store(Y + i, value, i < N)
+
+
+@triton.jit
+def _unpack_storage(X, Y, WORD: tl.constexpr):
+    count: tl.constexpr = 64 if WORD else 256
+    slots: tl.constexpr = 8 if WORD else 2
+    i, j = tl.arange(0, count), tl.arange(0, slots)
+    value = tl.load(X + i).to(tl.uint32)
+    codes = (value[:, None] >> (4 * j[None, :])) & 15
+    tl.store(Y + i[:, None] * slots + j[None, :], codes)
+
+
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.int32, torch.float4_e2m1fn_x2])
+def test_metax_fp4_host_device_storage(dtype, metax_device):
+    raw = torch.arange(4096, dtype=torch.int64).remainder(256).to(torch.uint8)
+    source = raw.view(dtype)
+    device = source.to(metax_device)
+    copied = device.clone()
+    assert copied.data_ptr() != device.data_ptr()
+    assert torch.equal(device.cpu().view(torch.uint8), raw)
+    assert torch.equal(copied.cpu().view(torch.uint8), raw)
+
+
+@pytest.mark.parametrize("mode", ["uint8", "int32", "x2_view", "x2_reinterpret"])
+@pytest.mark.parametrize("n,xi,xs,yi,ys", [
+    (1024, 32, 1, 32, 1),
+    (1024, 33, 1, 35, 1),
+    (513, 33, 2, 34, 3),
+    (513, 544, -1, 32, 1),
+    (259, 32, 1, 35, 1),
+])
+def test_metax_fp4_packed_copy(mode, n, xi, xs, yi, ys, metax_device):
+    # Offsets, strides and masks count containers, not logical FP4 values.
+    dtype = torch.int32 if mode == "int32" else torch.uint8
+    elem_bytes = dtype.itemsize
+    bits = torch.arange(2048 * elem_bytes, dtype=torch.int64).remainder(256).to(torch.uint8)
+    x = bits.view(dtype).to(metax_device)
+    raw = torch.full_like(x.view(torch.uint8), 165)
+    y = raw.view(dtype)
+    if mode == "x2_view":
+        x, y = x.view(torch.float4_e2m1fn_x2).view(torch.uint8), y.view(torch.float4_e2m1fn_x2).view(torch.uint8)
+    elif mode == "x2_reinterpret":
+        x = triton.reinterpret(x.view(torch.float4_e2m1fn_x2), tl.uint8)
+        y = triton.reinterpret(y.view(torch.float4_e2m1fn_x2), tl.uint8)
+    kernel = _copy_packed[(triton.cdiv(n, 256), )](x, y, n, xi, xs, yi, ys)
+    expected = torch.full_like(bits, 165).view(dtype)
+    i = torch.arange(n)
+    expected[yi + i * ys] = bits.view(dtype)[xi + i * xs]
+    assert torch.equal(raw.cpu(), expected.view(torch.uint8))
+    assert "tt.fp_to_fp" not in kernel.asm["ttir"]
+
+
+@pytest.mark.parametrize("n", [0, 1, 3, 4, 130, 259, 1024])
+def test_metax_fp4_packed_word_tail(n, metax_device):
+    source = torch.arange(1088, dtype=torch.int64).remainder(256).to(torch.uint8)
+    x = source.to(metax_device)
+    raw = torch.full_like(x, 165)
+    kernel = _copy_packed_words[(max(1, triton.cdiv(n, 1024)), )](x[32:], raw[32:], n)
+    expected = torch.full_like(source, 165)
+    expected[32:32 + n] = source[32:32 + n]
+    assert torch.equal(raw.cpu(), expected)
+    # 130 bytes can hold 259 logical values. Copying preserves the spare high
+    # nibble; it does not silently replace it with an encoding-time zero pad.
+    if n == 130:
+        assert int(raw.cpu()[161]) >> 4 == int(source[161]) >> 4 != 0
+    assert "tt.fp_to_fp" not in kernel.asm["ttir"]
+
+
+@pytest.mark.parametrize("word", [False, True])
+def test_metax_fp4_storage_nibble_order(word, metax_device):
+    raw = torch.arange(256, dtype=torch.int64).to(torch.uint8)
+    x = raw.view(torch.int32) if word else raw
+    output = torch.full((576, ), 165, dtype=torch.uint8, device=metax_device)
+    _unpack_storage[(1, )](x.to(metax_device), output[32:544], word)
+    expected = torch.full((576, ), 165, dtype=torch.uint8)
+    expected[32:544:2], expected[33:544:2] = raw & 15, raw >> 4
+    assert torch.equal(output.cpu(), expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.int32])
+def test_metax_fp4_shared_gather(dtype, metax_device):
+    from test_core import gather_test_kernel_1d
+
+    i = torch.arange(1024 * dtype.itemsize, dtype=torch.int64)
+    raw = (i * 73 + (i // 256) * 19).remainder(256).to(torch.uint8)
+    source = raw.view(dtype)
+    indices = (torch.arange(1024, dtype=torch.int32) * 73 + 17).remainder(1024)
+    output = torch.full((1088 * dtype.itemsize, ), 165, dtype=torch.uint8, device=metax_device)
+    kernel = gather_test_kernel_1d[(1, )](source.to(metax_device), indices.to(metax_device),
+                                          output.view(dtype)[32:1056], 0, 1024, 1024, 1024, num_warps=4)
+    expected = torch.full((1088 * dtype.itemsize, ), 165, dtype=torch.uint8)
+    expected.view(dtype)[32:1056] = source[indices.long()]
+    assert torch.equal(output.cpu(), expected)
+    assert kernel.metadata.shared > 0
+    assert "addrspace(3)" in kernel.asm["llir"]
+    assert "tt.fp_to_fp" not in kernel.asm["ttir"]
+
+
+@triton.jit
 def _encode(X, Y, N: tl.constexpr, ROUND: tl.constexpr, AXIS: tl.constexpr = -1, BLOCK: tl.constexpr = 512):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     x = tl.load(X + i, i < N, other=0)
