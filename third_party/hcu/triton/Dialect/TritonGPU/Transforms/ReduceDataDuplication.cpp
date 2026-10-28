@@ -14,8 +14,9 @@
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "triton/Analysis/Utility.h"
-#ifdef __TLE__
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#ifdef __TLE__
+#include "triton/Dialect/TritonGPU/IR/ExplicitLayout.h"
 #endif
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
@@ -108,8 +109,25 @@ public:
         return;
       auto dstDotOp =
           dyn_cast<triton::gpu::DotOperandEncodingAttr>(dstType.getEncoding());
-      if (!dstDotOp)
-        return;
+      bool needTrans = false;
+      if (!dstDotOp) {
+        // Layout propagation can move the conversion before a transpose,
+        // leaving a linear encoding instead of the dot operand encoding.
+        if (!cvtOp->hasOneUse())
+          return;
+        auto trans = dyn_cast<triton::TransOp>(*cvtOp->user_begin());
+        if (!trans || trans.getOrder() != ArrayRef<int32_t>{1, 0})
+          return;
+#ifdef __TLE__
+        if (hasTleExplicitEncoding(cvtOp) || hasTleExplicitEncoding(trans))
+          return;
+#endif
+        dstDotOp = dyn_cast<triton::gpu::DotOperandEncodingAttr>(
+            trans.getType().getEncoding());
+        if (!dstDotOp)
+          return;
+        needTrans = true;
+      }
 #ifdef __TLE__
       DenseSet<Value> visited;
       if (comesFromRemoteLoad(cvtOp.getSrc(), visited))
@@ -120,11 +138,16 @@ public:
       auto order = getOrderForMemory(srcType);
       auto sharedMemorySpace =
           triton::gpu::SharedMemorySpaceAttr::get(srcType.getContext());
+      auto sharedEncoding = triton::gpu::SwizzledSharedEncodingAttr::get(
+          mod.getContext(), dstDotOp, srcType.getShape(), order,
+          triton::gpu::getCTALayout(srcEncoding), srcType.getElementType(),
+          needTrans);
+      // Non-K-contiguous operands can lose vectorization with the unswizzled
+      // dot layout. Keep their generic conversion instead.
+      if (needTrans && sharedEncoding.getMaxPhase() == 1)
+        return;
       auto tmpType = triton::gpu::MemDescType::get(
-          dstType.getShape(), dstType.getElementType(),
-          triton::gpu::SwizzledSharedEncodingAttr::get(
-              mod.getContext(), dstDotOp, srcType.getShape(), order,
-              triton::gpu::getCTALayout(srcEncoding), srcType.getElementType()),
+          dstType.getShape(), dstType.getElementType(), sharedEncoding,
           sharedMemorySpace);
       auto tmp = triton::gpu::LocalAllocOp::create(builder, cvtOp.getLoc(),
                                                    tmpType, cvtOp.getSrc());

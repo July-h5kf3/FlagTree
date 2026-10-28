@@ -162,8 +162,8 @@ struct GluonLayouts {
         py::object(layouts.attr("SwizzledSharedLayout")).release();
     SharedLinearLayout =
         py::object(layouts.attr("SharedLinearLayout")).release();
-    HCUMFMALayout = py::object(amdLayouts.attr("HCUMFMALayout")).release();
-    HCUWMMALayout = py::object(amdLayouts.attr("HCUWMMALayout")).release();
+    HCUMFMALayout = py::object(amdLayouts.attr("AMDMFMALayout")).release();
+    HCUWMMALayout = py::object(amdLayouts.attr("AMDWMMALayout")).release();
     PaddedSharedLayout =
         py::object(layouts.attr("PaddedSharedLayout")).release();
 
