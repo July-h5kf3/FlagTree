@@ -62,8 +62,73 @@ protected:
     auto elemType = opIdx == 0 ? op.getAElemType() : op.getBElemType();
     auto loc = op.getLoc();
     int kDim = opIdx == 0 ? 1 : 0;
-    if (elemType == tt::ScaleDotElemType::E2M1)
+    bool isFp4 = elemType == tt::ScaleDotElemType::E2M1;
+    if (isFp4 && scale) {
+      auto inputTy = value.getType();
+      if (opIdx == 1)
+        scale = tt::TransOp::create(rewriter, loc, scale, getTransposeOrder(2));
+      auto infer =
+          inputTy.getEncoding()
+              .getDialect()
+              .getRegisteredInterface<triton::DialectInferLayoutInterface>();
+      auto shape = llvm::to_vector(inputTy.getShape());
+      shape[kDim] /= 16;
+      shape.insert(shape.begin() + kDim + 1, 16);
+      Attribute expandedEncoding;
+      auto reshaped = infer->inferReshapeOpEncoding(
+          inputTy.getShape(), inputTy.getEncoding(), shape, expandedEncoding,
+          loc);
+      assert(succeeded(reshaped));
+      // Project the packed data layout onto groups before loading scales.
+      // Broadcasting in an unrelated layout and then converting the full
+      // tensor creates unnecessary cross-warp shared-memory traffic.
+      auto slice = ttg::SliceEncodingAttr::get(
+          rewriter.getContext(), kDim + 1,
+          cast<ttg::DistributedEncodingTrait>(expandedEncoding));
+      scale = ConvertLayoutOp::create(
+          rewriter, loc, scale.getType().cloneWithEncoding(slice), scale);
+      auto expanded = tt::ExpandDimsOp::create(rewriter, loc, scale, kDim + 1);
+      auto broadcast = tt::BroadcastOp::create(
+          rewriter, loc, expanded.getType().clone(shape), expanded);
+      auto packed =
+          tt::ReshapeOp::create(rewriter, loc, inputTy.getShape(), broadcast);
+      scale = ConvertLayoutOp::create(rewriter, loc, inputTy, packed);
+
+      auto outputShape = llvm::to_vector(inputTy.getShape());
+      outputShape[kDim] *= 2;
+      auto outputTy = RankedTensorType::get(outputShape, computeType);
+      Attribute outputEncoding;
+      auto result = infer->inferFp4ToFpScaledOpEncoding(
+          outputShape, kDim, inputTy.getEncoding(), outputEncoding,
+          /*fwdInference=*/true, loc, outputTy);
+      assert(succeeded(result));
+      auto decoded = tt::Fp4ToFpScaledOp::create(
+          rewriter, loc, outputTy.cloneWithEncoding(outputEncoding), value,
+          scale, rewriter.getI32IntegerAttr(kDim));
+      decoded->setAttr("maca.keep_fp4_decode_layout", rewriter.getUnitAttr());
+      decoded->setAttr("maca.fp4_dot_fused", rewriter.getUnitAttr());
+      TensorValue output = decoded.getOutput();
+      if (auto blocked =
+              dyn_cast<ttg::BlockedEncodingAttr>(inputTy.getEncoding())) {
+        auto size = llvm::to_vector(blocked.getSizePerThread());
+        size[kDim] *= 2;
+        auto coalesced = ttg::BlockedEncodingAttr::get(
+            rewriter.getContext(), size, blocked.getThreadsPerWarp(),
+            blocked.getWarpsPerCTA(), blocked.getOrder(),
+            blocked.getCTALayout());
+        if (coalesced != outputEncoding)
+          output = ConvertLayoutOp::create(
+              rewriter, loc, outputTy.cloneWithEncoding(coalesced), output);
+        output.getDefiningOp()->setAttr("maca.keep_fp4_decode_layout",
+                                        rewriter.getUnitAttr());
+      }
+      return output;
+    }
+    if (isFp4) {
       value = ttg::Fp4ToFpOp::create(rewriter, loc, value, computeType, kDim);
+      value.getDefiningOp()->setAttr("maca.keep_fp4_decode_layout",
+                                     rewriter.getUnitAttr());
+    }
     if (!scale && value.getType().getElementType() == computeType)
       return value;
 
@@ -81,12 +146,15 @@ protected:
                                 value)
               .getResult());
     auto narrow = [&](Value v) {
-      return cast<TensorValue>(
+      auto result = cast<TensorValue>(
           tt::FpToFpOp::create(
               rewriter, loc, value.getType().clone(computeType), v,
               tt::RoundingModeAttr::get(rewriter.getContext(),
                                         tt::RoundingMode::RTNE))
               .getResult());
+      result.getDefiningOp()->setAttr("maca.keep_fp4_decode_layout",
+                                      rewriter.getUnitAttr());
+      return result;
     };
     if (!scale)
       return narrow(value);

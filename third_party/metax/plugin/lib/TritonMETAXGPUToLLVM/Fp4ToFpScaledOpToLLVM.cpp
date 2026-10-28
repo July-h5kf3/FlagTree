@@ -36,8 +36,19 @@ public:
       Value byte = b.zext(i16_ty, values[i]);
       for (unsigned shift : {0, 4}) {
         Value nibble = b.lshr(byte, b.i16_val(shift));
-        Value bf16 = LLVM::METAX::decodeFp4E2M1(loc, rewriter, nibble, false);
-        Value decoded = LLVM::METAX::convertBf16ToFp32(loc, rewriter, bf16);
+        Value decoded;
+        if (op->hasAttr("maca.fp4_dot_fused")) {
+          // E2M1 bits in the low FP32 exponent positions encode x*2^-126.
+          // C550 FP32 multiply preserves the .5 code's subnormal input.
+          Value code = b.zext(i32_ty, nibble);
+          Value sign = b.shl(b.and_(code, b.i32_val(8)), b.i32_val(28));
+          Value magnitude = b.shl(b.and_(code, b.i32_val(7)), b.i32_val(22));
+          Value raw = b.bitcast(b.or_(sign, magnitude), f32_ty);
+          decoded = b.fmul(raw, b.bitcast(b.i32_val(0x7e800000), f32_ty));
+        } else {
+          Value bf16 = LLVM::METAX::decodeFp4E2M1(loc, rewriter, nibble, false);
+          decoded = LLVM::METAX::convertBf16ToFp32(loc, rewriter, bf16);
+        }
         Value product = b.fmul(decoded, factor);
         if (op.getType().getElementType().isF16()) {
           results.push_back(

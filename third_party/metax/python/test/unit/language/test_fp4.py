@@ -265,14 +265,18 @@ def _dot_scaled(A, B, SA, SB, C, Y, A0: tl.constexpr, A1: tl.constexpr, B0: tl.c
     g = tl.arange(0, SCALE_WIDTH if SCALE_WIDTH else STEP // 32)
     acc = tl.load(C + r[:, None] * N + c[None, :]).to(ACC_TYPE)
     for start in range(0, K, STEP):
-        a = tl.load(A + r[:, None] * A0 + (start // (2 if FA == "e2m1" else 1) + ka[None, :]) * A1)
-        b = tl.load(B + (start // (2 if FB == "e2m1" else 1) + kb[:, None]) * B0 + c[None, :] * B1)
+        a = tl.load(A + r[:, None] * A0 + (start // (2 if FA == "e2m1" else 1) + ka[None, :]) * A1,
+                    start + ka[None, :] * (2 if FA == "e2m1" else 1) < K, other=0)
+        b = tl.load(B + (start // (2 if FB == "e2m1" else 1) + kb[:, None]) * B0 + c[None, :] * B1,
+                    start + kb[:, None] * (2 if FB == "e2m1" else 1) < K, other=0)
         if SA is not None:
-            sa = tl.load(SA + r[:, None] * (K // 32) + start // 32 + g[None, :])
+            sa = tl.load(SA + r[:, None] * (K // 32) + start // 32 + g[None, :], start // 32 + g[None, :] < K // 32,
+                         other=127.0)
         else:
             sa = None
         if SB is not None:
-            sb = tl.load(SB + c[:, None] * (K // 32) + start // 32 + g[None, :])
+            sb = tl.load(SB + c[:, None] * (K // 32) + start // 32 + g[None, :], start // 32 + g[None, :] < K // 32,
+                         other=127.0)
         else:
             sb = None
         if BATCH:
@@ -331,6 +335,34 @@ def test_metax_fp4_dot_scaled(fa, fb, scale_a, scale_b, metax_device):
     assert "llvm.mxc.mma.f32." in kernel.asm["llir"]
 
 
+@pytest.mark.parametrize("block", [(64, 128, 64, 8, 3), (64, 64, 64, 4, 2), (64, 128, 32, 4, 2), (64, 64, 64, 4, 4)])
+@pytest.mark.parametrize("k", [32, 96, 160])
+@pytest.mark.parametrize("scenario", ["", "fullstage"])
+def test_metax_fp4_dot_scaled_pipeline(block, k, scenario, metax_device):
+    m, n, step, warps, stages = block
+    a, av = _dot_operand("e2m1", m, k, 1)
+    b, bv = _dot_operand("e2m1", n, k, 3)
+    sa = (torch.arange(m * (k // 32)).reshape(m, -1).remainder(5) + 125).to(torch.uint8)
+    sb = (torch.arange(n * (k // 32)).reshape(n, -1).remainder(7) + 124).to(torch.uint8)
+    av = av.double() * torch.from_numpy(np.ldexp(np.ones(sa.shape),
+                                                 sa.numpy().astype(np.int16) - 127)).repeat_interleave(32, 1)
+    bv = bv.double() * torch.from_numpy(np.ldexp(np.ones(sb.shape),
+                                                 sb.numpy().astype(np.int16) - 127)).repeat_interleave(32, 1)
+    av, bv = av.to(torch.bfloat16).double(), bv.to(torch.bfloat16).double()
+    acc = torch.arange(m * n, dtype=torch.float32).reshape(m, n).remainder(13) / 8
+    expected = av @ bv.T + acc.double()
+    bound = (k + 2) * 2**-24 * (av.abs() @ bv.abs().T + acc.double().abs())
+    x, y = a.to(metax_device), b.T.contiguous().to(metax_device)
+    out = torch.full((m * n + 64, ), 11., dtype=torch.float32, device=metax_device)
+    _dot_scaled[(1, )](x, y, sa.view(torch.int8).to(metax_device), sb.to(metax_device), acc.to(metax_device),
+                       out[32:-32], *x.stride(), *y.stride(), m, n, k, step, "e2m1", "e2m1", num_warps=warps,
+                       num_stages=stages, scenario=scenario)
+    actual = out.cpu()
+    assert torch.equal(actual[:32], torch.full((32, ), 11.))
+    assert torch.equal(actual[-32:], torch.full((32, ), 11.))
+    assert torch.all((actual[32:-32].reshape(m, n).double() - expected).abs() <= bound)
+
+
 @triton.jit
 def _dot_control(A, B, Y):
     r, k, c = tl.arange(0, 16), tl.arange(0, 64), tl.arange(0, 16)
@@ -338,6 +370,99 @@ def _dot_control(A, B, Y):
     b = tl.load(B + k[:, None] * 16 + c[None, :])
     y = tl.dot(a, b)
     tl.store(Y + r[:, None] * 16 + c[None, :], y)
+
+
+@triton.jit
+def _dot_scaled_alias_store(A, B, Y):
+    r, k, c = tl.arange(0, 16), tl.arange(0, 32), tl.arange(0, 16)
+    ap = A + r[:, None] * 32 + k[None, :]
+    bp = B + k[:, None] * 16 + c[None, :]
+    acc = tl.zeros((16, 16), tl.float32)
+    for _ in range(2):
+        a, b = tl.load(ap), tl.load(bp)
+        acc = tl.dot_scaled(a, None, "e2m1", b, None, "e2m1", acc)
+        tl.store(ap, tl.full((16, 32), 0x44, tl.uint8))
+    tl.store(Y + r[:, None] * 16 + c[None, :], acc)
+
+
+def test_metax_fp4_dot_scaled_alias_store(metax_device):
+    a = torch.full((16, 32), 0x22, dtype=torch.uint8, device=metax_device)
+    b = torch.full((32, 16), 0x22, dtype=torch.uint8, device=metax_device)
+    out = torch.empty((16, 16), dtype=torch.float32, device=metax_device)
+    _dot_scaled_alias_store[(1, )](a, b, out, num_warps=4, num_stages=3)
+    # Iteration 0 reads ones; iteration 1 must read the twos just stored.
+    assert torch.equal(out.cpu(), torch.full((16, 16), 192.))
+    assert torch.equal(a.cpu(), torch.full((16, 32), 0x44, dtype=torch.uint8))
+
+
+@triton.jit
+def _dot_scaled_dependent_load(A, B, S, Y):
+    r, k, c = tl.arange(0, 16), tl.arange(0, 16), tl.arange(0, 16)
+    acc = tl.zeros((16, 16), tl.float32)
+    for i in range(2):
+        scale = tl.load(S + i * 16 + r[:, None])
+        offset = (scale.to(tl.int32) - 127) * 256
+        a = tl.load(A + offset + r[:, None] * 16 + k[None, :])
+        b = tl.load(B + k[:, None] * 16 + c[None, :])
+        acc = tl.dot_scaled(a, scale, "e2m1", b, None, "e2m1", acc)
+    tl.store(Y + r[:, None] * 16 + c[None, :], acc)
+
+
+def test_metax_fp4_dot_scaled_dependent_load(metax_device):
+    a = torch.stack((torch.full((16, 16), 0x22, dtype=torch.uint8), torch.full((16, 16), 0x44,
+                                                                               dtype=torch.uint8))).to(metax_device)
+    b = torch.full((16, 16), 0x22, dtype=torch.uint8, device=metax_device)
+    s = torch.stack((torch.full((16, 1), 127, dtype=torch.uint8), torch.full((16, 1), 128,
+                                                                             dtype=torch.uint8))).to(metax_device)
+    out = torch.empty((16, 16), dtype=torch.float32, device=metax_device)
+    _dot_scaled_dependent_load[(1, )](a, b, s, out, num_warps=4, num_stages=3)
+    assert torch.equal(out.cpu(), torch.full((16, 16), 160.))
+
+
+@triton.jit
+def _dot_scaled_scale_codes(Y):
+    p = tl.program_id(0)
+    code, scale = p // 256, p % 256
+    packed = (code | (code << 4)).to(tl.uint8)
+    a = tl.full((16, 16), 0, tl.uint8) | packed
+    b = tl.full((16, 16), 0x22, tl.uint8)
+    sa = tl.full((16, 1), 0, tl.uint8) | scale.to(tl.uint8)
+    sb = tl.full((16, 1), 0, tl.uint8) | tl.where(scale == 255, 127, 254 - scale).to(tl.uint8)
+    result = tl.dot_scaled(a, sa, "e2m1", b, sb, "e2m1")
+    i, j = tl.arange(0, 16), tl.arange(0, 16)
+    tl.store(Y + p * 256 + i[:, None] * 16 + j[None, :], result)
+
+
+def test_metax_fp4_dot_scaled_scale_codes(metax_device):
+    # Every E2M1 value and E8M0 code, with compensating RHS scales so large
+    # finite LHS values remain observable rather than overflowing the sum.
+    codes = torch.arange(4096) // 256
+    scales = torch.arange(4096).remainder(256)
+    table = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6., -0., -.5, -1., -1.5, -2., -3., -4., -6.],
+                         dtype=torch.float64)
+    a = table[codes] * torch.from_numpy(np.ldexp(np.ones(4096), scales.numpy() - 127))
+    a[scales == 255] = float("nan")
+    inverse = torch.where(scales == 255, 127, 254 - scales)
+    b = torch.from_numpy(np.ldexp(np.ones(4096), inverse.numpy() - 127))
+    a, b = a.to(torch.bfloat16).double(), b.to(torch.bfloat16).double()
+    # Use ordinary MMA as the reference for the device's denormal handling.
+    tiny = torch.full((16, 64), 2**-127, dtype=torch.bfloat16).to(metax_device)
+    large = torch.full((64, 16), float(2**126), dtype=torch.bfloat16).to(metax_device)
+    control = torch.empty((16, 16), dtype=torch.float32, device=metax_device)
+    _dot_control[(1, )](tiny, large, control, num_warps=4, num_stages=2)
+    if torch.equal(control.cpu(), torch.zeros((16, 16))):
+        minimum = torch.finfo(torch.bfloat16).tiny
+        a[a.abs() < minimum] = 0.
+        b[b.abs() < minimum] = 0.
+    else:
+        assert torch.equal(control.cpu(), torch.full((16, 16), 32.))
+    expected = (32 * a * b).float()
+    out = torch.empty((4096, 16, 16), dtype=torch.float32, device=metax_device)
+    _dot_scaled_scale_codes[(4096, )](out, num_warps=4, num_stages=2)
+    actual = out.cpu()
+    nan = torch.isnan(expected)
+    assert torch.equal(torch.isnan(actual), nan[:, None, None].expand_as(actual))
+    assert torch.equal(actual[~nan], expected[~nan, None, None].expand_as(actual[~nan]))
 
 
 @pytest.mark.parametrize("case", [

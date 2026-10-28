@@ -186,6 +186,8 @@ class LoopPipeliner {
   /// Check if none of the ops has valid uses
   LogicalResult checkOpUses(SetVector<Operation *> &ops);
 
+  LogicalResult collectFp4Graph(SetVector<Operation *> &ops);
+
   /// Check if ops have dependencies that are not pipelinable
   void checkOpDeps(SetVector<Operation *> &ops);
 
@@ -660,11 +662,110 @@ ttg::LocalAllocOp LoopPipeliner::allocateEmptyBuffer(triton::LoadOp loadOp,
   llvm_unreachable("Async copy's return should be of RankedTensorType");
 }
 
+LogicalResult LoopPipeliner::collectFp4Graph(SetVector<Operation *> &ops) {
+  auto dots = llvm::to_vector(forOp.getBody()->getOps<triton::DotOp>());
+  if (dots.size() != 1 || isSingleShm)
+    return failure();
+  for (Operation &op : forOp.getBody()->without_terminator()) {
+    if (auto load = dyn_cast<triton::LoadOp>(&op)) {
+      if (load.getIsVolatile())
+        return failure();
+    } else if (!isMemoryEffectFree(&op))
+      return failure();
+  }
+  auto visit = [&](auto &&self, Value value, Value cvt) -> bool {
+    if (value.getParentRegion() != forOp.getRegion())
+      return true;
+    Operation *op = value.getDefiningOp();
+    if (!op || op->getNumResults() != 1 || op->getNumRegions() != 0)
+      return false;
+    if (auto load = dyn_cast<triton::LoadOp>(op)) {
+      if (load.getIsVolatile())
+        return false;
+      if (validLoads.contains(value) && loadsMapping[value] != cvt)
+        return false;
+      validLoads.insert(value);
+      loadsMapping[value] = cvt;
+      ops.insert(op);
+      return true;
+    }
+    if (!isMemoryEffectFree(op))
+      return false;
+    for (Value operand : op->getOperands())
+      if (!self(self, operand, cvt))
+        return false;
+    dotsDeps.insert(op);
+    elemsMapping[value] = cvt;
+    return true;
+  };
+  for (Value operand : {dots.front().getA(), dots.front().getB()}) {
+    if (operand.getParentRegion() != forOp.getRegion())
+      continue;
+    auto cvt = operand.getDefiningOp<ttg::ConvertLayoutOp>();
+    if (!cvt ||
+        !isa<ttg::BlockedEncodingAttr>(cvt.getSrc().getType().getEncoding()) ||
+        !visit(visit, cvt.getSrc(), operand))
+      return failure();
+    dotsDeps.insert(cvt);
+    elemsMapping[operand] = operand;
+  }
+  if (validLoads.empty() ||
+      (pipelineLoadNum > 0 && validLoads.size() > pipelineLoadNum))
+    return failure();
+  // As in the basic pipeline, a load whose pointer/mask depends on another
+  // staged load cannot be prefetched independently.
+  for (Value load : validLoads) {
+    SetVector<Value> deps;
+    for (Value operand : load.getDefiningOp()->getOperands())
+      collectValueDep(operand, numStages - 1, deps);
+    for (Value other : validLoads)
+      if (deps.contains(other))
+        return failure();
+  }
+  // Only move private conversion expressions; other consumers retain the
+  // original loop schedule. Loads themselves may have additional consumers.
+  for (Operation *op : dotsDeps)
+    for (Operation *user : op->getUsers())
+      if (!dotsDeps.contains(user) && user != dots.front())
+        return failure();
+  // Register prefetch queues follow the source load order, not DFS order.
+  SetVector<Value> orderedLoads;
+  for (Operation &op : forOp.getBody()->without_terminator())
+    if (isa<triton::LoadOp>(op) && validLoads.contains(op.getResult(0)))
+      orderedLoads.insert(op.getResult(0));
+  validLoads = std::move(orderedLoads);
+  forOp->setAttr("maca.pipeline_fp4", UnitAttr::get(forOp.getContext()));
+  return success();
+}
+
 LogicalResult LoopPipeliner::initialize() {
   // All ops that maybe pipelined
   SetVector<Operation *> ops;
 
-  if (isFullStage) {
+  bool hasFp4 =
+      llvm::any_of(forOp.getBody()->without_terminator(), [](Operation &op) {
+        return isa<ttg::Fp4ToFpOp, tt::Fp4ToFpScaledOp>(&op);
+      });
+  if (hasFp4) {
+    if (collectFp4Graph(ops).failed())
+      return failure();
+    auto dot = *forOp.getBody()->getOps<triton::DotOp>().begin();
+    auto mma = dyn_cast<ttg::MACAMmaEncodingAttr>(dot.getType().getEncoding());
+    int64_t decodedBytes = 0;
+    for (Value operand : {dot.getA(), dot.getB()})
+      if (operand.getParentRegion() == &forOp.getRegion()) {
+        auto type = cast<RankedTensorType>(operand.getType());
+        decodedBytes +=
+            type.getNumElements() * type.getElementTypeBitWidth() / 8;
+      }
+    // Keep decoded operand buffers small on C550. Register prefetching still
+    // overlaps loads; a second barrier below protects shared-buffer reuse.
+    // Retain double buffering when the decoded tiles occupy less than half
+    // the 64 KiB shared-memory budget, or eight-warps are register-limited.
+    if (mma && mma.getVersionMajor() == 2 && mma.getVersionMinor() == 0 &&
+        ttg::lookupNumWarps(dot) <= 4 && decodedBytes * 2 >= 32 * 1024)
+      isSingleShm = true;
+  } else if (isFullStage) {
     bool failed =
         collectValidOp(forOp, yieldOp, numStages, loadsMapping, elemsMapping,
                        validLoads, dotsDeps, dotsDepsOutOfLoop, ops)
@@ -685,7 +786,7 @@ LogicalResult LoopPipeliner::initialize() {
   if (isSingleShm) {
     numStagesForSHM = 1;
     // TODO: support more load in single shared memory mode
-    if (validLoads.size() != 1)
+    if (validLoads.size() != 1 && !forOp->hasAttr("maca.pipeline_fp4"))
       return failure();
   }
 
@@ -884,6 +985,15 @@ void LoopPipeliner::emitPrologue() {
     prefetchMapping.map(v, loadStage[v][0]);
   }
   for (Operation *op : dotsDeps) {
+    if (forOp->hasAttr("maca.pipeline_fp4")) {
+      auto type = dyn_cast<RankedTensorType>(op->getResult(0).getType());
+      if (type && isa<ttg::DotOperandEncodingAttr>(type.getEncoding()))
+        storedDeps.insert(op);
+      else
+        blockedDeps.insert(op);
+      dotDepsWithOutDot.insert(op);
+      continue;
+    }
     bool isValid = true;
     for (Value v : op->getOperands()) {
       auto tensor = dyn_cast<RankedTensorType>(v.getType());
@@ -1402,7 +1512,7 @@ void LoopPipeliner::prefetchNextIteration(scf::ForOp newForOp,
       }
     }
   }
-  if (isSingleShm) {
+  if (isSingleShm && !forOp->hasAttr("maca.pipeline_fp4")) {
     // TODO: support more load in single shared memory mode
     auto firstDot = mapping.lookupOrDefault(loadDotMapping[validLoads.front()])
                         .getDefiningOp();
@@ -1427,6 +1537,13 @@ void LoopPipeliner::prefetchNextIteration(scf::ForOp newForOp,
 
   for (auto it = genDeps.rbegin(); it != genDeps.rend(); ++it) {
     (*it)->moveAfter(asyncWait);
+  }
+  if (isSingleShm && forOp->hasAttr("maca.pipeline_fp4") &&
+      !genStoredDeps.empty()) {
+    // All warps must have consumed the current shared operands before any
+    // warp overwrites them with the next decoded tile.
+    OpBuilder sync(genStoredDeps.front());
+    sync.create<ttg::BarrierSharedOp>(anchor);
   }
   asyncWait->erase();
 #else
