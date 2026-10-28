@@ -342,15 +342,72 @@ static LogicalResult updateOperandLayout(musa_tle::SqmmaOp op,
   return success();
 }
 
-static void setLoopAccumulator(scf::ForOp loop, unsigned index, Value init,
-                               DenseMap<Value, Value> &nativeAccumulators) {
-  loop->setOperand(3 + index, init);
-  Value argument = loop.getRegionIterArg(index);
-  Value result = loop.getResult(index);
-  argument.setType(init.getType());
-  result.setType(init.getType());
-  nativeAccumulators[argument] = argument;
-  nativeAccumulators[result] = result;
+static LogicalResult
+prepareAsyncLoopAccumulators(Value result, RankedTensorType encodedType,
+                             DenseMap<Value, Value> &encodedAccumulators) {
+  SmallVector<Value> pending{result};
+  DenseSet<Value> visited;
+  SmallVector<std::pair<scf::ForOp, unsigned>> loops;
+  while (!pending.empty()) {
+    Value value = pending.pop_back_val();
+    if (!visited.insert(value).second)
+      continue;
+    for (OpOperand &use : value.getUses()) {
+      scf::ForOp loop;
+      unsigned index;
+      if ((loop = dyn_cast<scf::ForOp>(use.getOwner()))) {
+        if (use.getOperandNumber() < 3)
+          continue;
+        index = use.getOperandNumber() - 3;
+      } else if (auto yield = dyn_cast<scf::YieldOp>(use.getOwner())) {
+        loop = dyn_cast<scf::ForOp>(yield->getParentOp());
+        if (!loop)
+          continue;
+        index = use.getOperandNumber();
+      } else {
+        continue;
+      }
+      Value argument = loop.getRegionIterArg(index);
+      if (llvm::is_contained(loops, std::make_pair(loop, index)))
+        continue;
+      loops.emplace_back(loop, index);
+      pending.push_back(argument);
+      pending.push_back(loop.getResult(index));
+    }
+  }
+
+  // Retype the whole connected loop component before converting its entries.
+  // Otherwise an inner loop can convert an outer iter_arg that changes later.
+  for (auto [loop, index] : loops) {
+    Value argument = loop.getRegionIterArg(index);
+    Value loopResult = loop.getResult(index);
+    if (Value existing = encodedAccumulators.lookup(argument);
+        existing && existing.getType() != encodedType)
+      return loop.emitOpError("requires one compatible async accumulator "
+                              "encoding across connected loop boundaries");
+    argument.setType(encodedType);
+    loopResult.setType(encodedType);
+    encodedAccumulators[argument] = argument;
+    encodedAccumulators[loopResult] = loopResult;
+  }
+  for (auto [loop, index] : loops) {
+    OpBuilder builder(loop);
+    Location loc = loop.getLoc();
+    auto convert = [&](Value value) -> Value {
+      if (Value encoded = encodedAccumulators.lookup(value))
+        return encoded;
+      if (value.getType() == encodedType ||
+          value.getDefiningOp<musa_tle::SqmmaOp>())
+        return value;
+      return triton::gpu::ConvertLayoutOp::create(builder, loc, encodedType,
+                                                  value);
+    };
+    loop->setOperand(3 + index, convert(loop.getInitArgs()[index]));
+    auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
+    builder.setInsertionPoint(yield);
+    yield->setOperand(index, convert(yield.getOperand(index)));
+  }
+  return success();
 }
 
 static LogicalResult verifyAsyncUses(musa_tle::SqmmaOp op) {
@@ -454,30 +511,6 @@ struct TritonMUSAGPUTLELowerSqmmaPass
         auto nativeTy = RankedTensorType::get(
             oldAccTy.getShape(), oldAccTy.getElementType(), encodings[dot]);
         Value nativeAcc = nativeAccumulators.lookup(dot.getC());
-        // An async loop carries the encoded registers through its iter_arg,
-        // yield and result; only a final wait releases them for tensor use.
-        if (!nativeAcc) {
-          if (auto argument = dyn_cast<BlockArgument>(dot.getC())) {
-            auto loop =
-                dyn_cast<scf::ForOp>(argument.getOwner()->getParentOp());
-            if (loop && argument.getArgNumber() >= loop.getNumInductionVars()) {
-              unsigned index =
-                  argument.getArgNumber() - loop.getNumInductionVars();
-              auto yield = cast<scf::YieldOp>(loop.getBody()->getTerminator());
-              if (yield.getOperand(index).getDefiningOp<musa_tle::SqmmaOp>()) {
-                OpBuilder initBuilder(loop);
-                Value init =
-                    nativeAccumulators.lookup(loop.getInitArgs()[index]);
-                if (!init)
-                  init = ttg::ConvertLayoutOp::create(
-                      initBuilder, loop.getLoc(), nativeTy,
-                      loop.getInitArgs()[index]);
-                setLoopAccumulator(loop, index, init, nativeAccumulators);
-                nativeAcc = argument;
-              }
-            }
-          }
-        }
         if (nativeAcc) {
           auto carriedTy = cast<RankedTensorType>(nativeAcc.getType());
           auto carriedEncoding =
@@ -493,6 +526,11 @@ struct TritonMUSAGPUTLELowerSqmmaPass
           // the current operands selected this instruction's K above.
           nativeTy = carriedTy;
         }
+        if (failed(prepareAsyncLoopAccumulators(dot.getD(), nativeTy,
+                                                nativeAccumulators)))
+          return signalPassFailure();
+        if (!nativeAcc)
+          nativeAcc = nativeAccumulators.lookup(dot.getC());
         if (!nativeAcc)
           nativeAcc = dot.getC();
         // An explicit SQMMA layout can describe another instruction shape.
@@ -521,13 +559,8 @@ struct TritonMUSAGPUTLELowerSqmmaPass
         nativeAccumulators[dot.getD()] = nativeDot.getD();
         for (OpOperand &use :
              llvm::make_early_inc_range(dot.getD().getUses())) {
-          if (auto loop = dyn_cast<scf::ForOp>(use.getOwner())) {
-            if (use.getOperandNumber() >= 3)
-              setLoopAccumulator(loop, use.getOperandNumber() - 3,
-                                 nativeDot.getD(), nativeAccumulators);
-          } else if (isa<scf::YieldOp>(use.getOwner())) {
+          if (isa<scf::ForOp, scf::YieldOp>(use.getOwner()))
             use.set(nativeDot.getD());
-          }
         }
         continue;
       }

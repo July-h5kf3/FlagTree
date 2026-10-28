@@ -993,6 +993,9 @@ def wgmma(
     The returned accumulator is an async WGMMA dependency value. Use
     ``tle.gpu.wgmma_wait(pendings, acc)`` before consuming it with ordinary
     tensor operations or storing it.
+    MThreads can carry this dependency through nested runtime ``for`` loops.
+    NVIDIA requires a wait before yielding it from a runtime loop; unwaited
+    loop yields are rejected during lowering.
 
     Logical N/K extents are not user-facing WGMMA parameters. The early
     logical-domain planner derives them from fragment dataflow and attaches

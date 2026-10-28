@@ -63,6 +63,8 @@ def _cross_dtype_kernel(A0, B0, A1, B1, Out, T0: tl.constexpr, T1: tl.constexpr,
     ("bfloat16", "float8_e4m3fn"),
     ("float8_e4m3fn", "float8_e4m3fn"),
     ("float16", "float16"),
+    ("float16", "bfloat16"),
+    ("bfloat16", "float16"),
     ("bfloat16", "bfloat16"),
 ])
 @pytest.mark.parametrize("repeats", [1, 2])
@@ -192,4 +194,36 @@ def _loop_without_wait(Out, iterations):
 def test_loop_accumulator_requires_wait(capfd):
     with pytest.raises(RuntimeError, match="PassManager::run failed"):
         compile_musa(_loop_without_wait, {"Out": "*fp32", "iterations": "i32"})
+    assert "async result must be consumed by musa_tle.sqmma_wait" in capfd.readouterr().err
+
+
+@pytest.mark.parametrize("m,n", [(32, 64), (64, 32), (32, 32)])
+def test_native_accumulator_instruction_shapes(cross_dtype_ttgir, m, n, tmp_path):
+    source, count = re.subn(r"instrShape = \[64, 64, 32\]", f"instrShape = [{m}, {n}, 32]", cross_dtype_ttgir)
+    assert count == 1
+    source = re.sub(r"\bm = 64 : i32", f"m = {m} : i32", source)
+    source = re.sub(r"\bn = 64 : i32", f"n = {n} : i32", source)
+    path = tmp_path / "instruction_shapes.ttgir"
+    path.write_text(source)
+    target, _ = mthreads_backend()
+    kernel = triton.compile(str(path), target=target)
+    assert f"llvm.musa.sqmma.e4m3.m{m}n{n}k32.mma" in kernel.asm["llir"]
+    assert f"llvm.musa.sqmma.fmma.m{m}n{n}k16.mma" in kernel.asm["llir"]
+
+
+@triton.jit
+def _incompatible_async_layout_kernel(Out):
+    a = _alloc_sqmma(64, 32, 0)
+    b = _alloc_sqmma(32, 64, 0)
+    acc = tle.gpu.wgmma(a, b, tl.full((64, 64), 0.0, tl.float32))
+    acc = tl.trans(acc)
+    acc = tle.gpu.wgmma(a, b, acc)
+    acc = tle.gpu.wgmma_wait(0, acc)
+    offsets = tl.arange(0, 64)[:, None] * 64 + tl.arange(0, 64)[None, :]
+    tl.store(Out + offsets, acc)
+
+
+def test_async_accumulator_relayout_requires_wait(capfd):
+    with pytest.raises(RuntimeError, match="PassManager::run failed"):
+        compile_musa(_incompatible_async_layout_kernel, {"Out": "*fp32"})
     assert "async result must be consumed by musa_tle.sqmma_wait" in capfd.readouterr().err

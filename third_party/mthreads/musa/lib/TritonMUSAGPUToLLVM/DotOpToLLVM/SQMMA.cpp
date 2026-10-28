@@ -64,6 +64,7 @@ bool isFP8(triton::musa::SQMMAEltType type) {
 struct SqmmaDescriptorIntrinsicSpec {
   llvm::StringRef intrinsicName;
   Type loadType;
+  Type scalarInputType;
   Value leadingStrideBytes;
   Value swizzleGranularity;
   Value swizzleStride;
@@ -163,10 +164,52 @@ buildSqmmaDescriptorIntrinsicSpec(Location loc, MemDescType memDescTy,
     return failure();
   }
 
+  Type scalarInputType;
+#ifdef __TLE__
+  llvm::LLVMContext llvmContext;
+  auto intrinsicId = llvm::Intrinsic::lookupIntrinsicID(intrinsicName);
+  if (!intrinsicId || llvm::Intrinsic::isOverloaded(intrinsicId)) {
+    emitError(loc) << "unsupported SQMMA descriptor intrinsic: "
+                   << intrinsicName;
+    return failure();
+  }
+  auto *signature = llvm::Intrinsic::getType(llvmContext, intrinsicId);
+  if (signature->getNumParams() != 4 ||
+      !signature->getReturnType()->isIntegerTy(32) ||
+      !signature->getParamType(1)->isIntegerTy(32) ||
+      !signature->getParamType(2)->isIntegerTy(32) ||
+      !signature->getParamType(3)->isIntegerTy(32)) {
+    emitError(loc) << "unsupported SQMMA descriptor signature: "
+                   << intrinsicName;
+    return failure();
+  }
+  auto *inputType = signature->getParamType(0);
+  if (inputType->isPointerTy()) {
+    if (inputType->getPointerAddressSpace() != 3) {
+      emitError(loc) << "SQMMA descriptor requires a shared-memory pointer: "
+                     << intrinsicName;
+      return failure();
+    }
+  } else {
+    if (inputType->isIntegerTy(elemBits))
+      scalarInputType = rewriter.getIntegerType(elemBits);
+    else if (inputType->isHalfTy() && elemBits == 16)
+      scalarInputType = rewriter.getF16Type();
+    else if (inputType->isFloatTy() && elemBits == 32)
+      scalarInputType = rewriter.getF32Type();
+    else {
+      emitError(loc) << "unsupported SQMMA descriptor scalar argument: "
+                     << intrinsicName;
+      return failure();
+    }
+  }
+#endif // __TLE__
+
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   return SqmmaDescriptorIntrinsicSpec{
       intrinsicName,
       loadType,
+      scalarInputType,
       b.i32_val(static_cast<int32_t>(groupedLeadingWidthBytes)),
       b.i32_val(static_cast<int32_t>(swizzle->swizzleGranularity)),
       b.i32_val(static_cast<int32_t>(swizzle->swizzleStride)),
@@ -220,23 +263,9 @@ public:
     Value elemBase = b.bitcast(base, elemPtrTy);
     Value elemPtr = b.gep(elemPtrTy, descriptorSpec.loadType, elemBase, offset);
     Value descriptorInput = elemPtr;
-#ifdef __TLE__
-    // Match the descriptor argument ABI of the linked LLVM.
-    llvm::LLVMContext llvmContext;
-    auto intrinsicId =
-        llvm::Intrinsic::lookupIntrinsicID(descriptorSpec.intrinsicName);
-    auto *inputType =
-        llvm::Intrinsic::getType(llvmContext, intrinsicId)->getParamType(0);
-    if (!inputType->isPointerTy()) {
-      descriptorInput =
-          LLVM::LoadOp::create(rewriter, loc, descriptorSpec.loadType, elemPtr);
-      Type scalarType = descriptorSpec.loadType;
-      if (auto *integerType = llvm::dyn_cast<llvm::IntegerType>(inputType))
-        scalarType = rewriter.getIntegerType(integerType->getBitWidth());
-      if (descriptorInput.getType() != scalarType)
-        descriptorInput = b.bitcast(descriptorInput, scalarType);
-    }
-#endif // __TLE__
+    if (descriptorSpec.scalarInputType)
+      descriptorInput = LLVM::LoadOp::create(
+          rewriter, loc, descriptorSpec.scalarInputType, elemPtr);
     auto desc = LLVM::createLLVMIntrinsicCallOp(
         rewriter, loc, descriptorSpec.intrinsicName, TypeRange{i32_ty},
         ValueRange{descriptorInput, descriptorSpec.leadingStrideBytes,
