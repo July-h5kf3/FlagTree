@@ -200,11 +200,11 @@ static void convertLoopCarriedAccumulator(OpOperand &use, Value encodedInit,
 // re-selected from the operand types at lowering (see WGMMA.cpp).
 static Value materializeMMAAccumulator(OpBuilder &builder, WGMMAOp op,
                                        RankedTensorType mmaType,
-                                       DenseMap<Value, Value> &encodedAccs) {
-  Value acc = op.getC();
-  if (Value mapped = lookupEncodedAccumulator(acc, encodedAccs))
-    return mapped;
+                                       Value encodedAcc) {
+  if (encodedAcc)
+    return encodedAcc;
 
+  Value acc = op.getC();
   auto accType = cast<RankedTensorType>(acc.getType());
   if (accType.getEncoding() == mmaType.getEncoding())
     return acc;
@@ -265,7 +265,7 @@ struct TritonTleLowerWGMMAPass
             return;
           }
           Value acc =
-              materializeMMAAccumulator(builder, wgmma, mmaType, encodedAccs);
+              materializeMMAAccumulator(builder, wgmma, mmaType, encodedAcc);
           Value a = materializeAOperand(builder, wgmma, mmaType);
           if (!acc) {
             failed = true;

@@ -76,7 +76,6 @@ selectSqmmaConfig(unsigned m, unsigned n, unsigned k, unsigned numWarps,
 
   std::optional<SelectedSqmmaConfig> best;
   unsigned bestCount = std::numeric_limits<unsigned>::max();
-  unsigned bestVolume = 0;
   bool bestPreferred = false;
   for (unsigned instM : kMN) {
     if (m % instM != 0)
@@ -100,18 +99,14 @@ selectSqmmaConfig(unsigned m, unsigned n, unsigned k, unsigned numWarps,
           if (m % tileM != 0 || n % tileN != 0)
             continue;
           unsigned count = (m / tileM) * (n / tileN) * (k / instK);
-          unsigned volume = instM * instN * instK;
           bool preferred =
               warpsM == preferredWarps[0] && warpsN == preferredWarps[1];
           // PH1's legal instruction shapes differ from NVIDIA's. Prefer its
           // warp split when realizable, then minimize SQMMA work within it.
           if (!best || (preferred && !bestPreferred) ||
-              (preferred == bestPreferred &&
-               (count < bestCount ||
-                (count == bestCount && volume > bestVolume)))) {
+              (preferred == bestPreferred && count < bestCount)) {
             best = SelectedSqmmaConfig{{instM, instN, instK}, {warpsM, warpsN}};
             bestCount = count;
-            bestVolume = volume;
             bestPreferred = preferred;
           }
         }
@@ -414,10 +409,12 @@ struct TritonMUSAGPUTLELowerSqmmaPass
         return signalPassFailure();
       }
       unsigned numWarps = ttg::maybeLookupNumWarps(dot).value_or(0);
-      auto preferredWarps = getPreferredWarpsPerCTA(dot, numWarps);
+      SmallVector<unsigned, 2> preferredWarps;
       // An async C dependency cannot redistribute its producer's registers.
       if (auto previous = dot.getC().getDefiningOp<musa_tle::SqmmaOp>())
         preferredWarps = to_vector(encodings[previous].getWarpsPerCTA());
+      else
+        preferredWarps = getPreferredWarpsPerCTA(dot, numWarps);
       auto config = selectSqmmaConfig(aTy.getShape()[0], bTy.getShape()[1],
                                       aTy.getShape()[1], numWarps, *operandType,
                                       preferredWarps);
