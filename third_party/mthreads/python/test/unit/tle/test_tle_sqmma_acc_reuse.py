@@ -8,7 +8,7 @@ import triton
 import triton.language as tl
 import triton.experimental.tle.language as tle
 
-from test_tle_utils import compile_musa, mthreads_backend, require_mthreads_libtriton
+from test_tle_utils import compile_musa, mthreads_backend, require_mthreads_libtriton, tme_descriptor_attrs
 
 require_mthreads_libtriton()
 
@@ -26,7 +26,8 @@ def _alloc_sqmma(M: tl.constexpr, N: tl.constexpr, DTYPE: tl.constexpr):
 
 @triton.jit(do_not_specialize=["ITERATIONS"])
 def _cross_dtype_kernel(A0, B0, A1, B1, Out, T0: tl.constexpr, T1: tl.constexpr, K0: tl.constexpr, K1: tl.constexpr,
-                        ITERATIONS, LOOP: tl.constexpr):
+                        ITERATIONS, LOOP: tl.constexpr, WAIT_IN_LOOP: tl.constexpr = False,
+                        FINAL_WAIT: tl.constexpr = True):
     a0 = _alloc_sqmma(64, K0, T0)
     b0 = _alloc_sqmma(K0, 64, T0)
     a1 = _alloc_sqmma(64, K1, T1)
@@ -51,7 +52,10 @@ def _cross_dtype_kernel(A0, B0, A1, B1, Out, T0: tl.constexpr, T1: tl.constexpr,
         for _ in range(ITERATIONS):
             acc = tle.gpu.wgmma(a0, b0, acc)
             acc = tle.gpu.wgmma(a1, b1, acc)
-    acc = tle.gpu.wgmma_wait(0, acc)
+            if WAIT_IN_LOOP:
+                acc = tle.gpu.wgmma_wait(0, acc)
+    if FINAL_WAIT:
+        acc = tle.gpu.wgmma_wait(0, acc)
     offsets = tl.arange(0, 64)[:, None] * 64 + tl.arange(0, 64)[None, :]
     tl.store(Out + offsets, acc)
 
@@ -67,8 +71,9 @@ def _cross_dtype_kernel(A0, B0, A1, B1, Out, T0: tl.constexpr, T1: tl.constexpr,
     ("bfloat16", "float16"),
     ("bfloat16", "bfloat16"),
 ])
-@pytest.mark.parametrize("repeats", [1, 2])
-def test_accumulator_reuse_runtime(first, second, repeats):
+@pytest.mark.parametrize("repeats", [0, 1, 3])
+@pytest.mark.parametrize("wait_in_loop", [False, True])
+def test_accumulator_reuse_runtime(first, second, repeats, wait_in_loop):
     from triton.tools.tensor_descriptor import TensorDescriptor
 
     if not hasattr(torch, "musa") or not torch.musa.is_available():
@@ -100,7 +105,9 @@ def test_accumulator_reuse_runtime(first, second, repeats):
         dtypes[0][3],
         dtypes[1][3],
         repeats,
-        repeats != 1,
+        wait_in_loop or repeats != 1,
+        WAIT_IN_LOOP=wait_in_loop,
+        FINAL_WAIT=not wait_in_loop,
         num_warps=4,
         num_stages=1,
     )
@@ -120,17 +127,23 @@ def test_accumulator_reuse_runtime(first, second, repeats):
     assert len(dots) >= 2
     producer = re.match(r"\s*(%[-\w.]+) = ", dots[0]).group(1)
     assert f"<32 x i32> {producer}," in dots[1], dots[1]
-    if repeats != 1:
+    if wait_in_loop or repeats != 1:
         assert "scf.for" in kernel.asm["ttgir"]
+    if wait_in_loop:
+        loop_body = kernel.asm["ttgir"].split("scf.for", 1)[1].split("scf.yield", 1)[0]
+        assert "ttg.convert_layout" not in loop_body
+        assert "sqmma_wait" in loop_body
+        assert kernel.asm["llir"].count("call void @llvm.musa.sqmma.wait()") == 1
 
 
-@pytest.fixture(scope="module")
-def cross_dtype_ttgir():
+def cross_dtype_source(wait_in_loop=False, second="fp16"):
+    from triton.compiler import ASTSource
+
     signature = {
         "A0": "tensordesc<fp8e4nv[64,32]>",
         "B0": "tensordesc<fp8e4nv[32,64]>",
-        "A1": "tensordesc<fp16[64,16]>",
-        "B1": "tensordesc<fp16[16,64]>",
+        "A1": f"tensordesc<{second}[64,16]>",
+        "B1": f"tensordesc<{second}[16,64]>",
         "Out": "*fp32",
         "T0": "constexpr",
         "T1": "constexpr",
@@ -138,9 +151,47 @@ def cross_dtype_ttgir():
         "K1": "constexpr",
         "ITERATIONS": "i32",
         "LOOP": "constexpr",
+        "WAIT_IN_LOOP": "constexpr",
+        "FINAL_WAIT": "constexpr",
     }
-    constants = {"T0": 0, "T1": 1, "K0": 32, "K1": 16, "LOOP": False}
-    return compile_musa(_cross_dtype_kernel, signature, constants).asm["ttgir"]
+    constants = {
+        "T0": 0, "T1": 1 if second == "fp16" else 2, "K0": 32, "K1": 16, "LOOP": wait_in_loop, "WAIT_IN_LOOP":
+        wait_in_loop, "FINAL_WAIT": not wait_in_loop
+    }
+    return ASTSource(_cross_dtype_kernel, signature, constexprs=constants, attrs=tme_descriptor_attrs(signature))
+
+
+@pytest.fixture(scope="module")
+def cross_dtype_ttgir():
+    target, _ = mthreads_backend()
+    return triton.compile(cross_dtype_source(), target=target).asm["ttgir"]
+
+
+@pytest.mark.parametrize("second", ["fp16", "bf16"])
+def test_wait_loop_keeps_native_accumulator_before_layout_optimization(second):
+    from triton._C.libtriton import ir, passes, mthreads
+
+    target, backend = mthreads_backend()
+    context = ir.context()
+    ir.load_dialects(context)
+    backend.load_dialects(context)
+    options = backend.parse_options({"num_warps": 4, "num_stages": 1})
+    source = cross_dtype_source(wait_in_loop=True, second=second)
+    module = source.make_ir(target, options, backend.get_codegen_implementation(options), backend.get_module_map(),
+                            context)
+    backend.make_ttir(module, {}, options, 31)
+    pm = ir.pass_manager(context)
+    passes.ttir.add_convert_to_ttgpuir(pm, "musa:31", 4, 32, 1)
+    mthreads.passes.ttgpuir.add_tle_early_assign_memory_space(pm)
+    mthreads.passes.ttgpuir.add_tle_select_encodings(pm)
+    mthreads.passes.ttgpuir.add_tle_lower_sqmma(pm)
+    pm.run(module, "wait_loop_accumulator_preparation")
+    loop_body = module.str_nodebug().split("scf.for", 1)[1].split("scf.yield", 1)[0]
+    assert "ttg.convert_layout" not in loop_body
+    assert loop_body.count("ttmg.squad_dot ") == 2
+    assert loop_body.count("ttmg.squad_dot_wait") == 1
+    assert "k = 32 : i32" in loop_body
+    assert "k = 16 : i32" in loop_body
 
 
 @pytest.mark.parametrize("marked", [False, True])

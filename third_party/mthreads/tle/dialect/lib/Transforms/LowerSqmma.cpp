@@ -714,9 +714,9 @@ static bool isMmaEncoded(Value value) {
 //
 //   iter -> dot -> dot ... -> wait -> scf.yield
 //
-// Every value on the path must be single-use and every dot must select the
-// same accumulator encoding. Other control-flow and ordinary tensor users
-// remain fail-closed.
+// Every value on the path must be single-use and every dot must assign C to
+// the same physical registers. Instruction K remains specific to each dot.
+// Other control-flow and ordinary tensor users remain fail-closed.
 static LogicalResult prepareWaitLoopCarriedSqmmaTypes(
     ArrayRef<musa_tle::SqmmaOp> dots,
     DenseMap<musa_tle::SqmmaOp, ttg::MUSASqmmaEncodingAttr> &encodings) {
@@ -784,6 +784,8 @@ static LogicalResult prepareWaitLoopCarriedSqmmaTypes(
             chainDots.back() != rootDot)
           continue;
 
+        auto accumulatorLayout =
+            mmaEncoding->second.toLinearLayout(oldAccTy.getShape());
         for (musa_tle::SqmmaOp dot : chainDots) {
           unsigned uses =
               std::distance(dot.getD().use_begin(), dot.getD().use_end());
@@ -793,7 +795,8 @@ static LogicalResult prepareWaitLoopCarriedSqmmaTypes(
           }
           auto dotEncoding = encodings.find(dot);
           if (dotEncoding == encodings.end() ||
-              dotEncoding->second != mmaEncoding->second) {
+              dotEncoding->second.toLinearLayout(oldAccTy.getShape()) !=
+                  accumulatorLayout) {
             valid = false;
             break;
           }
