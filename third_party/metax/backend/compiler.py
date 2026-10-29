@@ -17,6 +17,7 @@ import functools
 from typing import Any, Dict, Tuple, Optional
 from types import ModuleType
 import hashlib
+import inspect
 import re
 import tempfile
 import signal
@@ -479,4 +480,7 @@ class MACABackend(BaseBackend):
         if mxcc_arch is None:
             raise RuntimeError('mxcc_arch is None (not specified)')
         version = subprocess.check_output([mxcc_arch, "--version"]).decode("utf-8").split('\n', 1)[0]
-        return f'{version}-{self.capability}'
+        # The provider semantic implementation is outside triton/language.
+        from triton.language.semantic import TritonSemantic
+        semantic_hash = file_hash(inspect.getfile(TritonSemantic.dot))
+        return f'{version}-{self.capability}-{semantic_hash}'

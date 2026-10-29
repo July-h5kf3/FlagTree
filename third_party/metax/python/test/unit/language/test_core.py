@@ -5703,6 +5703,74 @@ def _metax_fp8_dot_operand(dtype, shape, pattern, rng, device):
     return tensor, _decode_float_to_fp64(bits, dtype)
 
 
+@triton.jit
+def _metax_int8_dot(A, B, C, Y, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, A0: tl.constexpr, A1: tl.constexpr,
+                    B0: tl.constexpr, B1: tl.constexpr, USE_ACC: tl.constexpr, EXPLICIT_OUT: tl.constexpr,
+                    STAGES: tl.constexpr):
+    m, n, k = tl.arange(0, M), tl.arange(0, N), tl.arange(0, 32)
+    acc = tl.load(C + m[:, None] * N + n[None, :]) if USE_ACC else tl.zeros((M, N), tl.int32)
+    for start in tl.range(0, tl.cdiv(K, 32), num_stages=STAGES):
+        offsets = start * 32 + k
+        a = tl.load(A + m[:, None] * A0 + offsets[None, :] * A1, offsets[None, :] < K, other=0)
+        b = tl.load(B + offsets[:, None] * B0 + n[None, :] * B1, offsets[:, None] < K, other=0)
+        if not USE_ACC and K == 32:
+            acc = tl.dot(a, b)
+        elif EXPLICIT_OUT:
+            acc = tl.dot(a, b, acc=acc, out_dtype=tl.int32)
+        else:
+            acc = tl.dot(a, b, acc=acc)
+    tl.static_assert(acc.dtype == tl.int32)
+    tl.store(Y + m[:, None] * N + n[None, :], acc)
+
+
+@pytest.mark.parametrize("m,n,k,stages,scenario", [
+    (1, 1, 32, 1, ""),
+    (2, 4, 32, 1, ""),
+    (1, 16, 64, 2, ""),
+    (16, 1, 96, 2, ""),
+    (1, 64, 128, 2, ""),
+    (64, 1, 128, 2, ""),
+    (8, 16, 64, 2, ""),
+    (16, 8, 64, 2, ""),
+    (8, 8, 96, 3, "fullstage"),
+    (16, 16, 64, 2, "fullstage"),
+    (32, 32, 136, 2, ""),
+])
+@pytest.mark.parametrize("row_major", [False, True])
+@pytest.mark.parametrize("use_acc", [False, True])
+def test_metax_int8_dot(m, n, k, stages, scenario, row_major, use_acc, metax_device):
+    rng = np.random.default_rng(20261029)
+    av = rng.integers(-128, 128, size=(m, k), dtype=np.int16)
+    bv = rng.integers(-128, 128, size=(k, n), dtype=np.int16)
+    cv = (np.arange(m * n, dtype=np.int32).reshape(m, n) * 17) % 8192 - 4096
+    expected = av.astype(np.int64) @ bv.astype(np.int64) + (cv if use_acc else 0)
+    a = torch.from_numpy(av).to(torch.int8).to(metax_device)
+    b = torch.from_numpy(bv if row_major else bv.T.copy()).to(torch.int8).to(metax_device)
+    if not row_major:
+        b = b.T
+    c = torch.from_numpy(cv).to(metax_device)
+    raw = torch.full((m * n + 64, ), 0x13579, dtype=torch.int32, device=metax_device)
+    # Keep an explicit-output control; all small shapes exercise the default.
+    explicit = m == n == 16 and row_major
+    _metax_int8_dot[(1, )](a, b, c, raw[32:-32], m, n, k, *a.stride(), *b.stride(), use_acc, explicit, stages,
+                           num_warps=4, num_stages=stages, scenario=scenario)
+    actual = raw.cpu().numpy()
+    np.testing.assert_array_equal(actual[:32], np.full(32, 0x13579, dtype=np.int32))
+    np.testing.assert_array_equal(actual[-32:], np.full(32, 0x13579, dtype=np.int32))
+    np.testing.assert_array_equal(actual[32:-32].reshape(m, n), expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.int64])
+def test_metax_int8_dot_invalid_accumulator(dtype, metax_device):
+    a = torch.ones((16, 32), dtype=torch.int8, device=metax_device)
+    b = torch.ones((32, 16), dtype=torch.int8, device=metax_device)
+    c = torch.zeros((16, 16), dtype=dtype, device=metax_device)
+    y = torch.empty((16, 16), dtype=torch.int32, device=metax_device)
+    with pytest.raises(triton.CompilationError, match="expected accumulator dtype int32"):
+        _metax_int8_dot[(1, )](a, b, c, y, 16, 16, 32, *a.stride(), *b.stride(), True, False, 1, num_warps=4,
+                               num_stages=1)
+
+
 _metax_fp8_pairs = list(itertools.product([tl.float8e4nv, tl.float8e5], repeat=2))
 
 

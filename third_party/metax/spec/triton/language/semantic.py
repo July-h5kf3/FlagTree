@@ -1586,7 +1586,10 @@ class TritonSemantic(Generic[TensorTy]):
             acc_handle = self.builder.create_splat(ret_ty.to_ir(self.builder), _0)
         else:
             acc_handle = acc.handle
-            assert acc.type.shape == ret_ty.shape and acc.type.element_ty == out_dtype
+            if acc.type.shape != ret_ty.shape:
+                raise ValueError(f"expected accumulator shape {ret_ty.shape}, got {acc.type.shape}")
+            if acc.type.element_ty != ret_scalar_ty:
+                raise ValueError(f"expected accumulator dtype {ret_scalar_ty}, got {acc.type.element_ty}")
 
         # max_num_imprecise_acc only applies to fp8 -> fp32 dot on sm_90
         if max_num_imprecise_acc is None:
@@ -1597,6 +1600,38 @@ class TritonSemantic(Generic[TensorTy]):
         else:
             if lhs.dtype.is_fp8() and rhs.dtype.is_fp8() and max_num_imprecise_acc > K:
                 raise ValueError(f"max_num_imprecise_acc ({max_num_imprecise_acc}) must be <= K ({K})")
+
+        if lhs.dtype == tl.int8 and lhs_rank == 2 and (M < 16 or N < 16):
+            # The MetaX MMA shared layout needs at least a 16x16 output tile.
+            # Interleave zero rows/columns using register views, then undo the
+            # interleaving after MMA. This never extends a global-memory load.
+            def resize(value, shape):
+                for axis, size in enumerate(shape):
+                    while value.type.shape[axis] < size:
+                        resized_shape = list(value.type.shape)
+                        resized_shape[axis] *= 2
+                        value = self.join(value, self.full(value.type.shape, 0, value.dtype))
+                        if axis == 0:
+                            value = self.permute(value, (0, 2, 1))
+                        value = self.reshape(value, resized_shape, can_reorder=False)
+                    while value.type.shape[axis] > size:
+                        resized_shape = list(value.type.shape)
+                        resized_shape[axis] //= 2
+                        resized_shape.insert(axis + 1, 2)
+                        value = self.reshape(value, resized_shape, can_reorder=False)
+                        if axis == 0:
+                            value = self.permute(value, (0, 2, 1))
+                        value, _ = self.split(value)
+                return value
+
+            padded_shape = [max(M, 16), max(N, 16)]
+            lhs = resize(lhs, [padded_shape[0], K])
+            rhs = resize(rhs, [K, padded_shape[1]])
+            padded_acc = resize(self.tensor(acc_handle, ret_ty), padded_shape)
+            result = self.tensor(
+                self.builder.create_dot(lhs.handle, rhs.handle, padded_acc.handle, input_precision,
+                                        max_num_imprecise_acc), tl.block_type(ret_scalar_ty, padded_shape))
+            return resize(result, [M, N])
 
         return self.tensor(
             self.builder.create_dot(lhs.handle, rhs.handle, acc_handle, input_precision, max_num_imprecise_acc), ret_ty)
