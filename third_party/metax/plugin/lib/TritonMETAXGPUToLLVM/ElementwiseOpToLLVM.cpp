@@ -2079,6 +2079,28 @@ struct SIToFPOpConversion
   }
 };
 
+struct UIToFPOpConversion
+    : ElementwiseOpConversionBase<mlir::arith::UIToFPOp, UIToFPOpConversion> {
+  using Base =
+      ElementwiseOpConversionBase<mlir::arith::UIToFPOp, UIToFPOpConversion>;
+  using Base::Base;
+  using Adaptor = typename Base::OpAdaptor;
+
+  SmallVector<Value> createDestOps(mlir::arith::UIToFPOp op, OpAdaptor adaptor,
+                                   ConversionPatternRewriter &rewriter,
+                                   Type elemTy, MultipleOperandsRange operands,
+                                   Location loc) const {
+    if (!getElementType(op.getIn()).isInteger(8) ||
+        !getElementType(op.getOut()).isBF16())
+      return {};
+    // BF16 uses i16 storage in LLVM. Every uint8 value is exact in FP32,
+    // so this intermediate cannot introduce double rounding.
+    auto value = rewriter.create<LLVM::UIToFPOp>(loc, f32_ty, operands[0][0]);
+    return {mlir::LLVM::METAX::convertFp32ToBf16(loc, value.getOperation(),
+                                                 rewriter, value)};
+  }
+};
+
 struct FPToSIOpConversion
     : ElementwiseOpConversionBase<mlir::arith::FPToSIOp, FPToSIOpConversion> {
   using Base =
@@ -2394,6 +2416,8 @@ void mlir::triton::METAX::populateElementwiseOpToLLVMPatterns(
   patterns.add<TruncFOpConversion>(typeConverter, axisInfoAnalysis, benefit);
   patterns.add<FPToSIOpConversion>(typeConverter, axisInfoAnalysis, benefit);
   patterns.add<SIToFPOpConversion>(typeConverter, axisInfoAnalysis, benefit);
+  patterns.add<UIToFPOpConversion>(typeConverter, axisInfoAnalysis,
+                                   PatternBenefit(benefit.getBenefit() + 1));
 
   patterns.add<FpToFpOpConversion>(typeConverter, axisInfoAnalysis,
                                    computeCapability, benefit);

@@ -143,6 +143,18 @@ def test_metax_int32_to_bf16_rtne(num_warps, metax_device):
     np.testing.assert_array_equal(output.cpu().numpy().view(np.uint16), expected)
 
 
+@pytest.mark.parametrize("num_warps", [1, 4])
+def test_metax_uint8_to_bf16(num_warps, metax_device):
+    values = np.resize(np.arange(256, dtype=np.uint8), 4096)
+    output = torch.full((4160,), 0x5a5a, dtype=torch.int16, device=metax_device)
+    type_convert_triton[(1,)](torch.from_numpy(values).to(metax_device),
+                                triton.reinterpret(output[32:-32], tl.bfloat16), None, 4096,
+                                num_warps=num_warps)
+    expected = np.full(4160, 0x5a5a, dtype=np.uint16)
+    expected[32:-32] = _encode_fp64_to_float(values.astype(np.float64), tl.bfloat16, ir.ROUNDING_MODE.RTNE)
+    np.testing.assert_array_equal(output.cpu().numpy().view(np.uint16), expected)
+
+
 def _metax_fp8_boundary_values(dtype, np_type):
     max_code = 0x7e if dtype == tl.float8e4nv else 0x7b
     representable = _decode_float_to_fp64(np.arange(max_code + 1, dtype=np.uint8), dtype)
