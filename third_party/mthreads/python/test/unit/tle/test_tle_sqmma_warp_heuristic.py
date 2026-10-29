@@ -106,7 +106,7 @@ def test_last_sqmma_preserves_warp_split(m, n, warps):
 
 
 @pytest.mark.parametrize("dtype,torch_dtype", [(tl.float8e4nv, torch.float8_e4m3fn), (tl.bfloat16, torch.bfloat16)])
-@pytest.mark.parametrize("mode", ["none", "raw", "row", "async_acc"])
+@pytest.mark.parametrize("mode", ["none", "raw", "row", "async_acc", "shared"])
 def test_warp_heuristic_runtime(dtype, torch_dtype, mode):
     import torch_musa
 
