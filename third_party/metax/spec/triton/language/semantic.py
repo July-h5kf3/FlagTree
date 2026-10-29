@@ -1556,9 +1556,11 @@ class TritonSemantic(Generic[TensorTy]):
         assert self.builder.codegen_fns.get(
             "min_dot_size") is not None, "target doesn't provide lower shape bounds for dot."
         min_dot_size = self.builder.codegen_fns["min_dot_size"](lhs.type, rhs.type)
-        assert lhs.shape[-2].value >= min_dot_size[0] and lhs.shape[-1].value >= min_dot_size[2] \
-            and rhs.shape[-1].value >= min_dot_size[1], \
-                f"Input shapes should have M >= {min_dot_size[0]}, N >= {min_dot_size[1]} and K >= {min_dot_size[2]}"
+        if (lhs.shape[-2].value < min_dot_size[0] or lhs.shape[-1].value < min_dot_size[2]
+                or rhs.shape[-1].value < min_dot_size[1]):
+            raise ValueError(
+                f"Input shapes should have M >= {min_dot_size[0]}, N >= {min_dot_size[1]} and K >= {min_dot_size[2]}; "
+                f"got M={lhs.shape[-2].value}, N={rhs.shape[-1].value}, K={lhs.shape[-1].value}")
         if lhs.type.scalar.is_int():
             assert lhs.type.scalar == tl.int8, "only int8 supported!"
             _0 = self.builder.get_int32(0)
@@ -1722,8 +1724,11 @@ class TritonSemantic(Generic[TensorTy]):
             K = K * PACKED_A
         if not rhs_k_pack:
             N = N * PACKED_B
-        if "e2m1" in (lhs_format, rhs_format) and not (lhs_scale_is_none and rhs_scale_is_none) and K % 32:
-            raise ValueError(f"MetaX FP4 dot_scaled with E8M0 scales requires K divisible by 32, got {K}")
+        if "e2m1" in (lhs_format, rhs_format):
+            if M < 16 or N < 16 or K < 16:
+                raise ValueError(f"MetaX FP4 dot_scaled requires M >= 16, N >= 16 and K >= 16; got M={M}, N={N}, K={K}")
+            if not (lhs_scale_is_none and rhs_scale_is_none) and K % 32:
+                raise ValueError(f"MetaX FP4 dot_scaled with E8M0 scales requires K divisible by 32, got {K}")
         ret_ty = tl.block_type(out_dtype, [B, M, N] if B else [M, N])
         _0 = self.builder.get_fp32(0)
         if acc is None:

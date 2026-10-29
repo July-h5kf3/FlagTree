@@ -2363,6 +2363,9 @@ def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_i
     For three-dimensional blocks, `tl.dot` performs the batched matrix product,
     where the first dimension of each block represents the batch dimension.
 
+    MetaX E4M3FN/E5M2 dot requires M and N >= 16 and K >= 32, with FP32
+    accumulation/output. Smaller M/N tiles are rejected before lowering.
+
     :param input: The first tensor to be multiplied.
     :type input: 2D or 3D tensor of scalar-type in {:code:`int8`, :code:`float8_e5m2`, :code:`float16`, :code:`bfloat16`, :code:`float32`}
     :param other: The second tensor to be multiplied.
@@ -2432,6 +2435,8 @@ def dot_scaled(lhs, lhs_scale, lhs_format, rhs, rhs_scale, rhs_format, acc=None,
     MetaX decomposes 2D operations containing E2M1 into GPU software decoding
     and FP32 scaling, followed by BF16 MMA (FP16 MMA if either input format is
     FP16), with FP32 accumulation/output. Inputs must be packed along K.
+    M, N and logical K must each be >= 16; K must also be divisible by 32
+    when scales are used.
     Scales are E8M0 int8/uint8 codes, one per 32 logical K values, or None
     for unit scaling. Code 0 is 2**-127 and code 255 is NaN. Scaled operands
     are rounded to the MMA input type with RTNE before multiplication; this

@@ -32,7 +32,9 @@ def min_dot_size(target: GPUTarget):
         lhs_bitwidth = lhs_type.scalar.primitive_bitwidth
         rhs_bitwidth = rhs_type.scalar.primitive_bitwidth
         assert lhs_bitwidth == rhs_bitwidth, "lhs and rhs bitwidth must be the same"
-        # For small M/N the input we can still use tensorcores with padding.
+        if lhs_type.scalar.is_fp8():
+            return (16, 16, 32)
+        # INT8 dot pads small M/N to the minimum MMA output tile.
         if lhs_bitwidth == 8:
             return (1, 1, 32)
         else:

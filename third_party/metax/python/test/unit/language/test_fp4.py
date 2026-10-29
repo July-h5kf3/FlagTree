@@ -410,9 +410,10 @@ def _dot_operand(fmt, rows, k, offset):
 @pytest.mark.parametrize("fa,fb", [("e2m1", "e2m1")] + [(a, b)
                                                         for t in ("e4m3", "e5m2", "fp16", "bf16")
                                                         for a, b in (("e2m1", t), (t, "e2m1"))])
-@pytest.mark.parametrize("scale_a,scale_b", [(True, True), (False, True), (True, False), (False, False)])
-def test_metax_fp4_dot_scaled(fa, fb, scale_a, scale_b, metax_device):
-    m, n, k, step = 32, 16, 128 if scale_a and scale_b else 64, 64
+@pytest.mark.parametrize("scale_a,scale_b,k,step", [(True, True, 128, 64), (False, True, 64, 64), (True, False, 64, 64),
+                                                    (False, False, 64, 64), (False, False, 16, 16)])
+def test_metax_fp4_dot_scaled(fa, fb, scale_a, scale_b, k, step, metax_device):
+    m, n = (16, 16) if k == 16 else (32, 16)
     a, av = _dot_operand(fa, m, k, 1)
     b, bv = _dot_operand(fb, n, k, 3)
     if scale_a:
@@ -438,7 +439,7 @@ def test_metax_fp4_dot_scaled(fa, fb, scale_a, scale_b, metax_device):
     t = sb.to(metax_device) if scale_b else None
     out = torch.full((m * n + 64, ), 11., dtype=torch.float32, device=metax_device)
     kernel = _dot_scaled[(1, )](x, y, s, t, acc.to(metax_device), out[32:-32], *x.stride(), *y.stride(), m, n, k, step,
-                                fa, fb, num_warps=4, num_stages=2)
+                                fa, fb, SCALE_WIDTH=max(1, step // 32), num_warps=4, num_stages=2)
     actual = out.cpu()
     assert torch.equal(actual[:32], torch.full((32, ), 11.))
     assert torch.equal(actual[-32:], torch.full((32, ), 11.))
@@ -661,10 +662,16 @@ def _dot_scaled_source(**kwargs):
     ({"OUT_TYPE": tl.float16}, "Only float32 is supported for out_dtype"),
     ({"SCALE_WIDTH": 1}, "lhs_scale must be a tensor of shape"),
     ({"K": 16, "STEP": 16, "SCALE_WIDTH": 1}, "requires K divisible by 32"),
+    ({"M": 1, "N": 1}, "requires M >= 16, N >= 16 and K >= 16; got M=1, N=1, K=64"),
+    ({"M": 8}, "requires M >= 16, N >= 16 and K >= 16; got M=8, N=16, K=64"),
+    ({"N": 8}, "requires M >= 16, N >= 16 and K >= 16; got M=16, N=8, K=64"),
+    *[({"K": k, "STEP": k, "SCALE_WIDTH": 1, "SA": None, "SB": None
+        }, f"requires M >= 16, N >= 16 and K >= 16; got M=16, N=16, K={k}") for k in (2, 4, 8)],
 ])
-def test_metax_fp4_dot_scaled_invalid(options, error):
+@pytest.mark.parametrize("arch", [80, 86])
+def test_metax_fp4_dot_scaled_invalid(options, error, arch):
     with pytest.raises(CompilationError, match=error):
-        triton.compile(_dot_scaled_source(**options), target=GPUTarget("maca", 80, 64))
+        triton.compile(_dot_scaled_source(**options), target=GPUTarget("maca", arch, 64))
 
 
 @pytest.mark.parametrize("arch", [80, 86])

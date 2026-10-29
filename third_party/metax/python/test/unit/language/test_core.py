@@ -5777,11 +5777,11 @@ _metax_fp8_pairs = list(itertools.product([tl.float8e4nv, tl.float8e5], repeat=2
 @pytest.mark.parametrize("lhs_dtype,rhs_dtype,pattern,block,scenario",
                          [(a, b, "finite", block, "")
                           for a, b in _metax_fp8_pairs
-                          for block in (32, 64)] + [(a, b, pattern, 64, scenario)
-                                                    for a, b in _metax_fp8_pairs
-                                                    for pattern, scenario in (("finite_row", ""),
-                                                                              ("finite_row_tail", ""),
-                                                                              ("finite_row", "fullstage"))] +
+                          for block in (16, 32, 64)] + [(a, b, pattern, 64, scenario)
+                                                        for a, b in _metax_fp8_pairs
+                                                        for pattern, scenario in (("finite_row", ""),
+                                                                                  ("finite_row_tail", ""),
+                                                                                  ("finite_row", "fullstage"))] +
                          [(a, b, pattern, 32, "")
                           for a, b in _metax_fp8_pairs
                           for pattern in ("subnormal", "rhs_subnormal", "nan")] + [(tl.float8e5, b, pattern, 32, "")
@@ -5804,7 +5804,7 @@ def test_metax_fp8_dot(lhs_dtype, rhs_dtype, pattern, block, scenario, metax_dev
     out = torch.empty((m, n), dtype=torch.float32, device=metax_device)
     initial_acc = 1.25 if pattern == "finite" else 0.
     kernel = matmul_kernel[(1, )](triton.reinterpret(a, lhs_dtype), triton.reinterpret(b, rhs_dtype), out, m, n, k,
-                                  *a.stride(), *b.stride(), *out.stride(), block, block, block, 0, num_warps=4,
+                                  *a.stride(), *b.stride(), *out.stride(), block, block, max(block, 32), 0, num_warps=4,
                                   num_stages=2, initial_acc=initial_acc, mask_k=has_tail, scenario=scenario)
     actual = out.cpu().numpy().astype(np.float64)
     with np.errstate(invalid="ignore"):
@@ -5845,14 +5845,24 @@ def test_metax_fp8_dot_invalid_accumulator(acc_dtype, out_dtype, error, metax_de
                              acc_dtype=acc_dtype, out_dtype=out_dtype)
 
 
-def _metax_fp8_dot_source(lhs_dtype, rhs_dtype):
+def _metax_fp8_dot_source(lhs_dtype, rhs_dtype, block_m=32, block_n=32):
     from triton.compiler import ASTSource
 
     signature = {name: "i32" for name in matmul_kernel.arg_names[:12]}
     signature.update(a_ptr=f"*{lhs_dtype}", b_ptr=f"*{rhs_dtype}", c_ptr="*fp32")
-    constants = dict(BLOCK_SIZE_M=32, BLOCK_SIZE_N=32, BLOCK_SIZE_K=32, low_precision_acc=0, num_stages=2,
+    constants = dict(BLOCK_SIZE_M=block_m, BLOCK_SIZE_N=block_n, BLOCK_SIZE_K=32, low_precision_acc=0, num_stages=2,
                      initial_acc=1.25, acc_dtype=tl.float32, out_dtype=tl.float32, mask_k=False)
     return ASTSource(matmul_kernel, signature, constexprs=constants)
+
+
+@pytest.mark.parametrize("lhs_dtype,rhs_dtype", _metax_fp8_pairs)
+@pytest.mark.parametrize("m,n", [(1, 1), (8, 16), (16, 8)])
+@pytest.mark.parametrize("arch", [80, 86])
+def test_metax_fp8_dot_invalid_shape(lhs_dtype, rhs_dtype, m, n, arch):
+    from triton.backends.compiler import GPUTarget
+
+    with pytest.raises(triton.CompilationError, match=f"M >= 16, N >= 16 and K >= 32; got M={m}, N={n}, K=32"):
+        triton.compile(_metax_fp8_dot_source(lhs_dtype, rhs_dtype, m, n), target=GPUTarget("maca", arch, 64))
 
 
 def test_metax_fp8_dot_diagnostic(metax_device, fresh_triton_cache, monkeypatch, capfd):
