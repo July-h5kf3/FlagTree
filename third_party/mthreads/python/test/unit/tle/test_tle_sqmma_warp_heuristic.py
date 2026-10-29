@@ -1,4 +1,4 @@
-"""MUSA SQMMA uses NVIDIA MMAv3's chained-dot and M-first warp heuristic."""
+"""MUSA SQMMA warp selection preserves explicit and chained layouts."""
 
 import re
 
@@ -89,6 +89,20 @@ def test_async_c_chain_preserves_warp_split():
     assert encodings[0] == encodings[1]
     layout = next(line for line in ttgir.splitlines() if line.startswith(encodings[0] + " = "))
     assert "warpsPerCTA = [8, 1], instrShape = [16, 64," in layout
+
+
+@pytest.mark.parametrize("m,n,warps", [(32, 64, 8), (64, 128, 8), (128, 128, 16), (16, 128, 8)])
+def test_last_sqmma_preserves_warp_split(m, n, warps):
+    _, ttgir = _compile_ws_ir(dot_chain, {"Q": "*fp32", "K": "*fp32", "Out": "*fp32"},
+                              {"M": m, "N": n, "DTYPE": tl.bfloat16, "MODE": "shared"}, consumer_warps=warps)
+    dots = [line for line in ttgir.splitlines() if " = ttmg.squad_dot " in line]
+    assert len(dots) == 2
+    splits = []
+    for dot in dots:
+        encoding = re.search(r"-> tensor<[^>]+, (#[^>]+)>", dot).group(1)
+        layout = next(line for line in ttgir.splitlines() if line.startswith(encoding + " = "))
+        splits.append(re.search(r"warpsPerCTA = (\[[^]]+\])", layout).group(1))
+    assert splits[0] == splits[1]
 
 
 @pytest.mark.parametrize("dtype,torch_dtype", [(tl.float8e4nv, torch.float8_e4m3fn), (tl.bfloat16, torch.bfloat16)])

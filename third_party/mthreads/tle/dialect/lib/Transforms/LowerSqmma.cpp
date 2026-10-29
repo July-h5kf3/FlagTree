@@ -46,15 +46,28 @@ struct SelectedSqmmaConfig {
   SmallVector<unsigned, 2> warpsPerCTA;
 };
 
-// Match NVIDIA MMAv3's forward-slice and M-first warp heuristic.
-static SmallVector<unsigned, 2> getPreferredWarpsPerCTA(musa_tle::SqmmaOp dot,
-                                                        unsigned numWarps) {
+static SmallVector<unsigned, 2> getPreferredWarpsPerCTA(
+    musa_tle::SqmmaOp dot, unsigned numWarps,
+    const DenseMap<musa_tle::SqmmaOp, ttg::MUSASqmmaEncodingAttr> &encodings) {
   SetVector<Operation *> slice;
   mlir::getForwardSlice(dot.getD(), &slice);
   if (llvm::any_of(slice, [](Operation *op) {
         return isa<tt::DotOpInterface, musa_tle::SqmmaOp>(op);
       }))
     return {numWarps, 1};
+
+  // Keep the last dot's split aligned with its input producer when possible.
+  slice.clear();
+  BackwardSliceOptions options;
+  options.omitBlockArguments = true;
+  (void)getBackwardSlice(dot.getA(), &slice, options);
+  (void)getBackwardSlice(dot.getB(), &slice, options);
+  for (Operation *op : llvm::reverse(slice)) {
+    if (auto previous = dyn_cast<musa_tle::SqmmaOp>(op)) {
+      if (auto encoding = encodings.lookup(previous))
+        return to_vector(encoding.getWarpsPerCTA());
+    }
+  }
 
   unsigned m = cast<RankedTensorType>(dot.getD().getType()).getShape()[0];
   SmallVector<unsigned, 2> warps{4, 1};
@@ -914,8 +927,11 @@ struct TritonMUSAGPUTLELowerSqmmaPass
       // An async C dependency cannot redistribute its producer's registers.
       if (auto previous = dot.getC().getDefiningOp<musa_tle::SqmmaOp>())
         preferredWarps = to_vector(encodings[previous].getWarpsPerCTA());
+      else if (auto explicitEnc = dyn_cast_or_null<ttg::MUSASqmmaEncodingAttr>(
+                   cast<RankedTensorType>(dot.getC().getType()).getEncoding()))
+        preferredWarps = to_vector(explicitEnc.getWarpsPerCTA());
       else
-        preferredWarps = getPreferredWarpsPerCTA(dot, numWarps);
+        preferredWarps = getPreferredWarpsPerCTA(dot, numWarps, encodings);
       auto config = selectSqmmaConfig(aTy.getShape()[0], bTy.getShape()[1],
                                       aTy.getShape()[1], numWarps, *operandType,
                                       preferredWarps, disableMSplitPreference);
