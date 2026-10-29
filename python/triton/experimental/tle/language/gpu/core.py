@@ -217,8 +217,13 @@ def _deduplicate_warp_specialize_captures(worker_items):
 
 
 @tl.builtin
-def warp_specialize(functions_and_args, worker_num_warps, worker_num_regs, _semantic: TLESemantic | None = None,
-                    _generator=None):
+def warp_specialize(
+    functions_and_args,
+    worker_num_warps,
+    worker_num_regs,
+    _semantic: TLESemantic | None = None,
+    _generator=None,
+):
     """
     Create an explicit GPU warp-specialized region.
 
@@ -994,6 +999,8 @@ def wgmma(
     ``tle.gpu.wgmma_wait(pendings, acc)`` before consuming it with ordinary
     tensor operations or storing it.
     MThreads can carry this dependency through nested runtime ``for`` loops.
+    A direct single-SQMMA loop result also supports an implicit completion wait
+    before ordinary tensor consumption.
     NVIDIA requires a wait before yielding it from a runtime loop; unwaited
     loop yields are rejected during lowering.
 

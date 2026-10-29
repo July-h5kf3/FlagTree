@@ -187,19 +187,21 @@ def _loop_without_wait(Out, iterations):
     acc = tl.full((64, 64), 0.0, tl.float32)
     for _ in range(iterations):
         acc = tle.gpu.wgmma(a, b, acc)
+        acc += 1.0
     offsets = tl.arange(0, 64)[:, None] * 64 + tl.arange(0, 64)[None, :]
     tl.store(Out + offsets, acc)
 
 
-def test_loop_accumulator_requires_wait(capfd):
+def test_loop_accumulator_arithmetic_requires_wait(capfd):
     with pytest.raises(RuntimeError, match="PassManager::run failed"):
         compile_musa(_loop_without_wait, {"Out": "*fp32", "iterations": "i32"})
     assert "async result must be consumed by musa_tle.sqmma_wait" in capfd.readouterr().err
 
 
 @pytest.mark.parametrize("m,n", [(32, 64), (64, 32), (32, 32)])
-def test_native_accumulator_instruction_shapes(cross_dtype_ttgir, m, n, tmp_path):
-    source, count = re.subn(r"instrShape = \[64, 64, 32\]", f"instrShape = [{m}, {n}, 32]", cross_dtype_ttgir)
+@pytest.mark.parametrize("encoding_k", [32, 128])
+def test_native_accumulator_instruction_shapes(cross_dtype_ttgir, m, n, encoding_k, tmp_path):
+    source, count = re.subn(r"instrShape = \[64, 64, 32\]", f"instrShape = [{m}, {n}, {encoding_k}]", cross_dtype_ttgir)
     assert count == 1
     source = re.sub(r"\bm = 64 : i32", f"m = {m} : i32", source)
     source = re.sub(r"\bn = 64 : i32", f"n = {n} : i32", source)
