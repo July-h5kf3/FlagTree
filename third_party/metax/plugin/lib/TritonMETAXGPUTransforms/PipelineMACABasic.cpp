@@ -770,9 +770,10 @@ LogicalResult LoopPipeliner::initialize() {
         ttg::lookupNumWarps(dot) <= 4 && decodedBytes * 2 >= 32 * 1024)
       isSingleShm = true;
   } else if (isFullStage) {
-    // Integer padding can change the accumulator's shape across join/split
-    // views. The fullstage cloner cannot preserve those uses yet; keep this
-    // loop's original schedule while retaining native MMA lowering.
+    // Power-of-two INT8 tiles are still padded with join/split views, which
+    // changes the accumulator shape. The fullstage cloner cannot preserve
+    // those uses yet; keep this loop's original schedule while retaining
+    // native MMA lowering.
     bool hasInt8Dot = llvm::any_of(
         forOp.getBody()->getOps<triton::DotOp>(), [](triton::DotOp dot) {
           return dot.getA().getType().getElementType().isInteger(8);
