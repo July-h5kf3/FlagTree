@@ -21,9 +21,16 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#include "AsyncMlaKvCopy.h"
 #include "Dialect/PPUGPU/IR/Dialect.h"
 #include "Dialect/TritonPPUGPU/IR/Dialect.h"
+#include "EarlySharedFloatScales.h"
+#include "GlobalLoadOffsets.h"
 #include "PPUGPUToLLVM/Passes.h"
+#include "PrefetchMlaNope.h"
+#include "ReadonlySharedMatrices.h"
+#include "ReuseMlaKvViews.h"
+#include "ScalarizeMlaPv.h"
 #include "TritonPPUGPUToLLVM/Passes.h"
 #include "TritonPPUGPUTransforms/Passes.h"
 #include "acblas_instance.h"
@@ -109,6 +116,15 @@ static void checkMatmulConstraints(const std::string &A_dtype,
 }
 
 void init_triton_ppu(py::module &&m) {
+  m.def("promote_mla_kv_copy", &mlir::triton::ppu::promoteMlaKvCopy);
+  m.def("reuse_mla_kv_views", &mlir::triton::ppu::reuseMlaKvViews);
+  m.def("fold_global_load_offsets", &::triton::ppu::foldGlobalLoadOffsets);
+  m.def("hoist_readonly_shared_matrices",
+        &::triton::ppu::hoistReadonlySharedMatrices);
+  m.def("publish_shared_float_scales_early",
+        &::triton::ppu::publishSharedFloatScalesEarly);
+  m.def("prefetch_mla_nope", &::triton::ppu::prefetchMlaNopeFragments);
+  m.def("scalarize_mla_pv", &::triton::ppu::scalarizeMlaPv);
   auto passes = m.def_submodule("passes");
   init_triton_ppu_passes_ttgpuir(passes.def_submodule("ttgpuir"));
   init_triton_ppu_passes_ttppugpuir(passes.def_submodule("ttppugpuir"));

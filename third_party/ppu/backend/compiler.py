@@ -210,6 +210,14 @@ class HGGCOptions:
     maxnreg: Optional[int] = None
     ppu_llc_options: Optional[str] = knobs.ppu.ppu_llc_options
     ir_override: Optional[str] = None  # filename of a user-defined IR (*.{ttir|ttgir|llir|tix})
+    ppu_fold_global_load_offsets: bool = False
+    ppu_vectorize_i8_shared_store: bool = False
+    ppu_hoist_readonly_shared_matrices: int = 0
+    ppu_publish_shared_float_scales_early: bool = False
+    ppu_reuse_mla_kv: bool = False
+    ppu_async_mla_kv: bool = False
+    ppu_prefetch_mla_nope: bool = False
+    ppu_scalarize_mla_pv: bool = False
     enable_fp_fusion: bool = True
     enable_reflect_ftz: bool = True  # ftz in libdevice
     launch_cooperative_grid: bool = False
@@ -431,6 +439,12 @@ class PPUBackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
 
         pm.run(mod, 'make_ttgir')
+        metadata["mla_shared_kv_views_reused"] = 0
+        metadata["mla_async_kv_copies"] = 0
+        if (opt.ppu_reuse_mla_kv and capability == 80 and opt.num_warps == 16 and opt.num_ctas == 1):
+            metadata["mla_shared_kv_views_reused"] = ppu.reuse_mla_kv_views(mod)
+            if opt.ppu_async_mla_kv and metadata["mla_shared_kv_views_reused"]:
+                metadata["mla_async_kv_copies"] = ppu.promote_mla_kv_copy(mod)
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
 
@@ -455,6 +469,8 @@ class PPUBackend(BaseBackend):
 
     def make_llir(self, src, metadata, options, capability):
         mod = src
+        if options.ppu_vectorize_i8_shared_store and capability == 80:
+            mod.set_attr("ppu.vector_i8_shared_store", ir.builder(mod.context).get_int32_attr(1))
         # TritonGPU -> LLVM-IR (MLIR)
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
@@ -492,6 +508,8 @@ class PPUBackend(BaseBackend):
             PPUBackend.instrumentation.patch("llvmir_to_llvm", pm, mod.context)
 
         pm.run(mod, 'make_llir')
+        metadata["vector_i8_shared_store_applied"] = mod.get_int_attr("ppu.vector_i8_shared_store.applied") or 0
+        metadata["vector_i8_shared_store_grouped"] = mod.get_int_attr("ppu.vector_i8_shared_store.grouped") or 0
 
         if knobs.compilation.dump_ir_extract_di_local_variables:
             # comments below on why separate it
@@ -535,11 +553,33 @@ class PPUBackend(BaseBackend):
 
         llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3)
 
+        if options.ppu_fold_global_load_offsets and capability == 80:
+            block_warps = src.get_int_attr("ttg.total-num-warps") or options.num_warps
+            metadata["global_load_offsets_folded"] = ppu.fold_global_load_offsets(llvm_mod, block_warps * 32)
+
         # Get some metadata
         total_num_warps = src.get_int_attr("ttg.total-num-warps")
         if total_num_warps is not None:
             metadata["num_warps"] = total_num_warps
         metadata["shared"] = src.get_int_attr("ttg.shared")
+        metadata["readonly_shared_matrices_hoisted"] = 0
+        if options.ppu_hoist_readonly_shared_matrices and capability == 80:
+            metadata["readonly_shared_matrices_hoisted"] = ppu.hoist_readonly_shared_matrices(
+                llvm_mod, options.ppu_hoist_readonly_shared_matrices, metadata["num_warps"] * 32, metadata["shared"])
+        metadata["shared_float_scales_published_early"] = 0
+        if options.ppu_publish_shared_float_scales_early and capability == 80:
+            metadata["shared"], metadata["shared_float_scales_published_early"] = ppu.publish_shared_float_scales_early(
+                llvm_mod, metadata["num_warps"] * 32, metadata["shared"])
+        metadata["mla_nope_fragments_prefetched"] = 0
+        if (options.ppu_prefetch_mla_nope and capability == 80 and metadata["num_warps"] == 16
+                and metadata["mla_shared_kv_views_reused"] == 1 and metadata["readonly_shared_matrices_hoisted"] == 12):
+            metadata["mla_nope_fragments_prefetched"] = ppu.prefetch_mla_nope(llvm_mod, 512, metadata["shared"])
+        metadata["mla_pv_scalarized"] = 0
+        if (options.ppu_scalarize_mla_pv and capability == 80 and metadata["num_warps"] == 16
+                and metadata["mla_shared_kv_views_reused"] == 1 and metadata["readonly_shared_matrices_hoisted"] == 12
+                and metadata["mla_nope_fragments_prefetched"] == 1
+                and metadata["shared_float_scales_published_early"] == 1):
+            metadata["mla_pv_scalarized"] = ppu.scalarize_mla_pv(llvm_mod, 512, metadata["shared"])
         metadata["global_scratch_size"] = src.get_int_attr("ttg.global_scratch_memory_size")
         metadata["global_scratch_align"] = src.get_int_attr("ttg.global_scratch_memory_alignment")
         metadata["profile_scratch_size"] = src.get_int_attr("ttg.profile_scratch_memory_size") or 0
