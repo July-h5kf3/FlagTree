@@ -397,9 +397,12 @@ def _dot_scaled(A, B, SA, SB, C, Y, A0: tl.constexpr, A1: tl.constexpr, B0: tl.c
     tl.store(Y + r[:, None] * N + c[None, :], acc)
 
 
-def _dot_operand(fmt, rows, k, offset):
+def _dot_operand(fmt, rows, k, offset, seed=None):
     table = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6., -0., -.5, -1., -1.5, -2., -3., -4., -6.])
-    codes = (torch.arange(rows * k).reshape(rows, k) * 7 + offset).remainder(16)
+    if seed is None:
+        codes = (torch.arange(rows * k).reshape(rows, k) * 7 + offset).remainder(16)
+    else:
+        codes = torch.from_numpy(np.random.default_rng(seed).integers(0, 16, size=(rows, k), dtype=np.int64))
     values = table[codes]
     if fmt == "e2m1":
         return (codes[:, ::2] | (codes[:, 1::2] << 4)).to(torch.uint8), values
@@ -448,28 +451,31 @@ def test_metax_fp4_dot_scaled(fa, fb, scale_a, scale_b, k, step, metax_device):
     assert "llvm.mxc.mma.f32." in kernel.asm["llir"]
 
 
-@pytest.mark.parametrize("block", [(64, 128, 64, 8, 3), (64, 64, 64, 4, 2), (64, 128, 32, 4, 2), (64, 64, 64, 4, 4)])
+@pytest.mark.parametrize("block", [(64, 128, 64, 8, 3), (64, 64, 64, 4, 2), (64, 128, 32, 4, 2), (64, 64, 64, 4, 4),
+                                   (32, 32, 32, 8, 2), (32, 32, 32, 8, 3), (32, 32, 32, 8, 4)])
 @pytest.mark.parametrize("k", [32, 96, 160])
 @pytest.mark.parametrize("scenario", ["", "fullstage"])
-def test_metax_fp4_dot_scaled_pipeline(block, k, scenario, metax_device):
+@pytest.mark.parametrize("fa,fb", [("e2m1", "e2m1"), ("e2m1", "fp16"), ("e2m1", "e5m2")])
+def test_metax_fp4_dot_scaled_pipeline(block, k, scenario, fa, fb, metax_device):
     m, n, step, warps, stages = block
-    a, av = _dot_operand("e2m1", m, k, 1)
-    b, bv = _dot_operand("e2m1", n, k, 3)
+    a, av = _dot_operand(fa, m, k, 1, seed=3101)
+    b, bv = _dot_operand(fb, n, k, 3, seed=3102)
     sa = (torch.arange(m * (k // 32)).reshape(m, -1).remainder(5) + 125).to(torch.uint8)
     sb = (torch.arange(n * (k // 32)).reshape(n, -1).remainder(7) + 124).to(torch.uint8)
     av = av.double() * torch.from_numpy(np.ldexp(np.ones(sa.shape),
                                                  sa.numpy().astype(np.int16) - 127)).repeat_interleave(32, 1)
     bv = bv.double() * torch.from_numpy(np.ldexp(np.ones(sb.shape),
                                                  sb.numpy().astype(np.int16) - 127)).repeat_interleave(32, 1)
-    av, bv = av.to(torch.bfloat16).double(), bv.to(torch.bfloat16).double()
+    compute_type = torch.float16 if "fp16" in (fa, fb) else torch.bfloat16
+    av, bv = av.to(compute_type).double(), bv.to(compute_type).double()
     acc = torch.arange(m * n, dtype=torch.float32).reshape(m, n).remainder(13) / 8
     expected = av @ bv.T + acc.double()
     bound = (k + 2) * 2**-24 * (av.abs() @ bv.abs().T + acc.double().abs())
     x, y = a.to(metax_device), b.T.contiguous().to(metax_device)
     out = torch.full((m * n + 64, ), 11., dtype=torch.float32, device=metax_device)
     _dot_scaled[(1, )](x, y, sa.view(torch.int8).to(metax_device), sb.to(metax_device), acc.to(metax_device),
-                       out[32:-32], *x.stride(), *y.stride(), m, n, k, step, "e2m1", "e2m1", num_warps=warps,
-                       num_stages=stages, scenario=scenario)
+                       out[32:-32], *x.stride(), *y.stride(), m, n, k, step, fa, fb, num_warps=warps, num_stages=stages,
+                       scenario=scenario)
     actual = out.cpu()
     assert torch.equal(actual[:32], torch.full((32, ), 11.))
     assert torch.equal(actual[-32:], torch.full((32, ), 11.))
