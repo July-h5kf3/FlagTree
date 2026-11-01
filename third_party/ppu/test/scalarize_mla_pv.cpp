@@ -96,16 +96,26 @@ static std::unique_ptr<Module> fixture(LLVMContext &context, unsigned variant) {
   for (unsigned lane = 0; lane < 32; ++lane)
     packedHigh = builder.CreateInsertElement(
         packedHigh, high[lane / 8][lane % 8], builder.getInt64(lane));
-  auto *factor = ConstantVector::getSplat(ElementCount::getFixed(32),
-                                          builder.getInt32(127));
-  Value *packedSeed =
-      variant == 1 ? builder.CreateMul(packedHigh, factor) : nullptr;
+  auto *factor = ConstantVector::getSplat(
+      ElementCount::getFixed(32), builder.getInt32(variant == 11   ? 7
+                                                   : variant == 12 ? 9
+                                                   : variant >= 9  ? 8
+                                                                   : 127));
+  Value *packedSeed = (variant == 1 || variant == 10 || variant == 12)
+                          ? builder.CreateBinOp(variant >= 9 ? Instruction::Shl
+                                                             : Instruction::Mul,
+                                                packedHigh, factor)
+                          : nullptr;
   for (unsigned lane = 0; lane < 32; ++lane)
     seeds[lane / 8][lane % 8] =
         packedSeed
             ? builder.CreateExtractElement(packedSeed, builder.getInt64(lane))
-            : builder.CreateMul(high[lane / 8][lane % 8],
-                                builder.getInt32(127));
+            : builder.CreateBinOp(variant >= 9 ? Instruction::Shl
+                                               : Instruction::Mul,
+                                  high[lane / 8][lane % 8],
+                                  builder.getInt32(variant == 11  ? 7
+                                                   : variant >= 9 ? 8
+                                                                  : 127));
   for (unsigned k = 0; k < 8; ++k)
     for (unsigned chain = 0; chain < 4; ++chain)
       low[chain] = multiply(k ? low[chain] : seeds[chain]);
@@ -139,72 +149,89 @@ static std::unique_ptr<Module> fixture(LLVMContext &context, unsigned variant) {
 }
 
 int main(int argc, char **argv) {
+  assert(triton::ppu::readonly_shared_matrices::readOnlyAsm(
+      "{ppu.add.u32 $0, $1, 128; ppu.shr.u32 $0, $0, 8;}"));
+  assert(!triton::ppu::readonly_shared_matrices::readOnlyAsm(
+      "{ppu.st.shared.b32 [$0], $1;}"));
   unsigned checks = 0;
   for (int file = 0; file < std::max(argc - 1, 1); ++file)
-    for (unsigned test = 0; test < 9; ++test) {
-      if (argc > 1 && test > 0 && test < 4)
-        continue;
-      LLVMContext context;
-      SMDiagnostic diagnostic;
-      auto module = argc == 1
-                        ? fixture(context, test)
-                        : parseIRFile(argv[file + 1], diagnostic, context);
-      if (!module) {
-        diagnostic.print(argv[0], errs());
-        return 1;
-      }
-      auto calls = products(*module);
-      assert(calls.size() == 96);
-      if (test == 6) {
-        IRBuilder<> builder(calls[32]->getNextNode());
-        auto *type = FunctionType::get(builder.getVoidTy(),
-                                       {builder.getInt32Ty()}, false);
-        builder.CreateCall(module->getOrInsertFunction(
-                               "llvm.nvvm.barrier.cta.sync.aligned.all", type),
-                           {builder.getInt32(0)});
-      }
-      if (test == 7) {
-        IRBuilder<> builder(calls[32]->getNextNode());
-        builder.CreateCall(module->getOrInsertFunction(
-            "unknown_memory_effect",
-            FunctionType::get(builder.getVoidTy(), false)));
-      }
-      if (test == 8) {
-        Value *seed = calls[64]->getArgOperand(0);
-        if (auto *extract = dyn_cast<ExtractElementInst>(seed))
-          seed = extract->getVectorOperand();
-        auto *multiply = cast<BinaryOperator>(seed);
-        auto *type = multiply->getType();
-        Constant *factor = ConstantInt::get(Type::getInt32Ty(context), 126);
-        if (auto *vector = dyn_cast<FixedVectorType>(type))
-          factor = ConstantVector::getSplat(vector->getElementCount(), factor);
-        multiply->setOperand(1, factor);
-      }
-      assert(!verifyModule(*module, &errs()));
-      std::string before = print(*module);
-      auto originalEffects = effects(*module);
-      std::array<std::array<Value *, 8>, 96> inputs;
-      for (unsigned index = 0; index < 96; ++index)
-        for (unsigned word = 0; word < 8; ++word)
-          inputs[index][word] = calls[index]->getArgOperand(word + 8);
-      unsigned changed = triton::ppu::scalarizeMlaPv(
-          *module, test == 4 ? 256 : 512, test == 5 ? 167936 : 168192);
-      assert(changed == (test < 4 ? 1 : 0));
-      assert(!verifyModule(*module, &errs()));
-      if (!changed) {
-        assert(print(*module) == before);
-      } else {
-        assert(products(*module) == calls);
-        assert(effects(*module) == originalEffects);
+    for (bool allowP15 : {false, true})
+      for (unsigned test = 0; test < (argc == 1 ? 13u : 9u); ++test) {
+        if (argc > 1 && test > 0 && test < 4)
+          continue;
+        LLVMContext context;
+        SMDiagnostic diagnostic;
+        auto module = argc == 1
+                          ? fixture(context, test)
+                          : parseIRFile(argv[file + 1], diagnostic, context);
+        if (!module) {
+          diagnostic.print(argv[0], errs());
+          return 1;
+        }
+        auto calls = products(*module);
+        assert(calls.size() == 96);
+        if (test == 6) {
+          IRBuilder<> builder(calls[32]->getNextNode());
+          auto *type = FunctionType::get(builder.getVoidTy(),
+                                         {builder.getInt32Ty()}, false);
+          builder.CreateCall(
+              module->getOrInsertFunction(
+                  "llvm.nvvm.barrier.cta.sync.aligned.all", type),
+              {builder.getInt32(0)});
+        }
+        if (test == 7) {
+          IRBuilder<> builder(calls[32]->getNextNode());
+          builder.CreateCall(module->getOrInsertFunction(
+              "unknown_memory_effect",
+              FunctionType::get(builder.getVoidTy(), false)));
+        }
+        if (test == 8) {
+          Value *seed = calls[64]->getArgOperand(0);
+          if (auto *extract = dyn_cast<ExtractElementInst>(seed))
+            seed = extract->getVectorOperand();
+          auto *multiply = cast<BinaryOperator>(seed);
+          auto *type = multiply->getType();
+          Constant *factor = ConstantInt::get(Type::getInt32Ty(context), 126);
+          if (auto *vector = dyn_cast<FixedVectorType>(type))
+            factor =
+                ConstantVector::getSplat(vector->getElementCount(), factor);
+          multiply->setOperand(1, factor);
+        }
+        assert(!verifyModule(*module, &errs()));
+        std::string before = print(*module);
+        auto originalEffects = effects(*module);
+        std::array<std::array<Value *, 8>, 96> inputs;
         for (unsigned index = 0; index < 96; ++index)
           for (unsigned word = 0; word < 8; ++word)
-            assert(calls[index]->getArgOperand(word + 8) ==
-                   inputs[index][word]);
-        std::string once = print(*module);
-        assert(triton::ppu::scalarizeMlaPv(*module, 512, 168192) == 0);
-        assert(print(*module) == once);
+            inputs[index][word] = calls[index]->getArgOperand(word + 8);
+        unsigned changed =
+            triton::ppu::scalarizeMlaPv(*module, test == 4 ? 256 : 512,
+                                        test == 5 ? 167936 : 168192, allowP15);
+        Value *firstSeed = calls[64]->getArgOperand(0);
+        if (auto *extract = dyn_cast<ExtractElementInst>(firstSeed))
+          firstSeed = extract->getVectorOperand();
+        bool shifted =
+            cast<BinaryOperator>(firstSeed)->getOpcode() == Instruction::Shl;
+        assert(changed ==
+               ((test < 4 || test == 9 || test == 10) && (!shifted || allowP15)
+                    ? 1
+                    : 0));
+        assert(!verifyModule(*module, &errs()));
+        if (!changed) {
+          assert(print(*module) == before);
+        } else {
+          assert(products(*module) == calls);
+          assert(effects(*module) == originalEffects);
+          for (unsigned index = 0; index < 96; ++index)
+            for (unsigned word = 0; word < 8; ++word)
+              assert(calls[index]->getArgOperand(word + 8) ==
+                     inputs[index][word]);
+          std::string once = print(*module);
+          assert(triton::ppu::scalarizeMlaPv(*module, 512, 168192, allowP15) ==
+                 0);
+          assert(print(*module) == once);
+        }
+        ++checks;
       }
-      ++checks;
-    }
   outs() << "Mla PV scalarization: " << checks << " checks passed\n";
 }

@@ -218,6 +218,7 @@ class HGGCOptions:
     ppu_async_mla_kv: bool = False
     ppu_prefetch_mla_nope: bool = False
     ppu_scalarize_mla_pv: bool = False
+    ppu_scalarize_mla_p15: bool = False
     enable_fp_fusion: bool = True
     enable_reflect_ftz: bool = True  # ftz in libdevice
     launch_cooperative_grid: bool = False
@@ -579,7 +580,8 @@ class PPUBackend(BaseBackend):
                 and metadata["mla_shared_kv_views_reused"] == 1 and metadata["readonly_shared_matrices_hoisted"] == 12
                 and metadata["mla_nope_fragments_prefetched"] == 1
                 and metadata["shared_float_scales_published_early"] == 1):
-            metadata["mla_pv_scalarized"] = ppu.scalarize_mla_pv(llvm_mod, 512, metadata["shared"])
+            metadata["mla_pv_scalarized"] = ppu.scalarize_mla_pv(llvm_mod, 512, metadata["shared"],
+                                                                 options.ppu_scalarize_mla_p15)
         metadata["global_scratch_size"] = src.get_int_attr("ttg.global_scratch_memory_size")
         metadata["global_scratch_align"] = src.get_int_attr("ttg.global_scratch_memory_alignment")
         metadata["profile_scratch_size"] = src.get_int_attr("ttg.profile_scratch_memory_size") or 0

@@ -43,6 +43,8 @@ int main(int argc, char **argv) {
       "ppu.st.shared.b32 [x], y;"));
   assert(!triton::ppu::readonly_shared_matrices::readOnlyAsm(
       "ppu.atomic.or.b32 x, y;"));
+  assert(triton::ppu::readonly_shared_matrices::readOnlyAsm(
+      "ppu.add.u32 x, y, 128; ppu.shr.u32 x, x, 8;"));
   unsigned passed = 0;
   for (unsigned test = 0; test < 16; ++test) {
     LLVMContext context;

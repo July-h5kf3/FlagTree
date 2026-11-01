@@ -61,6 +61,7 @@ inline bool readOnlyAsm(llvm::StringRef code) {
     auto opcode = statement.split(' ').first;
     if (!llvm::StringSwitch<bool>(opcode)
              .Cases("ppu.mov.u32", "ppu.mov.b32", true)
+             .Cases("ppu.add.u32", "ppu.shr.u32", true)
              .Cases("ppu.ld.global.b32", "ppu.ld.global.cg.v4.b32",
                     "ppu.ld.global.v4.b32", true)
              .Case("ppu.ld.global.v2.b32", true)

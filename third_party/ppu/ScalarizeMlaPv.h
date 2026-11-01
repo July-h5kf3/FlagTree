@@ -102,7 +102,7 @@ inline bool pure(llvm::Instruction &instruction) {
              instruction);
 }
 
-inline unsigned rewrite(llvm::Function &function) {
+inline unsigned rewrite(llvm::Function &function, bool allowP15) {
   using namespace llvm;
   SmallVector<CallInst *> products;
   for (BasicBlock &block : function)
@@ -213,9 +213,11 @@ inline unsigned rewrite(llvm::Function &function) {
       auto *existing = dyn_cast<BinaryOperator>(argument);
       auto *factor =
           existing ? dyn_cast<ConstantInt>(existing->getOperand(1)) : nullptr;
-      if (existing && existing->getOpcode() == Instruction::Mul &&
-          existing->getType()->isIntegerTy(32) && factor &&
-          factor->equalsInt(127) &&
+      if (existing && existing->getType()->isIntegerTy(32) && factor &&
+          ((existing->getOpcode() == Instruction::Mul &&
+            factor->equalsInt(127)) ||
+           (allowP15 && existing->getOpcode() == Instruction::Shl &&
+            factor->equalsInt(8))) &&
           highWords.contains(existing->getOperand(0))) {
         if (seenSeeds.insert(existing).second)
           ++scalarSeeds;
@@ -236,9 +238,11 @@ inline unsigned rewrite(llvm::Function &function) {
               : nullptr;
       if (!slot || slot->getZExtValue() >= 32 || !multiply || !type ||
           type->getNumElements() != 32 ||
-          !type->getElementType()->isIntegerTy(32) ||
-          multiply->getOpcode() != Instruction::Mul || !splat ||
-          !splat->equalsInt(127))
+          !type->getElementType()->isIntegerTy(32) || !splat ||
+          !((multiply->getOpcode() == Instruction::Mul &&
+             splat->equalsInt(127)) ||
+            (allowP15 && multiply->getOpcode() == Instruction::Shl &&
+             splat->equalsInt(8))))
         return 0;
       Value *cursor = multiply->getOperand(0), *high = nullptr;
       while (auto *insert = dyn_cast<InsertElementInst>(cursor)) {
@@ -286,8 +290,11 @@ inline unsigned rewrite(llvm::Function &function) {
   tail.removable.insert(root);
   for (auto [seed, high] : seeds) {
     builder.SetInsertPoint(seed);
-    Value *value =
-        builder.CreateMul(high, builder.getInt32(127), "pv_stream_seed");
+    auto *operation = cast<BinaryOperator>(seed->getVectorOperand());
+    auto *factor = cast<Constant>(operation->getOperand(1))->getSplatValue();
+    Value *value = builder.CreateBinOp(
+        static_cast<Instruction::BinaryOps>(operation->getOpcode()), high,
+        factor, "pv_stream_seed");
     seed->replaceAllUsesWith(value);
   }
   for (auto *instruction : seedNodes)
@@ -343,14 +350,14 @@ inline unsigned rewrite(llvm::Function &function) {
 } // namespace mla_pv_scalarization
 
 inline unsigned scalarizeMlaPv(llvm::Module &module, unsigned threads,
-                               unsigned shared) {
+                               unsigned shared, bool allowP15 = false) {
   if (threads != 512 || shared != 168192)
     return 0;
   unsigned changed = 0;
   for (llvm::Function &function : module)
     if (!function.isDeclaration() &&
         function.getCallingConv() == llvm::CallingConv::PTX_Kernel)
-      changed += mla_pv_scalarization::rewrite(function);
+      changed += mla_pv_scalarization::rewrite(function, allowP15);
   return changed;
 }
 
