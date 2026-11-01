@@ -25,6 +25,7 @@
 #include "PatternTritonGPUOpToLLVM.h"
 #include "TargetInfo.h"
 #include "TritonPPUGPUToLLVM/AIUUtility.h"
+#include "TritonPPUGPUToLLVM/I8SharedStore.h"
 #include "Utility.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
@@ -60,6 +61,280 @@ using namespace mlir::triton;
 using namespace mlir::triton::gpu;
 using namespace mlir::triton::ppu;
 using namespace mlir::LLVM::PPU;
+
+LogicalResult lowerVectorI8SharedStore(
+    Location loc, const LinearLayout &regLayout, MemDescType memDescType,
+    ArrayRef<Value> values, Value smemBase, Value affineOffset,
+    ConversionPatternRewriter &rewriter, const ppu::TargetInfo &targetInfo) {
+  auto module = rewriter.getBlock()->getParent()->getParentOfType<ModuleOp>();
+  auto enabled =
+      module->getAttrOfType<IntegerAttr>("ppu.vector_i8_shared_store");
+  if (!enabled || enabled.getInt() != 1 ||
+      targetInfo.getComputeCapability() != 80 || memDescType.getRank() != 2 ||
+      !memDescType.getElementType().isInteger(8) ||
+      memDescType.getShape() != ArrayRef<int64_t>({256, 512}) ||
+      memDescType.getAllocShape() != memDescType.getShape() ||
+      !regLayout.isInvertible())
+    return failure();
+  auto shared = dyn_cast<SwizzledSharedEncodingAttr>(memDescType.getEncoding());
+  auto vec16Flag = module->getAttrOfType<IntegerAttr>("mla.group_vec16_kv");
+  bool originalLayout = shared && shared.getVec() == 8 &&
+                        shared.getPerPhase() == 1 && shared.getMaxPhase() == 16;
+  bool vec16Layout =
+      shared && shared.getVec() == 16 && shared.getPerPhase() == 1 &&
+      (shared.getMaxPhase() == 8 || shared.getMaxPhase() == 16) && vec16Flag &&
+      vec16Flag.getInt() == 1;
+  if ((!originalLayout && !vec16Layout) ||
+      shared.getOrder() != ArrayRef<unsigned>({1, 0}))
+    return failure();
+  APInt affine;
+  if (!matchPattern(affineOffset, m_ConstantInt(&affine)) || !affine.isZero())
+    return failure();
+  auto memory = toLinearLayout(memDescType);
+  if (!memory.isInvertible())
+    return failure();
+  auto conversion = regLayout.invertAndCompose(memory);
+  auto *ctx = rewriter.getContext();
+  auto key = [ctx](StringRef name) { return StringAttr::get(ctx, name); };
+  auto kReg = key("register"), kLane = key("lane"), kWarp = key("warp");
+  auto kBlock = key("block"), kOffset = key("offset");
+  auto names = llvm::to_vector(conversion.getOutDimNames());
+  auto offset = llvm::find(names, kOffset);
+  if (offset == names.end())
+    return failure();
+  unsigned offsetIndex = std::distance(names.begin(), offset);
+  auto bases = conversion.getBases();
+  if (bases[kReg].size() < 4)
+    return failure();
+  unsigned count = regLayout.getInDimSize(kReg);
+  if (count < 16 || count % 16 || values.size() != count)
+    return failure();
+  // Every 16 register bytes cover one aligned packet, possibly rotated by
+  // eight bytes according to a warp-uniform row phase. No lane can change it.
+  for (const auto &entry : bases) {
+    for (unsigned bit = 0; bit < entry.second.size(); ++bit) {
+      const auto &basis = entry.second[bit];
+      for (unsigned dim = 0; dim < names.size(); ++dim) {
+        if (entry.first == kReg && bit < 4) {
+          if (basis[dim] != (dim == offsetIndex ? (1 << bit) : 0))
+            return failure();
+        } else if (dim != offsetIndex) {
+          if (basis[dim] != 0)
+            return failure();
+        } else if (entry.first == kWarp) {
+          if (basis[dim] & 7)
+            return failure();
+        } else if (basis[dim] & 15) {
+          return failure();
+        }
+      }
+    }
+  }
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  auto element = rewriter.getI8Type();
+  auto byteWord = vec_ty(element, 4);
+  auto [lane, warp] = getLaneAndWarpId(rewriter, loc);
+  auto pointerType = ptr_ty(ctx, 3);
+  // Group only when all sixteen packets have the same eight-byte rotation.
+  // Their register bases must give exactly the previously emitted addresses.
+  bool grouped = count == 256 && bases[kReg].size() == 8;
+  for (unsigned bit = 4; grouped && bit < 8; ++bit)
+    grouped = bases[kReg][bit][offsetIndex] == (1 << (bit + 9));
+  // LinearLayout combines bases with XOR. Fixed positive packet offsets are
+  // valid only when lane/warp/block bases do not overlap register bits 13..16.
+  for (const auto &entry : bases)
+    if (entry.first != kReg)
+      for (const auto &basis : entry.second)
+        if (basis[offsetIndex] & 0x1e000)
+          grouped = false;
+  SmallVector<Value> groupedWords;
+  Value groupedAddress;
+  for (unsigned index = 0; index < count; index += 16) {
+    SmallVector<Value> words;
+    for (unsigned word = 0; word < 4; ++word) {
+      Value packed = b.undef(byteWord);
+      for (unsigned byte = 0; byte < 4; ++byte)
+        packed = b.insert_element(packed, values[index + word * 4 + byte],
+                                  b.i32_val(byte));
+      words.push_back(b.bitcast(packed, i32_ty));
+    }
+    auto offsets = applyLinearLayout(loc, rewriter, conversion,
+                                     {{kReg, b.i32_val(index)},
+                                      {kLane, lane},
+                                      {kWarp, warp},
+                                      {kBlock, b.i32_val(0)}});
+    Value packetOffset = offsets[offsetIndex].second;
+    Value address = b.gep(pointerType, element, smemBase, packetOffset,
+                          LLVM::GEPNoWrapFlags::inbounds);
+    Value rawAddress = b.ptrtoint(i32_ty, address);
+    if (grouped) {
+      groupedWords.append(words);
+      if (index == 0)
+        groupedAddress = rawAddress;
+      continue;
+    }
+    SmallVector<Value> operands(words);
+    operands.push_back(rawAddress);
+    StringRef assembly(
+        "{ .reg .u32 w0,w1,w2,w3, aligned, bit; .reg .pred swap; "
+        "ppu.and.b32 aligned, $4, 0xfffffff0; ppu.and.b32 bit, $4, 8; "
+        "ppu.setp.ne.u32 swap, bit, 0; "
+        "ppu.selp.b32 w0, $2, $0, swap; ppu.selp.b32 w1, $3, $1, swap; "
+        "ppu.selp.b32 w2, $0, $2, swap; ppu.selp.b32 w3, $1, $3, swap; "
+        "ppu.st.shared.v4.b32 [aligned], {w0,w1,w2,w3}; }");
+    LLVM::InlineAsmOp::create(
+        rewriter, loc, Type(), operands, assembly, "r,r,r,r,r", true, false,
+        LLVM::TailCallKind::None,
+        LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT),
+        ArrayAttr::get(ctx, {}));
+  }
+  if (grouped) {
+    groupedWords.push_back(groupedAddress);
+    std::string constraints = "r";
+    for (unsigned i = 1; i < groupedWords.size(); ++i)
+      constraints += ",r";
+    LLVM::InlineAsmOp::create(
+        rewriter, loc, Type(), groupedWords,
+        ::mlir::triton::ppu::groupedI8SharedStoreAsm(), constraints, true,
+        false, LLVM::TailCallKind::None,
+        LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT),
+        ArrayAttr::get(ctx, {}));
+    auto previous = module->getAttrOfType<IntegerAttr>(
+        "ppu.vector_i8_shared_store.grouped");
+    module->setAttr(
+        "ppu.vector_i8_shared_store.grouped",
+        rewriter.getI32IntegerAttr(previous ? previous.getInt() + 1 : 1));
+  }
+  auto applications =
+      module->getAttrOfType<IntegerAttr>("ppu.vector_i8_shared_store.applied");
+  module->setAttr(
+      "ppu.vector_i8_shared_store.applied",
+      rewriter.getI32IntegerAttr(applications ? applications.getInt() + 1 : 1));
+  return success();
+}
+
+LogicalResult lowerPackedI8SharedStore(
+    Location loc, const LinearLayout &regLayout, MemDescType memDescType,
+    ArrayRef<Value> values, Value smemBase, Value affineOffset,
+    ConversionPatternRewriter &rewriter, const ppu::TargetInfo &targetInfo) {
+  auto module = rewriter.getBlock()->getParent()->getParentOfType<ModuleOp>();
+  if (targetInfo.getComputeCapability() != 80 || memDescType.getRank() != 2 ||
+      !memDescType.getElementType().isInteger(8) ||
+      !isa<SwizzledSharedEncodingAttr>(memDescType.getEncoding()) ||
+      memDescType.getAllocShape() != memDescType.getShape() ||
+      !regLayout.isInvertible())
+    return failure();
+  APInt affine;
+  if (!matchPattern(affineOffset, m_ConstantInt(&affine)) || !affine.isZero())
+    return failure();
+  auto *ctx = rewriter.getContext();
+  auto key = [ctx](StringRef name) { return StringAttr::get(ctx, name); };
+  auto kReg = key("register"), kLane = key("lane"), kWarp = key("warp");
+  auto kBlock = key("block"), kOffset = key("offset");
+  auto bases = regLayout.getBases();
+  if (bases[kReg].size() < 2 || bases[kLane].size() < 4)
+    return failure();
+  unsigned count = regLayout.getInDimSize(kReg);
+  if (count < 4 || count % 4 || values.size() != count)
+    return failure();
+  auto memLayout = toLinearLayout(memDescType);
+  if (!memLayout.isInvertible())
+    return failure();
+  std::optional<LinearLayout> store;
+  unsigned laneStart = 2, offsetIndex = 0;
+  // Native byte transpose exchanges register byte bits with lane bits 2/3.
+  // For lane bits 0/1, permute source lanes before the transpose and invert
+  // that permutation through the store addresses.
+  for (unsigned candidateLane : {2u, 0u}) {
+    auto candidateBases = bases;
+    std::swap(candidateBases[kReg][0], candidateBases[kLane][candidateLane]);
+    std::swap(candidateBases[kReg][1],
+              candidateBases[kLane][candidateLane + 1]);
+    LinearLayout candidate(candidateBases, regLayout.getOutDims(), false);
+    auto conversion = candidate.invertAndCompose(memLayout);
+    auto names = llvm::to_vector(conversion.getOutDimNames());
+    auto offsetIt = llvm::find(names, kOffset);
+    if (offsetIt == names.end())
+      continue;
+    unsigned position = std::distance(names.begin(), offsetIt);
+    // A packed store is valid only when every other basis preserves alignment.
+    bool contiguous = true;
+    for (const auto &entry : conversion.getBases()) {
+      for (unsigned bit = 0; bit < entry.second.size(); ++bit) {
+        const auto &basis = entry.second[bit];
+        for (unsigned dim = 0; dim < names.size(); ++dim) {
+          if (entry.first == kReg && bit < 2)
+            contiguous &= basis[dim] == (dim == position ? (1 << bit) : 0);
+          else if (dim == position)
+            contiguous &= (basis[dim] & 3) == 0;
+          else
+            contiguous &= basis[dim] == 0;
+        }
+      }
+    }
+    if (contiguous) {
+      store = std::move(conversion);
+      laneStart = candidateLane;
+      offsetIndex = position;
+      break;
+    }
+  }
+  if (!store)
+    return failure();
+  auto b = TritonLLVMOpBuilder(loc, rewriter);
+  StringRef name("__flagtree_ppu_intrinsic__mat.trans.b8");
+  LLVM::LLVMFuncOp nativeTranspose;
+  if (Operation *existing = module.lookupSymbol(name)) {
+    nativeTranspose = cast<LLVM::LLVMFuncOp>(existing);
+  } else {
+    RewriterBase::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToStart(module.getBody());
+    auto type = LLVM::LLVMFunctionType::get(i32_ty, {i32_ty});
+    nativeTranspose = LLVM::LLVMFuncOp::create(rewriter, loc, name, type);
+    nativeTranspose.setPassthroughAttr(
+        rewriter.getArrayAttr({rewriter.getStringAttr("nounwind"),
+                               rewriter.getStringAttr("convergent")}));
+    nativeTranspose.setMemoryEffectsAttr(LLVM::MemoryEffectsAttr::get(
+        ctx, LLVM::ModRefInfo::NoModRef, LLVM::ModRefInfo::NoModRef,
+        LLVM::ModRefInfo::NoModRef));
+  }
+  auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+  Value shuffledLane;
+  if (laneStart == 0) {
+    shuffledLane =
+        b.or_(b.and_(laneId, b.i32_val(16)),
+              b.or_(b.shl(b.and_(laneId, b.i32_val(3)), b.i32_val(2)),
+                    b.lshr(b.and_(laneId, b.i32_val(12)), b.i32_val(2))));
+  }
+  auto element = rewriter.getI8Type();
+  auto packed = vec_ty(element, 4);
+  for (unsigned index = 0; index < count; index += 4) {
+    Value bytes = b.undef(packed);
+    for (unsigned byte = 0; byte < 4; ++byte)
+      bytes = b.insert_element(bytes, values[index + byte], b.i32_val(byte));
+    Value word = b.bitcast(bytes, i32_ty);
+    if (laneStart == 0)
+      word = LLVM::PPU::shuffleIdx(loc, rewriter, word, shuffledLane);
+    Value changed =
+        createLLVMCallOp(rewriter, loc, nativeTranspose, ValueRange{word})
+            .getResult();
+    // The lane permutation is an involution, so remap the address instead of
+    // shuffling the transposed value a second time.
+    Value storeLane = laneStart == 0 ? shuffledLane : laneId;
+    auto offsets = applyLinearLayout(loc, rewriter, *store,
+                                     {{kReg, b.i32_val(index)},
+                                      {kLane, storeLane},
+                                      {kWarp, warpId},
+                                      {kBlock, b.i32_val(0)}});
+    Value address =
+        b.gep(ptr_ty(ctx, 3), element, smemBase,
+              b.xor_(offsets[offsetIndex].second, affineOffset).getResult(),
+              LLVM::GEPNoWrapFlags::inbounds);
+    auto operation = b.store(changed, address);
+    operation.setAlignment(4);
+  }
+  return success();
+}
 
 LogicalResult lowerLdStMatrix(
     Location loc, const LinearLayout &regLayout, MemDescType memDescType,
@@ -102,6 +377,10 @@ LogicalResult lowerLdStMatrix(
   auto affineOffset = smemObj.getShmemOffset(loc, rewriter, memDescType);
   auto maskSpanAffineOffset = smemObj.getMaskSpanOffsets(memDescType);
   auto llvmElemTy = typeConverter->convertType(memDescType.getElementType());
+  if (isStore && succeeded(lowerPackedI8SharedStore(
+                     loc, regLayout, memDescType, vals, smemBase, affineOffset,
+                     rewriter, targetInfo)))
+    return success();
   for (bool transpose : {false, true}) {
     auto result = LLVM::PPU::lowerLdStMatrix(
         loc, cvt, transpose, vals, smemBase, affineOffset, maskSpanAffineOffset,
@@ -116,8 +395,9 @@ LogicalResult lowerLdStMatrix(
 LogicalResult lowerPPULdMatrix(
     Location loc, RankedTensorType tensorTy, MemDescType memDescType,
     bool transpose, Value &src, // Output for ldmatrix
-    Value smemBase, Type llvmElemTy, ConversionPatternRewriter &rewriter,
-    const ppu::TargetInfo &targetInfo, const LLVMTypeConverter *typeConverter,
+    Value smemBase, Value affineOffset, Type llvmElemTy,
+    ConversionPatternRewriter &rewriter, const ppu::TargetInfo &targetInfo,
+    const LLVMTypeConverter *typeConverter,
     std::pair<size_t, Type> *const llvmOpCount = nullptr) {
   // Lower load via ppu.ldmatrix
   if (!targetInfo.supportLdMatrix())
@@ -165,7 +445,7 @@ LogicalResult lowerPPULdMatrix(
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   auto *ctx = tensorTy.getContext();
   auto regL = toLinearLayout(tensorTy.getShape(), tensorTy.getEncoding());
-  auto memL = toLinearLayout(memDescType.getShape(), memDescType.getEncoding());
+  auto memL = toLinearLayout(memDescType);
   auto cvt = minimalCvtLayout(memDescType, tensorTy);
 
   auto S = [ctx](StringRef v) { return StringAttr::get(ctx, v); };
@@ -188,11 +468,90 @@ LogicalResult lowerPPULdMatrix(
 
   bool Opb8bLdmatrix =
       isPPU0010 && bitwidth == 8 && dotEnc.getOpIdx() == 1 && transpose;
-  if (bitwidth == 8 && transpose && !Opb8bLdmatrix)
+  bool packedInt8Transpose = isPPU0010 && bitwidth == 8 && transpose &&
+                             tensorTy.getElementType().isInteger(8);
+  if (bitwidth == 8 && transpose && !Opb8bLdmatrix && !packedInt8Transpose)
     return failure();
 
   // Inter block stmatrix is not supported
   if (cvt.hasInDim(kBlock))
+    return failure();
+
+  // Keep packed INT8 words intact through the register transpose.
+  auto directModule =
+      rewriter.getBlock()->getParent()->getParentOfType<ModuleOp>();
+  if (packedInt8Transpose) {
+    auto inputBases = regL.getBases();
+    if (inputBases[kReg].size() >= 2 && inputBases[kLane].size() >= 4) {
+      // mat.trans.b8 exchanges byte bits 0/1 with lane bits 2/3.
+      std::swap(inputBases[kReg][0], inputBases[kLane][2]);
+      std::swap(inputBases[kReg][1], inputBases[kLane][3]);
+      LinearLayout inputLayout(inputBases, regL.getOutDims(), false);
+      auto inputToShared = inputLayout.invertAndCompose(memL);
+      auto outputNames = llvm::to_vector(inputToShared.getOutDimNames());
+      auto offsetIt = llvm::find(outputNames, kOffset);
+      unsigned offsetIndex = std::distance(outputNames.begin(), offsetIt);
+      bool contiguous = offsetIt != outputNames.end();
+      auto registerBases = inputToShared.getBases().find(kReg)->second;
+      for (unsigned bit = 0; bit < 2 && contiguous; ++bit) {
+        for (unsigned dim = 0; dim < outputNames.size(); ++dim) {
+          int expected = dim == offsetIndex ? (1 << bit) : 0;
+          contiguous &= registerBases[bit][dim] == expected;
+        }
+      }
+      unsigned count = regL.getInDimSize(kReg);
+      if (contiguous && count >= 4 && count % 4 == 0) {
+        StringRef name("__flagtree_ppu_intrinsic__mat.trans.b8");
+        LLVM::LLVMFuncOp nativeTranspose;
+        if (Operation *existing = directModule.lookupSymbol(name)) {
+          nativeTranspose = cast<LLVM::LLVMFuncOp>(existing);
+        } else {
+          RewriterBase::InsertionGuard guard(rewriter);
+          rewriter.setInsertionPointToStart(directModule.getBody());
+          auto functionType = LLVM::LLVMFunctionType::get(i32_ty, {i32_ty});
+          nativeTranspose =
+              LLVM::LLVMFuncOp::create(rewriter, loc, name, functionType);
+          nativeTranspose.setPassthroughAttr(
+              rewriter.getArrayAttr({rewriter.getStringAttr("nounwind"),
+                                     rewriter.getStringAttr("convergent")}));
+          nativeTranspose.setMemoryEffectsAttr(LLVM::MemoryEffectsAttr::get(
+              ctx, LLVM::ModRefInfo::NoModRef, LLVM::ModRefInfo::NoModRef,
+              LLVM::ModRefInfo::NoModRef));
+        }
+        auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+        SmallVector<Value> values;
+        for (unsigned index = 0; index < count; index += 4) {
+          auto offsets = applyLinearLayout(loc, rewriter, inputToShared,
+                                           {{kReg, b.i32_val(index)},
+                                            {kLane, laneId},
+                                            {kWarp, warpId},
+                                            {kBlock, b.i32_val(0)}});
+          Value address = b.gep(
+              smemPtrTy, llvmElemTy, smemBase,
+              b.xor_(offsets[offsetIndex].second, affineOffset).getResult(),
+              LLVM::GEPNoWrapFlags::inbounds);
+          Value word = b.load(i32_ty, address);
+          Value changed =
+              createLLVMCallOp(rewriter, loc, nativeTranspose, ValueRange{word})
+                  .getResult();
+          Value bytes = b.bitcast(changed, vec_ty(llvmElemTy, 4));
+          for (unsigned byte = 0; byte < 4; ++byte)
+            values.push_back(
+                b.extract_element(llvmElemTy, bytes, b.i32_val(byte)));
+        }
+        auto packedType = LLVM::LLVMStructType::getLiteral(
+            ctx, SmallVector<Type>(values.size(), llvmElemTy));
+        src = packLLElements(loc, typeConverter, values, rewriter, packedType);
+        return success();
+      }
+    }
+  }
+
+  // The legacy byte-transpose path only supports operand B.
+  if (bitwidth == 8 && transpose && !Opb8bLdmatrix)
+    return failure();
+
+  if (SharedMemoryObject::getMaskSpanOffsets(memDescType))
     return failure();
 
   auto srcVals = SmallVector<Value>{};
@@ -392,13 +751,16 @@ public:
       }
     }
 
+    Value affineOffset =
+        smemObj.getShmemOffset(op.getLoc(), rewriter, memDescType);
+
     // Try to lower to ppu.ldmatrix
     bool lowered = false;
     Value val;
     for (bool transpose : {false, true}) {
       lowered = lowerPPULdMatrix(op.getLoc(), dstTy, memDescType, transpose,
-                                 val, smemBase, llvmElemTy, rewriter,
-                                 targetInfo, getTypeConverter())
+                                 val, smemBase, affineOffset, llvmElemTy,
+                                 rewriter, targetInfo, getTypeConverter())
                     .succeeded();
       if (lowered) {
         rewriter.replaceOp(op, val);
@@ -569,9 +931,18 @@ struct LocalAllocOpConversion
 
     auto regLayout = toLinearLayout(regTy);
     auto values = unpackLLElements(op.getLoc(), adaptor.getSrc(), rewriter);
-    auto result =
-        lowerLdStMatrix(op.getLoc(), regLayout, memDescType, values, smemObj,
-                        rewriter, targetInfo, getTypeConverter());
+    // Vectorize only an initializer whose allocation guarantees 16-byte
+    // alignment.
+    auto result = failure();
+    if (op.getAlignmentOrDefault() >= 16)
+      result = lowerVectorI8SharedStore(
+          op.getLoc(), regLayout, memDescType, values, smemBase,
+          smemObj.getShmemOffset(op.getLoc(), rewriter, memDescType), rewriter,
+          targetInfo);
+    if (failed(result))
+      result =
+          lowerLdStMatrix(op.getLoc(), regLayout, memDescType, values, smemObj,
+                          rewriter, targetInfo, getTypeConverter());
     if (failed(result)) {
       return failure();
     }
