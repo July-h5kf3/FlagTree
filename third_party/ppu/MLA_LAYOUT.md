@@ -1,6 +1,6 @@
 # Optional INT8 MLA operand reuse
 
-These PPU backend options preserve the INT8 NoPE/P14 products and FP32 state.
+These PPU backend options reuse INT8 NoPE/PV operands and retain the FP32 update graph.
 They are disabled by default. They do not require warp specialization.
 
 | Option | Default | Purpose |
@@ -12,6 +12,7 @@ They are disabled by default. They do not require warp specialization.
 | `ppu_publish_shared_float_scales_early` | `false` | Publish supported FP32 row scales at the existing pre-PV synchronization. |
 | `ppu_prefetch_mla_nope` | `false` | Schedule supported NoPE operand loads with their existing MMA consumers. |
 | `ppu_scalarize_mla_pv` | `false` | Schedule supported PV seed and FP32 update lanes without changing their expressions. |
+| `ppu_scalarize_mla_p15` | `false` | Admit a proven radix256 shift seed when PV scalarization is requested. |
 
 The initial KV-view matcher targets the paged decode content tile
 `[256, 512]`, signed INT8 dot operands with `kWidth=4`, 16 warps and one CTA.
@@ -41,6 +42,26 @@ The backend records application counters in compiled metadata, including
 `mla_shared_kv_views_reused`, `readonly_shared_matrices_hoisted`,
 `mla_async_kv_copies`, `shared_float_scales_published_early`,
 `mla_nope_fragments_prefetched` and `mla_pv_scalarized`.
+
+## Optional P15 probability seeds
+
+P14 uses an integer high product multiplied by127 before the residual product.
+An operator may instead encode normalized probabilities on a finer radix256
+grid and request `ppu_scalarize_mla_p15` together with `ppu_scalarize_mla_pv`.
+The compiler then admits the existing scalar or vector shift-by8 seed. It does
+not change the probability encoding, MMA inputs or floating expressions itself.
+The original multiplication-by127 path remains supported with either flag value.
+
+The P15 path retains the existing geometry, earlier-transform counters,
+shared-read and FP32 dataflow checks. Unsupported shifts or unproved expressions
+are rejected before mutation. `PPUMlaPvScalarizationTest` exercises scalar/vector
+seeds with the option off and on, including rejection and idempotence.
+The Python binding retains its three-argument form; its optional fourth argument
+is `allow_p15=False`.
+
+A consumer must retain older candidate sets when this option is absent. For
+persistent tuning caches, normalize all candidate fields to the same key set,
+including any probability-radix constexpr, before adding the P15 candidates.
 
 ## Validation
 
