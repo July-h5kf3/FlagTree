@@ -27,12 +27,14 @@
 #include "EarlySharedFloatScales.h"
 #include "GlobalLoadOffsets.h"
 #include "PPUGPUToLLVM/Passes.h"
+#include "PipelineMlaKv.h"
 #include "PrefetchMlaNope.h"
 #include "ReadonlySharedMatrices.h"
 #include "ReuseMlaKvViews.h"
 #include "ScalarizeMlaPv.h"
 #include "TritonPPUGPUToLLVM/Passes.h"
 #include "TritonPPUGPUTransforms/Passes.h"
+#include "UniformMlaLoop.h"
 #include "acblas_instance.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/NVVM/NVVMToLLVMIRTranslation.h"
@@ -116,6 +118,9 @@ static void checkMatmulConstraints(const std::string &A_dtype,
 }
 
 void init_triton_ppu(py::module &&m) {
+  m.def("prove_uniform_mla_loop", &mlir::triton::ppu::proveUniformMlaLoop);
+  m.def("pipeline_mla_kv", &::triton::ppu::pipelineMlaKv, py::arg("module"),
+        py::arg("threads"), py::arg("shared"), py::arg("reuse_pages") = false);
   m.def("promote_mla_kv_copy", &mlir::triton::ppu::promoteMlaKvCopy);
   m.def("reuse_mla_kv_views", &mlir::triton::ppu::reuseMlaKvViews);
   m.def("fold_global_load_offsets", &::triton::ppu::foldGlobalLoadOffsets);

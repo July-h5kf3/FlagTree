@@ -219,6 +219,8 @@ class HGGCOptions:
     ppu_prefetch_mla_nope: bool = False
     ppu_scalarize_mla_pv: bool = False
     ppu_scalarize_mla_p15: bool = False
+    ppu_pipeline_mla_kv: bool = False
+    ppu_pipeline_mla_kv_pages: bool = False
     enable_fp_fusion: bool = True
     enable_reflect_ftz: bool = True  # ftz in libdevice
     launch_cooperative_grid: bool = False
@@ -470,6 +472,9 @@ class PPUBackend(BaseBackend):
 
     def make_llir(self, src, metadata, options, capability):
         mod = src
+        metadata["mla_kv_loop_uniform"] = 0
+        if options.ppu_pipeline_mla_kv and capability == 80:
+            metadata["mla_kv_loop_uniform"] = ppu.prove_uniform_mla_loop(mod)
         if options.ppu_vectorize_i8_shared_store and capability == 80:
             mod.set_attr("ppu.vector_i8_shared_store", ir.builder(mod.context).get_int32_attr(1))
         # TritonGPU -> LLVM-IR (MLIR)
@@ -582,6 +587,15 @@ class PPUBackend(BaseBackend):
                 and metadata["shared_float_scales_published_early"] == 1):
             metadata["mla_pv_scalarized"] = ppu.scalarize_mla_pv(llvm_mod, 512, metadata["shared"],
                                                                  options.ppu_scalarize_mla_p15)
+        metadata["mla_kv_pipelined"] = 0
+        metadata["mla_kv_page_results_reused"] = 0
+        if (options.ppu_pipeline_mla_kv and capability == 80 and metadata["mla_pv_scalarized"] == 1
+                and metadata["mla_kv_loop_uniform"] == 1):
+            result = ppu.pipeline_mla_kv(llvm_mod, metadata["num_warps"] * 32, metadata["shared"],
+                                         options.ppu_pipeline_mla_kv_pages)
+            assert result in (0, 1, 5)
+            metadata["mla_kv_pipelined"] = int(result != 0)
+            metadata["mla_kv_page_results_reused"] = 4 if result == 5 else 0
         metadata["global_scratch_size"] = src.get_int_attr("ttg.global_scratch_memory_size")
         metadata["global_scratch_align"] = src.get_int_attr("ttg.global_scratch_memory_alignment")
         metadata["profile_scratch_size"] = src.get_int_attr("ttg.profile_scratch_memory_size") or 0

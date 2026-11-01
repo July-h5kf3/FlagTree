@@ -13,6 +13,8 @@ They are disabled by default. They do not require warp specialization.
 | `ppu_prefetch_mla_nope` | `false` | Schedule supported NoPE operand loads with their existing MMA consumers. |
 | `ppu_scalarize_mla_pv` | `false` | Schedule supported PV seed and FP32 update lanes without changing their expressions. |
 | `ppu_scalarize_mla_p15` | `false` | Admit a proven radix256 shift seed when PV scalarization is requested. |
+| `ppu_pipeline_mla_kv` | `false` | Start the next KV copy after the current iteration's final KV read. |
+| `ppu_pipeline_mla_kv_pages` | `false` | Reuse the four page values already read by that pipeline. |
 
 The initial KV-view matcher targets the paged decode content tile
 `[256, 512]`, signed INT8 dot operands with `kWidth=4`, 16 warps and one CTA.
@@ -63,11 +65,44 @@ A consumer must retain older candidate sets when this option is absent. For
 persistent tuning caches, normalize all candidate fields to the same key set,
 including any probability-radix constexpr, before adding the P15 candidates.
 
+## KV copy pipeline
+
+The pipeline targets the existing MLA loop with 512 threads with a 128 KiB shared KV
+region and the earlier reuse, async-copy, prefetch and scalarization transforms.
+Before LLVM lowering, the backend proves that the supported i32 loop bounds are
+equal for every thread in the CTA. It accepts public entry arguments, program IDs, supported scalar
+arithmetic/loads and whole-program scalar reductions. Opaque assembly, volatile
+loads, arguments of private functions or blocks other than the entry block, unknown producers, nested
+loops and unsupported steps retain the original schedule.
+
+The LLVM transform enumerates all 512 threads to verify the complete copy/read
+footprints. It checks all loop writers, calls, source dependencies and accesses
+after the last KV read before changing IR. Later probability/scale reads must be
+disjoint from KV. The first copy stays in the loop preheader; a following copy
+runs only when the original next/end condition permits another iteration. The
+existing CTA barrier after all KV reads precedes the overwrite. The next header
+retains its wait and publication barrier. The final iteration issues no extra
+copy. MMA inputs and FP32 expressions are unchanged.
+
+Optional page reuse adds four current/next page result PHIs only after matching
+the canonical table loads and their exact pointer/predicate aliases. The skip
+edge cannot feed another loop iteration. Reads and copies remain inside each
+operator call; no input conversion or page lookup is cached across calls.
+
+Inspect `mla_kv_loop_uniform`, `mla_kv_pipelined` and
+`mla_kv_page_results_reused` in compiled metadata. A requested option can still
+have an application count of zero. Consumers should retain their earlier
+candidates and normalize supported option defaults before SQL caching; older
+packages must not receive the new keywords.
+
 ## Validation
 
-`PPUMlaNopePrefetchTest` and `PPUMlaPvScalarizationTest` are registered with
+`PPUMlaNopePrefetchTest`, `PPUMlaPvScalarizationTest` and
+`PPUMlaKvPipelineTest` are registered with
 CTest when `TRITON_BUILD_UT=ON`. Additional LLVM tests accept real lowered MLA
 modules to check immutable query reads, scale publication and copy ordering.
+`test_uniform_mla_loop.py` checks supported and rejected scalar loop bounds
+without executing a GPU kernel.
 
 `python/test/unit/language/test_ppu_int8_{transpose,subview}.py` checks packed
 load correctness. PPU unit tests under `third_party/ppu/python/test/` check
