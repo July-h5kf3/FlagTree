@@ -4,6 +4,7 @@
 #define TRITON_PPU_PIPELINE_MLA_KV_H
 #include "EarlySharedFloatScales.h"
 #include "PrefetchMlaNope.h"
+#include "ScheduleMlaPvTail.h"
 
 namespace triton::ppu {
 namespace mla_kv_pipeline {
@@ -383,6 +384,8 @@ inline unsigned pipelineMlaKv(llvm::Module &module, unsigned threads,
   for (auto &function : module)
     if (!function.isDeclaration())
       changed += mla_kv_pipeline::run(function, shared, reusePages);
+  if (changed)
+    scheduleMlaPvTail(module, threads, shared);
   return changed;
 }
 } // namespace triton::ppu

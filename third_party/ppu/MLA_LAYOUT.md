@@ -84,6 +84,14 @@ existing CTA barrier after all KV reads precedes the overwrite. The next header
 retains its wait and publication barrier. The final iteration issues no extra
 copy. MMA inputs and FP32 expressions are unchanged.
 
+After this rewrite, the supported 35-MMA PV continuation schedules its existing
+scalar FP32 output lanes through their SSA dependencies. This shortens the delay
+between independent integer products and their output updates without moving
+instructions across the copy or synchronization boundary. The continuation must
+contain the expected 32-lane output pack and no writers, synchronization or
+unknown effects. Rejected continuations retain their instruction order. This is
+part of the existing pipeline option and adds no operator configuration.
+
 Optional page reuse adds four current/next page result PHIs only after matching
 the canonical table loads and their exact pointer/predicate aliases. The skip
 edge cannot feed another loop iteration. Reads and copies remain inside each
@@ -97,8 +105,8 @@ packages must not receive the new keywords.
 
 ## Validation
 
-`PPUMlaNopePrefetchTest`, `PPUMlaPvScalarizationTest` and
-`PPUMlaKvPipelineTest` are registered with
+`PPUMlaNopePrefetchTest`, `PPUMlaPvScalarizationTest`,
+`PPUMlaKvPipelineTest` and `PPUMlaPvTailScheduleTest` are registered with
 CTest when `TRITON_BUILD_UT=ON`. Additional LLVM tests accept real lowered MLA
 modules to check immutable query reads, scale publication and copy ordering.
 `test_uniform_mla_loop.py` checks supported and rejected scalar loop bounds
