@@ -181,26 +181,36 @@ static LogicalResult lowerCopy(ttg::TMACopyOp op) {
 
 #ifdef __TLE__
 // `other` of a pointer load made from a descriptor load: select(padding, nan,
-// zero) for a float element type; the zero constant alone for other types.
+// zero) for a float element type; the zero constant alone for other types,
+// which have no NaN padding flag.
 struct PaddingSelect {
   Value padding;
   Value zero;
 };
 
-static std::optional<PaddingSelect> matchPaddingSelect(Value other) {
-  auto select = other.getDefiningOp<arith::SelectOp>();
-  if (!select || !select.getCondition().getType().isInteger(1))
-    return std::nullopt;
-  auto zero = select.getFalseValue().getDefiningOp<arith::ConstantOp>();
-  if (!zero)
-    return std::nullopt;
-  auto splat = dyn_cast<SplatElementsAttr>(zero.getValue());
+static bool isZeroSplat(Value other) {
+  auto constant = other.getDefiningOp<arith::ConstantOp>();
+  if (!constant)
+    return false;
+  auto splat = dyn_cast<SplatElementsAttr>(constant.getValue());
   if (!splat)
+    return false;
+  Attribute element = splat.getSplatValue<Attribute>();
+  if (auto value = dyn_cast<FloatAttr>(element))
+    return value.getValue().isZero();
+  if (auto value = dyn_cast<IntegerAttr>(element))
+    return value.getValue().isZero();
+  return false;
+}
+
+static std::optional<PaddingSelect> matchPaddingSelect(Value other) {
+  if (isZeroSplat(other))
+    return PaddingSelect{Value(), other};
+  auto select = other.getDefiningOp<arith::SelectOp>();
+  if (!select || !select.getCondition().getType().isInteger(1) ||
+      !isZeroSplat(select.getFalseValue()))
     return std::nullopt;
-  auto value = dyn_cast<FloatAttr>(splat.getSplatValue<Attribute>());
-  if (!value || !value.getValue().isZero())
-    return std::nullopt;
-  return PaddingSelect{select.getCondition(), zero.getResult()};
+  return PaddingSelect{select.getCondition(), select.getFalseValue()};
 }
 
 // The pointer of a rewritten descriptor load is
@@ -309,7 +319,7 @@ static LogicalResult zeroPadCopyLoad(tt::LoadOp load,
   dropInnermostStride(load);
   if (auto bits = load->getAttrOfType<IntegerAttr>(kDescriptorDivisibilityAttr))
     hintDescriptorAlignment(load, bits.getInt());
-  if (!asserted.insert(padding->padding).second)
+  if (!padding->padding || !asserted.insert(padding->padding).second)
     return success();
   // The flag is a kernel argument or a constant: check it once, where it is
   // defined, so that every copy of the descriptor is covered.

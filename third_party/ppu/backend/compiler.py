@@ -268,7 +268,13 @@ class PPUBackend(BaseBackend):
     # 16 elements, whose bounds mask is then constant over every vector.
     @staticmethod
     def get_tensor_descriptor_specialization(arg):
-        bits = int(arg.base.data_ptr() % 16 == 0)
+        # cp.async pads with zero; the kernel would only trap on a NaN request.
+        if getattr(arg, "padding", "zero") == "nan":
+            raise ValueError("PPU descriptor copies to shared memory pad with zero; "
+                             "the descriptor asks for NaN padding")
+        # A fake tensor has no storage to be aligned (TensorDescriptor skips it too).
+        fake = type(arg.base).__name__ in ("FakeTensor", "FunctionalTensor")
+        bits = int(not fake and arg.base.data_ptr() % 16 == 0)
         for dim, extent in enumerate(arg.shape):
             if extent % 16 == 0:
                 bits |= 2 << dim
@@ -383,9 +389,11 @@ class PPUBackend(BaseBackend):
         ppu.passes.ttppugpuir.add_tle_lower_tma_copy(pm)
         ppu.passes.ttppugpuir.add_tle_promote_async_load_to_aiu(pm)
         passes.ttir.add_rewrite_tensor_pointer(pm)
-        if capability // 10 < 9:
-            passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
-            ppu.passes.ttppugpuir.add_tle_zero_pad_descriptor_copies(pm)
+        # PPU has no TMA unit at any capability: descriptors always become
+        # pointers, and the descriptor copies lowered above become zero-padded
+        # pointer loads.
+        passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
+        ppu.passes.ttppugpuir.add_tle_zero_pad_descriptor_copies(pm)
         passes.common.add_canonicalizer(pm)
         passes.ttir.add_combine(pm)
         passes.ttir.add_reorder_broadcast(pm)
