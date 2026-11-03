@@ -106,7 +106,8 @@ template <unsigned Width>
 inline unsigned rewrite(llvm::Function &function, bool allowP15,
                         unsigned threads = 512, unsigned batchTiles = 0) {
   using namespace llvm;
-  if (batchTiles && (batchTiles != 4 || Width != 64 || threads != 512))
+  if (batchTiles &&
+      (batchTiles != 4 || Width != 64 || (threads != 512 && threads != 256)))
     return 0;
   SmallVector<CallInst *> products;
   for (BasicBlock &block : function)
@@ -390,7 +391,9 @@ inline unsigned scalarizeMlaPv(llvm::Module &module, unsigned threads,
   if (!((threads == 512 && (shared == 168192 || shared == 123392)) ||
         (threads == 256 && shared == 94464)))
     return 0;
-  if (batchTiles && (batchTiles != 4 || threads != 512 || shared != 123392))
+  if (batchTiles &&
+      (batchTiles != 4 || !((threads == 512 && shared == 123392) ||
+                            (threads == 256 && shared == 94464))))
     return 0;
   unsigned changed = 0;
   for (llvm::Function &function : module)

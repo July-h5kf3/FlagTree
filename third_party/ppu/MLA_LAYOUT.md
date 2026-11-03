@@ -135,15 +135,16 @@ The option defaults to false; unsupported shapes keep their existing lowering.
 PPU CTA. It uses a `[1, 8]` PV warp layout and a 64 KiB shared KV buffer.
 Query fragments remain in shared memory. FP32 scale publication, NoPE/PV
 streaming and KV prefetch use the same effect and SSA checks with the actual
-256-thread CTA: 16 copies, 64 unique PV word readers and 37 remaining PV MMA
+256-thread CTA: 16 copies, 64 unique PV word readers and 49 remaining PV MMA
 instructions. Loop indices retain their original 32-bit or 64-bit type.
 The two FP32 scale planes raise encoded shared storage from 94208 to 94464
 bytes. Two signed INT8 PV products and FP32 recurrence state are preserved.
 This option also defaults to false; existing configurations keep their lowering.
 
-The 64-head path schedules PV in batches of four independent output tiles.
+The 64-head and 32-head paths schedule PV in batches of four independent output tiles.
 The dependency graph retains every original MMA input and FP32 expression,
 while completing a batch before starting more output state. The same KV-reader
-proof permits the next copy with 51 PV MMA instructions remaining. This whole
-PV schedule replaces the separate continuation-only tail schedule on that path;
-the 32-head path retains its existing continuation schedule.
+proof permits the next copy with 51 or 49 PV MMA instructions remaining,
+respectively. This whole PV schedule replaces the separate continuation-only
+tail schedule on both paths. Scalarization callers that omit the batch argument
+retain their existing schedule.
