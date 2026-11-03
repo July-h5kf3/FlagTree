@@ -68,3 +68,35 @@ def test_mla_kv_views(case, tmp_path):
         assert ppu.reuse_mla_kv_views(module) == 0 and str(module) == rewritten
     else:
         assert str(module) == before
+
+
+@pytest.mark.parametrize('case', ['reuse', 'marker_off', 'duplicate_root', 'insufficient_alignment', 'mutable'])
+def test_mla_h64_kv_views(case, tmp_path):
+    text = MODULE.replace('256x512', '128x512').replace('512x256', '512x128')
+    text = text.replace('[128, 0]', '[64, 0]').replace('warp = [[16, 0], [32, 0], [64, 0]',
+                                                       'warp = [[16, 0], [32, 0], [0, 0]')
+    text = text.replace('warpsPerCTA = [2, 8]', 'warpsPerCTA = [4, 4]')
+    if case != 'marker_off':
+        text = text.replace('module attributes {', 'module attributes {ppu.mla_h64_k128_pv_layout = 1 : i32, ')
+    allocation = next(line for line in text.splitlines() if '%root = ttg.local_alloc' in line)
+    if case == 'duplicate_root':
+        text = text.replace(allocation, allocation + '\n' + allocation.replace('%root =', '%extra_root ='))
+    elif case == 'insufficient_alignment':
+        text = text.replace('ttg.local_alloc %kv :', 'ttg.local_alloc %kv {alignment = 8 : i32} :')
+    elif case == 'mutable':
+        text = text.replace('#shared, #smem>', '#shared, #smem, mutable>')
+    context = ir.context()
+    ir.load_dialects(context)
+    ppu.load_dialects(context)
+    path = tmp_path / 'h64.ttgir'
+    path.write_text(text)
+    module = ir.parse_mlir_module(str(path), context)
+    module.context = context
+    before = str(module)
+    assert ppu.reuse_mla_kv_views(module) == int(case == 'reuse')
+    if case == 'reuse':
+        assert 'vec = 16, perPhase = 1, maxPhase = 16' in str(module)
+        after = str(module)
+        assert ppu.reuse_mla_kv_views(module) == 0 and str(module) == after
+    else:
+        assert str(module) == before

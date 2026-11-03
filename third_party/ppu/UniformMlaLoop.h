@@ -18,10 +18,14 @@ inline unsigned proveUniformMlaLoop(ModuleOp module) {
   if (loops.size() != 1)
     return 0;
   auto loop = loops.front();
+  auto marker =
+      module->getAttrOfType<IntegerAttr>("ppu.mla_h64_k128_pv_layout");
+  bool small = marker && marker.getInt() == 1;
   llvm::APInt step;
   if (!loop.getLowerBound().getType().isInteger(32) ||
       !loop.getUpperBound().getType().isInteger(32) ||
-      !matchPattern(loop.getStep(), m_ConstantInt(&step)) || step != 4)
+      !matchPattern(loop.getStep(), m_ConstantInt(&step)) ||
+      (step != 4 && !(small && step == 2)))
     return 0;
   llvm::DenseSet<Value> proved;
   std::function<bool(Value)> uniform = [&](Value value) {

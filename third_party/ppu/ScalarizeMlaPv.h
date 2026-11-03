@@ -18,7 +18,7 @@ struct Lane {
   unsigned first = 0, second = 0, index = 0;
 };
 
-struct Tail {
+template <unsigned Width> struct Tail {
   llvm::Instruction *publication;
   llvm::SmallVector<Lane> lanes;
   std::map<std::pair<llvm::Value *, unsigned>, unsigned> memo;
@@ -56,7 +56,7 @@ struct Tail {
                                  slot % width);
     } else {
       auto *instruction = dyn_cast<Instruction>(vector);
-      bool eligible = type->getNumElements() == 32 ||
+      bool eligible = type->getNumElements() == Width ||
                       (instruction &&
                        instruction->getParent() == publication->getParent() &&
                        publication->comesBefore(instruction));
@@ -102,6 +102,7 @@ inline bool pure(llvm::Instruction &instruction) {
              instruction);
 }
 
+template <unsigned Width>
 inline unsigned rewrite(llvm::Function &function, bool allowP15) {
   using namespace llvm;
   SmallVector<CallInst *> products;
@@ -154,7 +155,7 @@ inline unsigned rewrite(llvm::Function &function, bool allowP15) {
       for (auto *word : outputs[index])
         highWords.insert(word);
   }
-  if (terminals.size() != 32)
+  if (terminals.size() != Width)
     return 0;
   Instruction *root = nullptr;
   for (Instruction *instruction = products.back()->getNextNode();
@@ -162,7 +163,8 @@ inline unsigned rewrite(llvm::Function &function, bool allowP15) {
        instruction = instruction->getNextNode()) {
     auto *type = dyn_cast<FixedVectorType>(instruction->getType());
     if (instruction->getOpcode() == Instruction::FAdd && type &&
-        type->getNumElements() == 32 && type->getElementType()->isFloatTy()) {
+        type->getNumElements() == Width &&
+        type->getElementType()->isFloatTy()) {
       if (root)
         return 0;
       root = instruction;
@@ -170,9 +172,9 @@ inline unsigned rewrite(llvm::Function &function, bool allowP15) {
   }
   if (!root)
     return 0;
-  Tail tail{publication};
-  std::array<unsigned, 32> roots{};
-  for (unsigned index = 0; index < 32; ++index)
+  Tail<Width> tail{publication};
+  std::array<unsigned, Width> roots{};
+  for (unsigned index = 0; index < Width; ++index)
     roots[index] = tail.scalar(root, index);
   std::function<bool(unsigned, SmallVectorImpl<Value *> &)> words =
       [&](unsigned index, SmallVectorImpl<Value *> &found) {
@@ -190,9 +192,9 @@ inline unsigned rewrite(llvm::Function &function, bool allowP15) {
         }
         return true;
       };
-  std::array<Value *, 32> laneWord{};
+  std::array<Value *, Width> laneWord{};
   unsigned covered = 0;
-  for (unsigned index = 0; index < 32; ++index) {
+  for (unsigned index = 0; index < Width; ++index) {
     SmallVector<Value *> found;
     if (!words(roots[index], found) || found.size() > 1)
       return 0;
@@ -236,8 +238,8 @@ inline unsigned rewrite(llvm::Function &function, bool allowP15) {
           vectorFactor
               ? dyn_cast_or_null<ConstantInt>(vectorFactor->getSplatValue())
               : nullptr;
-      if (!slot || slot->getZExtValue() >= 32 || !multiply || !type ||
-          type->getNumElements() != 32 ||
+      if (!slot || slot->getZExtValue() >= Width || !multiply || !type ||
+          type->getNumElements() != Width ||
           !type->getElementType()->isIntegerTy(32) || !splat ||
           !((multiply->getOpcode() == Instruction::Mul &&
              splat->equalsInt(127)) ||
@@ -260,7 +262,7 @@ inline unsigned rewrite(llvm::Function &function, bool allowP15) {
       seedNodes.insert(multiply);
       seedNodes.insert(seed);
     }
-  if (seeds.size() + scalarSeeds != 32)
+  if (seeds.size() + scalarSeeds != Width)
     return 0;
   // All effect, lane and seed checks precede any changes to the SSA graph.
   IRBuilder<NoFolder> builder(root);
@@ -282,7 +284,7 @@ inline unsigned rewrite(llvm::Function &function, bool allowP15) {
     scalars.push_back(value);
   }
   Value *packed = PoisonValue::get(root->getType());
-  for (unsigned index = 0; index < 32; ++index)
+  for (unsigned index = 0; index < Width; ++index)
     packed =
         builder.CreateInsertElement(packed, scalars[roots[index]],
                                     builder.getInt64(index), "pv_stream_pack");
@@ -334,10 +336,10 @@ inline unsigned rewrite(llvm::Function &function, bool allowP15) {
       emit(word);
   }
   for (Value *word : terminalOrder)
-    for (unsigned index = 0; index < 32; ++index)
+    for (unsigned index = 0; index < Width; ++index)
       if (laneWord[index] == word)
         emit(scalars[roots[index]]);
-  for (unsigned index = 0; index < 32; ++index)
+  for (unsigned index = 0; index < Width; ++index)
     if (!laneWord[index])
       emit(scalars[roots[index]]);
   for (auto *instruction : region)
@@ -351,13 +353,15 @@ inline unsigned rewrite(llvm::Function &function, bool allowP15) {
 
 inline unsigned scalarizeMlaPv(llvm::Module &module, unsigned threads,
                                unsigned shared, bool allowP15 = false) {
-  if (threads != 512 || shared != 168192)
+  if (threads != 512 || (shared != 168192 && shared != 123392))
     return 0;
   unsigned changed = 0;
   for (llvm::Function &function : module)
     if (!function.isDeclaration() &&
         function.getCallingConv() == llvm::CallingConv::PTX_Kernel)
-      changed += mla_pv_scalarization::rewrite(function, allowP15);
+      changed += shared == 123392
+                     ? mla_pv_scalarization::rewrite<64>(function, allowP15)
+                     : mla_pv_scalarization::rewrite<32>(function, allowP15);
   return changed;
 }
 

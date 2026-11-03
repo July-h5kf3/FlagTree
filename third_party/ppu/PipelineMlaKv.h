@@ -27,8 +27,8 @@ inline bool pageRead(llvm::CallInst *call) {
   return argument && argument->getArgNo() == 6;
 }
 
-inline unsigned run(llvm::Function &function, unsigned shared,
-                    bool reusePages) {
+inline unsigned run(llvm::Function &function, unsigned shared, bool reusePages,
+                    bool small = false) {
   using namespace llvm;
   if (function.getCallingConv() != CallingConv::PTX_Kernel ||
       function.hasFnAttribute("ppu.mla.kv.pipeline"))
@@ -47,7 +47,7 @@ inline unsigned run(llvm::Function &function, unsigned shared,
             copies.push_back(call);
         }
     }
-  if (products.size() != 96 || copies.size() != 16)
+  if (products.size() != 96 || copies.size() != (small ? 8 : 16))
     return 0;
   auto *header = products.front()->getParent();
   DominatorTree dominance(function);
@@ -77,8 +77,8 @@ inline unsigned run(llvm::Function &function, unsigned shared,
   auto *step = next ? dyn_cast<ConstantInt>(next->getOperand(1)) : nullptr;
   auto *iv = next ? dyn_cast<PHINode>(next->getOperand(0)) : nullptr;
   if (!next || next->getOpcode() != Instruction::Add ||
-      next->getParent() != latch || !step || !step->equalsInt(4) || !iv ||
-      iv->getParent() != header || !iv->getType()->isIntegerTy(32) ||
+      next->getParent() != latch || !step || !step->equalsInt(small ? 2 : 4) ||
+      !iv || iv->getParent() != header || !iv->getType()->isIntegerTy(32) ||
       iv->getNumIncomingValues() != 2 || iv->getBasicBlockIndex(latch) < 0 ||
       iv->getIncomingValueForBlock(latch) != next ||
       iv->getBasicBlockIndex(preheader) < 0)
@@ -149,7 +149,7 @@ inline unsigned run(llvm::Function &function, unsigned shared,
     return bytes;
   };
   BitVector kv(shared), destinations(shared), expected(shared);
-  expected.set(0, 131072);
+  expected.set(0, small ? 65536 : 131072);
   SmallPtrSet<LoadInst *, 32> readers;
   LoadInst *last = nullptr;
   for (auto *product : ArrayRef(products).drop_front(32))
@@ -183,8 +183,8 @@ inline unsigned run(llvm::Function &function, unsigned shared,
       return 0;
     destinations |= *bytes;
   }
-  if (readers.size() != 64 || kv != expected || destinations != expected ||
-      !last)
+  if (readers.size() != (small ? 32 : 64) || kv != expected ||
+      destinations != expected || !last)
     return 0;
   unsigned remaining = 0;
   for (Instruction *instruction = last->getNextNode(); instruction;
@@ -232,7 +232,7 @@ inline unsigned run(llvm::Function &function, unsigned shared,
         return 0;
     }
   }
-  if (remaining != 35 || position[next] <= position[last] ||
+  if (remaining != (small ? 39 : 35) || position[next] <= position[last] ||
       position[condition] <= position[next])
     return 0;
   // Only the IV and a bounded pure integer/page-read DAG may be remapped.
@@ -289,7 +289,7 @@ inline unsigned run(llvm::Function &function, unsigned shared,
         if (auto *call = dyn_cast<CallInst>(&instruction))
           if (pageRead(call))
             pages.push_back(call);
-    if (pages.size() != 4)
+    if (pages.size() != (small ? 2 : 4))
       return 0;
     for (unsigned i = 0; i < pages.size(); ++i) {
       SmallVector<CallInst *> matching;
@@ -373,18 +373,19 @@ inline unsigned run(llvm::Function &function, unsigned shared,
   commit->eraseFromParent();
   protect->eraseFromParent();
   function.addFnAttr("ppu.mla.kv.pipeline", "1");
-  return reusePages ? 5 : 1;
+  return reusePages ? (small ? 3 : 5) : 1;
 }
 } // namespace mla_kv_pipeline
 inline unsigned pipelineMlaKv(llvm::Module &module, unsigned threads,
                               unsigned shared, bool reusePages = false) {
-  if (threads != 512 || shared != 168192)
+  if (threads != 512 || (shared != 168192 && shared != 123392))
     return 0;
   unsigned changed = 0;
   for (auto &function : module)
     if (!function.isDeclaration())
-      changed += mla_kv_pipeline::run(function, shared, reusePages);
-  if (changed)
+      changed +=
+          mla_kv_pipeline::run(function, shared, reusePages, shared == 123392);
+  if (changed && shared == 168192)
     scheduleMlaPvTail(module, threads, shared);
   return changed;
 }

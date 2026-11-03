@@ -14,11 +14,15 @@ inline unsigned reuseMlaKvViews(ModuleOp module) {
   using namespace mlir::triton::gpu;
   SmallVector<TransOp> transposes;
   module.walk([&](TransOp transpose) { transposes.push_back(transpose); });
+  auto marker =
+      module->getAttrOfType<IntegerAttr>("ppu.mla_h64_k128_pv_layout");
+  bool small = marker && marker.getInt() == 1;
   unsigned changed = 0;
   for (auto transpose : transposes) {
     auto resultType = dyn_cast<RankedTensorType>(transpose.getType());
     if (!resultType || !resultType.getElementType().isInteger(8) ||
-        resultType.getShape() != ArrayRef<int64_t>({512, 256}) ||
+        (resultType.getShape() != ArrayRef<int64_t>({512, 256}) &&
+         !(small && resultType.getShape() == ArrayRef<int64_t>({512, 128}))) ||
         transpose.getOrder() != ArrayRef<int32_t>({1, 0}))
       continue;
     auto dot = dyn_cast<DotOperandEncodingAttr>(resultType.getEncoding());
@@ -27,7 +31,9 @@ inline unsigned reuseMlaKvViews(ModuleOp module) {
     if (!dot || dot.getOpIdx() != 1 || dot.getKWidth() != 4 || !mma ||
         !mma.isPPU0010() ||
         (mma.getWarpsPerCTA() != ArrayRef<unsigned>({2, 8}) &&
-         mma.getWarpsPerCTA() != ArrayRef<unsigned>({1, 16})))
+         mma.getWarpsPerCTA() != ArrayRef<unsigned>({1, 16}) &&
+         !(small && resultType.getShape() == ArrayRef<int64_t>({512, 128}) &&
+           mma.getWarpsPerCTA() == ArrayRef<unsigned>({4, 4}))))
       continue;
     auto convert = transpose.getSrc().getDefiningOp<ConvertLayoutOp>();
     if (!convert || !convert.getResult().hasOneUse())
@@ -37,7 +43,8 @@ inline unsigned reuseMlaKvViews(ModuleOp module) {
     bool ambiguous = false;
     for (auto *user : key.getUsers()) {
       if (auto allocation = dyn_cast<LocalAllocOp>(user)) {
-        if (allocation.getType().getShape() != ArrayRef<int64_t>({256, 512}))
+        if (allocation.getType().getShape() !=
+            ArrayRef<int64_t>({resultType.getShape()[1], 512}))
           continue;
         if (root)
           ambiguous = true;

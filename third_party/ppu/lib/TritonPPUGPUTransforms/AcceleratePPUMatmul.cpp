@@ -126,6 +126,18 @@ SmallVector<unsigned, 2> warpsPerTileMmaV1(DotOpInterface dotOp,
   if (rank == 3)
     return {(unsigned)numWarps, 1, 1};
 
+  auto module = dotOp->getParentOfType<ModuleOp>();
+  auto enabled =
+      module->getAttrOfType<IntegerAttr>("ppu.mla_h64_k128_pv_layout");
+  auto lhs = cast<RankedTensorType>(dotOp->getOperand(0).getType());
+  auto rhs = cast<RankedTensorType>(dotOp->getOperand(1).getType());
+  if (enabled && enabled.getInt() == 1 && numWarps == 16 &&
+      shape == ArrayRef<int64_t>({64, 512}) &&
+      lhs.getElementType().isInteger(8) && rhs.getElementType().isInteger(8) &&
+      lhs.getShape() == ArrayRef<int64_t>({64, 128}) &&
+      rhs.getShape() == ArrayRef<int64_t>({128, 512}))
+    return {1u, 16u};
+
   auto filter = [&dotOp](Operation *op) {
     return op->getParentRegion() == dotOp->getParentRegion() &&
            !isa<TransOp>(op);

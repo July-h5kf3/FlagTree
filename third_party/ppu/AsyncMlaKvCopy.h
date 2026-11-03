@@ -15,6 +15,9 @@ inline unsigned promoteMlaKvCopy(ModuleOp module) {
   ModuleAxisInfoAnalysis axis(module);
   SmallVector<LocalAllocOp> roots;
   module.walk([&](LocalAllocOp root) { roots.push_back(root); });
+  auto marker =
+      module->getAttrOfType<IntegerAttr>("ppu.mla_h64_k128_pv_layout");
+  bool small = marker && marker.getInt() == 1;
   unsigned changed = 0;
   for (auto root : roots) {
     if (!root.getSrc())
@@ -25,8 +28,9 @@ inline unsigned promoteMlaKvCopy(ModuleOp module) {
     if (!load || !load.getResult().hasOneUse() ||
         load->getBlock() != root->getBlock() || !root.isSharedMemoryAlloc() ||
         type.getMutableMemory() || !type.getElementType().isInteger(8) ||
-        type.getShape() != ArrayRef<int64_t>({256, 512}) || !encoding ||
-        encoding.getVec() != 16 || encoding.getPerPhase() != 1 ||
+        (type.getShape() != ArrayRef<int64_t>({256, 512}) &&
+         !(small && type.getShape() == ArrayRef<int64_t>({128, 512}))) ||
+        !encoding || encoding.getVec() != 16 || encoding.getPerPhase() != 1 ||
         encoding.getMaxPhase() != 16 ||
         encoding.getOrder() != ArrayRef<unsigned>({1, 0}) ||
         load.getIsVolatile() ||

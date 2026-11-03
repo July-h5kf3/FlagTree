@@ -218,7 +218,8 @@ inline bool proveNoQueryWrites(llvm::Loop &loop, const llvm::BitVector &query,
 }
 
 inline unsigned hoist(llvm::Function &function, unsigned count,
-                      unsigned threads, unsigned sharedBytes) {
+                      unsigned threads, unsigned sharedBytes,
+                      bool wide = false) {
   using namespace llvm;
   SmallVector<CallInst *> products;
   for (BasicBlock &block : function)
@@ -297,7 +298,7 @@ inline unsigned hoist(llvm::Function &function, unsigned count,
       query.set(*offset, *offset + 16);
     }
   }
-  if (query.count() != 16384 ||
+  if (query.count() != (wide ? 32768 : 16384) ||
       !proveNoQueryWrites(*loop, query, layout, threads))
     return 0;
   CallInst *wait = nullptr, *commit = nullptr;
@@ -322,8 +323,8 @@ inline unsigned hoist(llvm::Function &function, unsigned count,
       }
     }
   }
-  bool overlap = count == 12 && copies.size() == 16 && commits == 1 &&
-                 waits == 1 && commit->comesBefore(wait);
+  bool overlap = count == 12 && copies.size() == (wide ? 8 : 16) &&
+                 commits == 1 && waits == 1 && commit->comesBefore(wait);
   if (overlap) {
     for (auto *copy : copies)
       overlap &= copy->comesBefore(commit);
@@ -358,13 +359,13 @@ inline unsigned hoistReadonlySharedMatrices(llvm::Module &module,
                                             unsigned count, unsigned threads,
                                             unsigned sharedBytes) {
   if ((count != 8 && count != 12 && count != 16) || threads != 512 ||
-      (sharedBytes != 217088 && sharedBytes != 167936))
+      (sharedBytes != 217088 && sharedBytes != 167936 && sharedBytes != 122880))
     return 0;
   unsigned changed = 0;
   for (auto &function : module)
     if (!function.isDeclaration())
-      changed += readonly_shared_matrices::hoist(function, count, threads,
-                                                 sharedBytes);
+      changed += readonly_shared_matrices::hoist(
+          function, count, threads, sharedBytes, sharedBytes == 122880);
   return changed;
 }
 

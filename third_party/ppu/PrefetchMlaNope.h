@@ -211,8 +211,10 @@ inline unsigned schedule(llvm::Function &function, unsigned shared) {
     for (unsigned tid = 0; tid < 512; ++tid) {
       for (unsigned operand = 0; operand < 2; ++operand) {
         auto *input = operand ? &*key : &*query;
-        int64_t low = operand ? 0 : 131072;
-        int64_t high = operand ? 131072 : shared;
+        int64_t keyBytes =
+            shared == 122880 || shared == 123392 ? 65536 : 131072;
+        int64_t low = operand ? 0 : keyBytes;
+        int64_t high = operand ? keyBytes : shared;
         if (!preparePointer(input->pointer, tid, layout, constants[tid],
                             integers[tid]))
           return 0;
@@ -353,7 +355,8 @@ inline unsigned schedule(llvm::Function &function, unsigned shared) {
 
 inline unsigned prefetchMlaNopeFragments(llvm::Module &module, unsigned threads,
                                          unsigned shared) {
-  if (threads != 512 || (shared != 167936 && shared != 168192))
+  if (threads != 512 || (shared != 167936 && shared != 168192 &&
+                         shared != 122880 && shared != 123392))
     return 0;
   unsigned changed = 0;
   for (llvm::Function &function : module)

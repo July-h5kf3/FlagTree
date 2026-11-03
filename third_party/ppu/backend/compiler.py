@@ -229,6 +229,7 @@ class HGGCOptions:
     ppu_scalarize_mla_p15: bool = False
     ppu_pipeline_mla_kv: bool = False
     ppu_pipeline_mla_kv_pages: bool = False
+    ppu_mla_h64_k128: bool = False
     enable_fp_fusion: bool = True
     enable_reflect_ftz: bool = True  # ftz in libdevice
     launch_cooperative_grid: bool = False
@@ -420,6 +421,12 @@ class PPUBackend(BaseBackend):
         if opt.maxnreg is not None:
             mod.set_attr("ttg.maxnreg", ir.builder(mod.context).get_int32_attr(opt.maxnreg))
 
+        if opt.ppu_mla_h64_k128 and capability == 80 and opt.num_warps == 16 and opt.num_ctas == 1:
+            source = str(mod)
+            if ('@dense_int8_mla_kernel(' in source and 'tensor<64x128xi8' in source and 'tensor<128x512xi8' in source
+                    and 'tensor<512x128xi8' in source):
+                mod.set_attr("ppu.mla_h64_k128_pv_layout", ir.builder(mod.context).get_int32_attr(1))
+
         pm = ir.pass_manager(mod.context)
         dump_enabled = pm.enable_debug()
         emuTF32 = (capability // 10 >= 8)
@@ -517,8 +524,10 @@ class PPUBackend(BaseBackend):
 
     def make_llir(self, src, metadata, options, capability):
         mod = src
+        h64 = (options.ppu_mla_h64_k128 and capability == 80 and options.num_warps == 16 and options.num_ctas == 1
+               and src.get_int_attr("ppu.mla_h64_k128_pv_layout") == 1)
         metadata["mla_kv_loop_uniform"] = 0
-        if options.ppu_pipeline_mla_kv and capability == 80:
+        if (options.ppu_pipeline_mla_kv or h64) and capability == 80:
             metadata["mla_kv_loop_uniform"] = ppu.prove_uniform_mla_loop(mod)
         if options.ppu_vectorize_i8_shared_store and capability == 80:
             mod.set_attr("ppu.vector_i8_shared_store", ir.builder(mod.context).get_int32_attr(1))
@@ -617,33 +626,42 @@ class PPUBackend(BaseBackend):
             metadata["num_warps"] = total_num_warps
         metadata["shared"] = src.get_int_attr("ttg.shared")
         metadata["readonly_shared_matrices_hoisted"] = 0
-        if options.ppu_hoist_readonly_shared_matrices and capability == 80:
+        if (options.ppu_hoist_readonly_shared_matrices or h64) and capability == 80:
             metadata["readonly_shared_matrices_hoisted"] = ppu.hoist_readonly_shared_matrices(
-                llvm_mod, options.ppu_hoist_readonly_shared_matrices, metadata["num_warps"] * 32, metadata["shared"])
+                llvm_mod, 8 if h64 else options.ppu_hoist_readonly_shared_matrices, metadata["num_warps"] * 32,
+                metadata["shared"])
         metadata["shared_float_scales_published_early"] = 0
-        if options.ppu_publish_shared_float_scales_early and capability == 80:
+        if (options.ppu_publish_shared_float_scales_early or h64) and capability == 80:
             metadata["shared"], metadata["shared_float_scales_published_early"] = ppu.publish_shared_float_scales_early(
                 llvm_mod, metadata["num_warps"] * 32, metadata["shared"])
         metadata["mla_nope_fragments_prefetched"] = 0
-        if (options.ppu_prefetch_mla_nope and capability == 80 and metadata["num_warps"] == 16
-                and metadata["mla_shared_kv_views_reused"] == 1 and metadata["readonly_shared_matrices_hoisted"] == 12):
+        if ((options.ppu_prefetch_mla_nope or h64) and capability == 80 and metadata["num_warps"] == 16
+                and metadata["mla_shared_kv_views_reused"] == 1
+                and (metadata["readonly_shared_matrices_hoisted"] == 12 or
+                     (h64 and metadata["readonly_shared_matrices_hoisted"] == 8))):
             metadata["mla_nope_fragments_prefetched"] = ppu.prefetch_mla_nope(llvm_mod, 512, metadata["shared"])
         metadata["mla_pv_scalarized"] = 0
-        if (options.ppu_scalarize_mla_pv and capability == 80 and metadata["num_warps"] == 16
-                and metadata["mla_shared_kv_views_reused"] == 1 and metadata["readonly_shared_matrices_hoisted"] == 12
+        if ((options.ppu_scalarize_mla_pv or h64) and capability == 80 and metadata["num_warps"] == 16
+                and metadata["mla_shared_kv_views_reused"] == 1
+                and (metadata["readonly_shared_matrices_hoisted"] == 12 or
+                     (h64 and metadata["readonly_shared_matrices_hoisted"] == 8))
                 and metadata["mla_nope_fragments_prefetched"] == 1
                 and metadata["shared_float_scales_published_early"] == 1):
             metadata["mla_pv_scalarized"] = ppu.scalarize_mla_pv(llvm_mod, 512, metadata["shared"],
-                                                                 options.ppu_scalarize_mla_p15)
+                                                                 options.ppu_scalarize_mla_p15 or h64)
         metadata["mla_kv_pipelined"] = 0
         metadata["mla_kv_page_results_reused"] = 0
-        if (options.ppu_pipeline_mla_kv and capability == 80 and metadata["mla_pv_scalarized"] == 1
+        if ((options.ppu_pipeline_mla_kv or h64) and capability == 80 and metadata["mla_pv_scalarized"] == 1
                 and metadata["mla_kv_loop_uniform"] == 1):
             result = ppu.pipeline_mla_kv(llvm_mod, metadata["num_warps"] * 32, metadata["shared"],
                                          options.ppu_pipeline_mla_kv_pages)
-            assert result in (0, 1, 5)
+            assert result in (0, 1, 3, 5)
             metadata["mla_kv_pipelined"] = int(result != 0)
-            metadata["mla_kv_page_results_reused"] = 4 if result == 5 else 0
+            metadata["mla_kv_page_results_reused"] = result - 1 if result in (3, 5) else 0
+        metadata["mla_pv_tail_scheduled"] = 0
+        if h64 and metadata["mla_kv_pipelined"] == 1:
+            metadata["mla_pv_tail_scheduled"] = ppu.schedule_mla_pv_tail(llvm_mod, metadata["num_warps"] * 32,
+                                                                         metadata["shared"])
         metadata["global_scratch_size"] = src.get_int_attr("ttg.global_scratch_memory_size")
         metadata["global_scratch_align"] = src.get_int_attr("ttg.global_scratch_memory_alignment")
         metadata["profile_scratch_size"] = src.get_int_attr("ttg.profile_scratch_memory_size") or 0

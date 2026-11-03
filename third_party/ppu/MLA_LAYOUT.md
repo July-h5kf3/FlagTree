@@ -121,3 +121,12 @@ validate its original output/LSE oracles and complete decode plus merge time.
 Consumers can inspect the backend option schema before adding these options
 to their tuning space. Older compiler packages should retain their existing
 configuration space without forwarding unsupported option keywords.
+
+`ppu_mla_h64_k128` opts the dense INT8 MLA kernel into the 64-head,
+128-token path on a 16-warp PPU CTA. It selects a `[1, 16]` PV warp layout,
+reuses the 64 KiB KV buffer, hoists eight query fragments, publishes FP32
+scales, streams NoPE/PV operands, and pipelines the next KV tile before the
+remaining PV instructions. The same address, writer, SSA and uniform-loop
+proofs apply to both supported geometries. Encoded shared storage is 123392
+bytes. Two signed INT8 PV products and FP32 recurrence state are preserved.
+The option defaults to false; unsupported shapes keep their existing lowering.

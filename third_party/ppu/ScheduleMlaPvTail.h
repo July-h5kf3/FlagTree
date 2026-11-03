@@ -6,10 +6,11 @@
 #include "ScalarizeMlaPv.h"
 
 namespace triton::ppu {
-inline unsigned scheduleMlaPvTail(llvm::Module &module, unsigned threads,
-                                  unsigned shared) {
+template <unsigned Width>
+inline unsigned scheduleMlaPvTailImpl(llvm::Module &module, unsigned threads,
+                                      unsigned shared) {
   using namespace llvm;
-  if (threads != 512 || shared != 168192)
+  if (threads != 512 || shared != (Width == 64 ? 123392 : 168192))
     return 0;
   unsigned changed = 0;
   for (Function &function : module) {
@@ -41,20 +42,20 @@ inline unsigned scheduleMlaPvTail(llvm::Module &module, unsigned threads,
           insert ? dyn_cast<FixedVectorType>(insert->getType()) : nullptr;
       auto *index =
           insert ? dyn_cast<ConstantInt>(insert->getOperand(2)) : nullptr;
-      if (type && type->getNumElements() == 32 &&
+      if (type && type->getNumElements() == Width &&
           type->getElementType()->isFloatTy() && index &&
-          index->equalsInt(31) &&
+          index->equalsInt(Width - 1) &&
           insert->getName().starts_with("pv_stream_pack")) {
         if (root)
           accepted = false;
         root = insert;
       }
     }
-    if (!accepted || products != 35 || !root)
+    if (!accepted || products != (Width == 64 ? 39 : 35) || !root)
       continue;
-    std::array<Value *, 32> lanes;
+    std::array<Value *, Width> lanes;
     Value *cursor = root;
-    for (int index = 31; index >= 0; --index) {
+    for (int index = Width - 1; index >= 0; --index) {
       auto *insert = dyn_cast<InsertElementInst>(cursor);
       auto *slot =
           insert ? dyn_cast<ConstantInt>(insert->getOperand(2)) : nullptr;
@@ -100,5 +101,11 @@ inline unsigned scheduleMlaPvTail(llvm::Module &module, unsigned threads,
   }
   return changed;
 }
+inline unsigned scheduleMlaPvTail(llvm::Module &module, unsigned threads,
+                                  unsigned shared) {
+  return shared == 123392 ? scheduleMlaPvTailImpl<64>(module, threads, shared)
+                          : scheduleMlaPvTailImpl<32>(module, threads, shared);
+}
+
 } // namespace triton::ppu
 #endif

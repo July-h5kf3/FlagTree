@@ -247,7 +247,8 @@ inline std::pair<unsigned, unsigned>
 publishSharedFloatScalesEarly(llvm::Module &module, unsigned threads,
                               unsigned shared) {
   using namespace llvm;
-  if (threads != 512 || (shared != 217088 && shared != 167936))
+  if (threads != 512 ||
+      (shared != 217088 && shared != 167936 && shared != 122880))
     return {shared, 0};
   auto *annotations = module.getNamedMetadata("nvvm.annotations");
   if (!annotations)
