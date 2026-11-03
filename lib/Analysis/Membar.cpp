@@ -28,7 +28,9 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "tle/dialect/include/IR/Dialect.h"
 #include "tle/dialect/include/IR/ExactSMEM.h"
+#ifdef __PPU__
 #include "tle/dialect/include/Transforms/TransformAttrs.h"
+#endif
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #endif
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -45,7 +47,6 @@ namespace mlir {
 namespace {
 
 namespace tt = mlir::triton;
-namespace tle = mlir::triton::tle;
 namespace ttg = mlir::triton::gpu;
 
 struct StaticAccessView {
@@ -619,8 +620,11 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
       unsigned groupThreads = triton::gpu::lookupNumWarps(op) *
                               triton::gpu::TritonGPUDialect::getThreadsPerWarp(
                                   op->getParentOfType<ModuleOp>());
-      // A named wait involving every warp in this partition already orders
-      // its shared-memory accesses, including reads before a pipe refill.
+      // A named wait whose count covers this partition is taken as a wait of
+      // every warp in it: it already orders their shared-memory accesses,
+      // including reads before a pipe refill. A wait that only some warps of
+      // the partition execute, with the rest of the count from other groups,
+      // is not a group-wide synchronization.
       if (value && value.getInt() >= groupThreads) {
         blockInfo->sync();
         return;
@@ -631,8 +635,9 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
   // publishes to a peer that waits on a named barrier. Keep tracking pending
   // memory effects here; the rendezvous belongs at consumption, not at the
   // per-thread completion wait.
-  if (isa<triton::gpu::AsyncWaitOp>(op) && op->hasAttr(tle::kTlePipeWaitAttr) &&
-      target && target.getValue().starts_with("ppu:"))
+  if (isa<triton::gpu::AsyncWaitOp>(op) &&
+      op->hasAttr(triton::tle::kTlePipeWaitAttr) && target &&
+      target.getValue().starts_with("ppu:"))
     return;
 #endif
 

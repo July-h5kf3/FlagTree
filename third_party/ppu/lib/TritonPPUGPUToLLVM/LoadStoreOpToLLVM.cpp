@@ -763,6 +763,22 @@ struct AsyncAIUCopyGlobalToLocalOpConversion
     Value tensorShapeZ2d = tensorShapeZ;
     if (rowLayout != LLVM::PPU::AIURowLayout::Dense)
       tensorShapeZ2d = b.trunc(i32_ty, rowStride);
+    Value tileBegin = b.sext(i64_ty, zCoord);
+    Value tileEnd = b.add(tileBegin, b.i64_val(tileC));
+    if (rowLayout == LLVM::PPU::AIURowLayout::Runtime) {
+      // Rows closer together than the row length overlap. The 2d copy takes
+      // the stride as the row length, so a tile column past the stride would
+      // read zeros instead of the next row; the compile-time gate rejects such
+      // a constant stride (isAIUStrideExpressible), a run-time one traps.
+      Value overlapping =
+          b.and_(b.icmp_slt(rowStride, adaptor.getShape()[colDim]),
+                 b.icmp_sgt(tileEnd, rowStride));
+      emitDeviceAssert(op, overlapping,
+                       "AIU load: the row stride is smaller than the row "
+                       "length, so the tile's columns past the stride cannot "
+                       "be read; use a plain load for overlapping rows",
+                       targetInfo, rewriter);
+    }
     Value src3d, tensorShapeY3d, tensorShapeX3d, tensorShapeZ3d, yOffset3d;
     Value use3d;
     if (emit3d) {
@@ -807,15 +823,14 @@ struct AsyncAIUCopyGlobalToLocalOpConversion
         // and the stride would read memory instead of zeros, which the
         // compile-time gate rejects for a constant stride (isAIULoadLayout).
         // A tile with such a column traps instead of returning them.
-        Value tileBegin = b.sext(i64_ty, zCoord);
-        Value tileEnd = b.add(tileBegin, b.i64_val(tileC));
         Value inexpressible = b.and_(b.and_(b.xor_(use3d, b.true_val()),
                                             b.icmp_ne(rowStride, rowLength)),
                                      b.and_(b.icmp_slt(tileBegin, rowStride),
                                             b.icmp_sgt(tileEnd, rowLength)));
         emitDeviceAssert(op, inexpressible,
                          "AIU load: the row stride is not a multiple of the "
-                         "row length, so the columns past the row length "
+                         "row length, or the rows do not fit the 3d "
+                         "descriptor, so the columns past the row length "
                          "cannot be zero filled; pad the rows or drop the "
                          "column boundary check",
                          targetInfo, rewriter);

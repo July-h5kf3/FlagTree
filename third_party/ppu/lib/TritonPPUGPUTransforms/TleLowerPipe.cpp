@@ -78,10 +78,10 @@ namespace tle = triton::tle;
 // maps them to physical ids at the end of the TTGIR pipeline.
 constexpr int64_t kFirstVirtualNamedBarrierId = 16;
 constexpr int64_t kNumHardwareBarriers = 16;
-// Ids the warp specialization lowering reserves: the default group's barrier,
-// the switch loop, and one per partition.
-constexpr int64_t kNumWarpSpecializeReservedBarriers =
-    tle::kTleWarpSpecializeReservedNamedBarriers;
+// Ids the warp specialization lowering reserves: the default warp group's
+// barrier and the switch loop. Keep in step with TleAllocateNamedBarriers,
+// which hands out virtual ids above them.
+constexpr int64_t kNumWarpSpecializeReservedBarriers = 2;
 
 // The threads that execute an op: a ttg.warp_specialize worker partition, or
 // the default warps (the default region and everything outside the op).
@@ -366,15 +366,8 @@ static void createCloseTags(OpBuilder &builder, Pipe &pipe) {
   pipe.closeTagSlotType = ttg::MemDescType::get(
       {1}, builder.getI32Type(), getCloseTagEncoding(context, 1),
       sharedMemorySpace, /*mutableMemory=*/true);
-  if (llvm::isPowerOf2_64(pipe.capacity)) {
-    Value init = createCloseTagTensor(
-        builder, loc,
-        getCloseTagTensorType(create, builder, {pipe.capacity, 1}), false);
-    pipe.closeTags = ttg::LocalAllocOp::create(builder, loc, arrayType, init);
-    return;
-  }
-  // A register tensor needs a power-of-two element count; clear the exact
-  // number of stages one slot at a time.
+  // Clear the stages one slot at a time: this runs once per kernel, and a
+  // register tensor would need a power-of-two number of stages.
   pipe.closeTags = ttg::LocalAllocOp::create(builder, loc, arrayType);
   Value init = createCloseTagTensor(
       builder, loc, getCloseTagTensorType(create, builder, {1}), false);
@@ -424,6 +417,35 @@ static LogicalResult recordEndpoint(std::optional<Endpoint> &endpoint,
            << " ops must run in one warp group; PPU pipes hand over "
               "between warp groups with hardware barriers";
   return success();
+}
+
+// The warp_specialize an endpoint's partition belongs to; null for the
+// default warps.
+static Operation *getWarpSpecialize(const Endpoint &endpoint) {
+  if (!endpoint.partition.region)
+    return nullptr;
+  return endpoint.partition.region->getParentOp()->getParentOp();
+}
+
+// The readers of a pipe arrive once on every empty barrier before their first
+// wait, and the counters of the software path are zero filled once, at the
+// create. The hardware keeps that state across executions, so a pipe that
+// hands over between warp groups is created, and its warp_specialize runs,
+// once per kernel: neither sits inside a loop.
+static LogicalResult checkRunsOnce(Pipe &pipe) {
+  auto inLoop = [](Operation *op) {
+    return op->getParentOfType<LoopLikeOpInterface>() != nullptr;
+  };
+  Operation *ws = getWarpSpecialize(*pipe.writer);
+  for (auto &[name, reader] : pipe.readers)
+    if (Operation *readerWs = getWarpSpecialize(reader))
+      ws = readerWs;
+  if (!inLoop(pipe.create) && !(ws && inLoop(ws)))
+    return success();
+  return pipe.create.emitOpError(
+      "hands over between warp groups inside a loop; the hardware barriers "
+      "keep their state across executions, so such a pipe is created and "
+      "used by a warp_specialize that runs once per kernel");
 }
 
 static FailureOr<std::string> getReaderName(const Pipe &pipe, Operation *op) {
@@ -482,6 +504,9 @@ static LogicalResult analyzePipes(ModuleOp module, PipeMap &pipes) {
             tle::PipeWriterCloseOp>(op)) {
       if (failed(recordEndpoint(pipe.writer, op, "writer")))
         return failure();
+      // As on NVIDIA: a one_shot pipe has no close, and is_closed stays false.
+      if (pipe.oneShot && isa<tle::PipeWriterCloseOp>(op))
+        return op->emitOpError("does not support close on one_shot pipe");
       pipe.hasClose |= isa<tle::PipeWriterCloseOp>(op);
       pipe.hasCpAsyncCommit |= op->hasAttr(tle::kTlePipeCommitCpAsyncAttr);
       continue;
@@ -518,6 +543,8 @@ static LogicalResult analyzePipes(ModuleOp module, PipeMap &pipes) {
       pipe.readerThreads.push_back(reader.threads);
       pipe.emptyThreads += reader.threads;
     }
+    if (pipe.crossGroupReaders && !pipe.oneShot && failed(checkRunsOnce(pipe)))
+      return failure();
   }
   return success();
 }
@@ -1084,6 +1111,9 @@ private:
   }
 
   Pending lowerDeferredBlock(Block &block, Pending pending) {
+    // getDeferredWriterRegion leaves closed pipes to the general path.
+    assert(!pipe.hasClose &&
+           "a closed pipe completes its copies at the commit");
     SmallVector<Operation *> original;
     for (Operation &op : block.without_terminator())
       original.push_back(&op);

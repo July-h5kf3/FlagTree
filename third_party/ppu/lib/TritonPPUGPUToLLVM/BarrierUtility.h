@@ -39,7 +39,8 @@ namespace mlir::triton::ppu {
 // which ppu-llc resolves to s.blksyn.
 //
 // `fence` selects what the issuing warp drains before the barrier:
-//   bit 0: its shared-memory stores (s.wait tsmcnt(0));
+//   bit 0: its shared-memory accesses, loads and stores (s.wait tsmcnt(0);
+//          the tsm counter covers both);
 //   bit 4: all of its outstanding global accesses (vmem.fence.blk).
 // barrier0, __syncthreads and an inline `bar.sync` use 31 (both). Draining the
 // global accesses costs ~3000 cycles with loads in flight, and is not needed to
@@ -66,7 +67,7 @@ void createPPUBarrierArrive(OpBuilder &b, Location loc, unsigned id,
 // A CTA-wide barrier (id 0) that the lowering inserts to order shared memory:
 // Membar hazards and the scratch buffers synchronized through
 // TargetInfo::barrier (e.g. layout conversions). It drains only the warp's
-// shared-memory stores. Inside a warp-specialized kernel the warp
+// shared-memory accesses. Inside a warp-specialized kernel the warp
 // specialization lowering retargets it to the barrier of the warp group.
 void createPPUSharedMemoryBarrier(OpBuilder &b, Location loc,
                                   unsigned numThreads);

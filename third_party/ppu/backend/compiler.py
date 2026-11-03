@@ -278,13 +278,11 @@ class PPUBackend(BaseBackend):
     # A TLE descriptor copy becomes a bounds-checked pointer copy on PPU (no
     # TMA unit). The cache key records what makes it a vectorized cp.async: a
     # 16-byte aligned base, and the dimensions whose extent is a multiple of
-    # 16 elements, whose bounds mask is then constant over every vector.
+    # 16 elements, whose bounds mask is then constant over every vector. The
+    # padding is a kernel argument; a copy to shared memory traps on NaN
+    # padding (TleZeroPadDescriptorCopies), a descriptor load keeps it.
     @staticmethod
     def get_tensor_descriptor_specialization(arg):
-        # cp.async pads with zero; the kernel would only trap on a NaN request.
-        if getattr(arg, "padding", "zero") == "nan":
-            raise ValueError("PPU descriptor copies to shared memory pad with zero; "
-                             "the descriptor asks for NaN padding")
         # A fake tensor has no storage to be aligned (TensorDescriptor skips it too).
         fake = type(arg.base).__name__ in ("FakeTensor", "FunctionalTensor")
         bits = int(not fake and arg.base.data_ptr() % 16 == 0)
@@ -453,7 +451,8 @@ class PPUBackend(BaseBackend):
             tle.passes.add_early_assign_memory_space(pm)
             tle.passes.add_select_encodings(pm)
             tle.passes.add_insert_local_pointer_barriers(pm)
-            tle.passes.add_optimize_local_pointer_loads(pm)
+            # flagtree keep smem read order
+            tle.passes.add_optimize_local_pointer_loads(pm, knobs.compilation.keep_smem_read_order)
             tle.passes.add_optimize_local_pointer_stores(pm)
         ppu.passes.ttgpuir.add_accelerate_matmul(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
@@ -487,7 +486,8 @@ class PPUBackend(BaseBackend):
         ppu.passes.ttppugpuir.add_aiu_lowering(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
-        passes.ttgpuir.add_reorder_instructions(pm)
+        # flagtree keep smem read order
+        passes.ttgpuir.add_reorder_instructions(pm, knobs.compilation.keep_smem_read_order)
         if tle is not None:
             tle.passes.add_lower_async_load(pm)
         passes.ttir.add_loop_aware_cse(pm)

@@ -216,7 +216,9 @@ static std::optional<PaddingSelect> matchPaddingSelect(Value other) {
 // The pointer of a rewritten descriptor load is
 //   addptr(..., broadcast(muli(offsets, splat(stride))))
 // per dimension, innermost last. Replaces the innermost product by its
-// offsets when the stride is not already a constant.
+// offsets when the stride is not already a constant: the innermost stride of
+// a descriptor is 1 (TensorDescriptor and make_tensor_descriptor require it),
+// and the constant lets the axis analysis see the contiguity.
 static void dropInnermostStride(tt::LoadOp load) {
   auto addptr = load.getPtr().getDefiningOp<tt::AddPtrOp>();
   if (!addptr)
@@ -319,10 +321,20 @@ static LogicalResult zeroPadCopyLoad(tt::LoadOp load,
   dropInnermostStride(load);
   if (auto bits = load->getAttrOfType<IntegerAttr>(kDescriptorDivisibilityAttr))
     hintDescriptorAlignment(load, bits.getInt());
-  if (!padding->padding || !asserted.insert(padding->padding).second)
+  if (!padding->padding)
     return success();
-  // The flag is a kernel argument or a constant: check it once, where it is
-  // defined, so that every copy of the descriptor is covered.
+  // A descriptor made in the kernel has a constant flag: reject NaN padding
+  // at compile time.
+  if (auto constant = padding->padding.getDefiningOp<arith::ConstantIntOp>())
+    return constant.value() == 0
+               ? success()
+               : load.emitOpError("PPU descriptor copies to shared memory pad "
+                                  "with zero; the descriptor asks for NaN "
+                                  "padding");
+  if (!asserted.insert(padding->padding).second)
+    return success();
+  // The flag of a host descriptor is a kernel argument: check it once, where
+  // it is defined, so that every copy of the descriptor is covered.
   OpBuilder builder(load.getContext());
   if (Operation *def = padding->padding.getDefiningOp())
     builder.setInsertionPointAfter(def);

@@ -36,7 +36,7 @@ pytestmark = pytest.mark.skipif(not is_ppu(), reason="requires the PPU backend")
 
 def _check_lowered(ck, *, copies):
     ttgir = ck.asm["ttgir"]
-    assert "tle.pipe" not in ttgir
+    assert "tle.pipe." not in ttgir
     assert "ttng.wait_barrier_named" in ttgir and "ttng.arrive_barrier_named" in ttgir
     if copies:
         assert "ttg.async_copy_global_to_local" in ttgir and "ttg.async_wait" in ttgir
@@ -149,7 +149,7 @@ def test_pipe_mixed_readers_keep_copies_in_flight(capacity, depth, n_tiles):
         assert torch.count_nonzero(remote_out).item() == 0
     _check_lowered(ck, copies=True)
     if n_tiles >= 2:
-        assert "num = 1 : i32, ppugpu.pipe_wait" in ck.asm["ttgir"]
+        assert "num = 1 : i32, tle.pipe_wait" in ck.asm["ttgir"]
 
 
 @pytest.mark.parametrize("mode", [1, 2])
@@ -395,7 +395,7 @@ def test_pipe_one_shot():
     torch.cuda.synchronize()
     torch.testing.assert_close(y, x + 1)
     ttgir = ck.asm["ttgir"]
-    assert "tle.pipe" not in ttgir
+    assert "tle.pipe." not in ttgir
     # A one_shot pipe has no empty barriers: one full barrier, arrived once and waited once.
     assert ttgir.count("ttng.arrive_barrier_named") == 1 and ttgir.count("ttng.wait_barrier_named") == 1
 
@@ -432,7 +432,7 @@ def test_pipe_same_warps(n_tiles):
     torch.cuda.synchronize()
     torch.testing.assert_close(y, 3 * x)
     ttgir = ck.asm["ttgir"]
-    assert "tle.pipe" not in ttgir
+    assert "tle.pipe." not in ttgir
     # Same warps on both ends: ordering barriers only, no hardware hand-over.
     assert "ttng.wait_barrier_named" not in ttgir and "ttg.local_barrier" in ttgir
     assert "ttg.async_wait" in ttgir
@@ -479,7 +479,7 @@ def _quad_consumer(r0, r1, r2, r3, y, n_tiles, BLOCK: tl.constexpr):
 
 @triton.jit
 def _quad_ring_kernel(x, y, n_tiles, CAPACITY: tl.constexpr, BLOCK: tl.constexpr):
-    # 4 pipes x 2 x CAPACITY barriers exceed the 12 hardware barriers left to TLE.
+    # 4 pipes x 2 x CAPACITY barriers exceed the 13 hardware barriers left to TLE.
     ring0 = tle.gpu.alloc([CAPACITY, BLOCK], dtype=tl.float32, layout=None, scope=tle.gpu.smem)
     ring1 = tle.gpu.alloc([CAPACITY, BLOCK], dtype=tl.float32, layout=None, scope=tle.gpu.smem)
     ring2 = tle.gpu.alloc([CAPACITY, BLOCK], dtype=tl.float32, layout=None, scope=tle.gpu.smem)
@@ -506,8 +506,8 @@ def test_pipe_software_barrier_fallback(n_tiles):
     scale = torch.tensor([1.0, 2.0, 3.0, 4.0], device="cuda").repeat_interleave(block).repeat(n_tiles)
     torch.testing.assert_close(y, x * scale)
     ttgir = ck.asm["ttgir"]
-    assert "tle.pipe" not in ttgir
-    # The first pipe takes 8 hardware barriers; the remaining 4 ids cannot hold another pipe,
+    assert "tle.pipe." not in ttgir
+    # The first pipe takes 8 hardware barriers; the remaining 5 ids cannot hold another pipe,
     # so the other three spin on shared-memory counters.
     assert "ttng.wait_barrier_named" in ttgir
     assert "scf.while" in ttgir

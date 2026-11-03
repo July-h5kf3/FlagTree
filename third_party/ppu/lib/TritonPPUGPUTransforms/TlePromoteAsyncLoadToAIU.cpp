@@ -23,9 +23,9 @@
 
 #include "TritonPPUGPUToLLVM/AIUUtility.h"
 #include "TritonPPUGPUTransforms/Passes.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
-#include "triton/Dialect/Triton/IR/Utility.h"
 
 namespace mlir {
 
@@ -43,6 +43,33 @@ static bool isAIULoadElementType(Type elemTy) {
   return bitWidth == 8 || bitWidth == 16 || bitWidth == 32;
 }
 
+// The make_tensor_ptr a block pointer comes from, through tt.advance and the
+// iteration arguments and results of scf.for; null for any other producer
+// (triton::getMakeTensorPtrOp asserts on those).
+static triton::MakeTensorPtrOp findMakeTensorPtrOp(Value ptr) {
+  while (true) {
+    if (auto arg = dyn_cast<BlockArgument>(ptr)) {
+      auto forOp = dyn_cast<scf::ForOp>(arg.getOwner()->getParentOp());
+      if (!forOp || arg.getArgNumber() == 0)
+        return nullptr;
+      ptr = forOp.getInitArgs()[arg.getArgNumber() - 1];
+      continue;
+    }
+    Operation *def = ptr.getDefiningOp();
+    if (auto makeTensorPtr = dyn_cast<triton::MakeTensorPtrOp>(def))
+      return makeTensorPtr;
+    if (auto advance = dyn_cast<triton::AdvanceOp>(def)) {
+      ptr = advance.getPtr();
+      continue;
+    }
+    if (auto forOp = dyn_cast<scf::ForOp>(def)) {
+      ptr = forOp.getInitArgs()[cast<OpResult>(ptr).getResultNumber()];
+      continue;
+    }
+    return nullptr;
+  }
+}
+
 // The copy reads a 2-D tile with one unit-stride dimension and fills
 // everything out of bounds with zeros. Rows that are a constant stride apart
 // must fit the descriptor (see AIUUtility.h); a run-time stride is checked
@@ -51,7 +78,9 @@ static bool isAIULoadLayout(triton::LoadOp loadOp) {
   if (cast<RankedTensorType>(loadOp.getType()).getRank() != 2 ||
       loadOp.getPadding() == triton::PaddingOption::PAD_NAN)
     return false;
-  auto makeTensorPtr = triton::getMakeTensorPtrOp(loadOp.getPtr());
+  auto makeTensorPtr = findMakeTensorPtrOp(loadOp.getPtr());
+  if (!makeTensorPtr)
+    return false;
   ArrayRef<int32_t> order = makeTensorPtr.getOrder();
   auto strides = makeTensorPtr.getStrides();
   auto shape = makeTensorPtr.getShape();

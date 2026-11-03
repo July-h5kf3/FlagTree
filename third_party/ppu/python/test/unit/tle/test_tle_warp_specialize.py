@@ -6,6 +6,12 @@
 * ``buffered_tensor.subslice`` as a dot operand of a swizzled ring slot.
 """
 
+import os
+import re
+import subprocess
+import sys
+import textwrap
+
 import pytest
 import torch
 
@@ -78,10 +84,122 @@ def test_warp_specialize_named_barrier_ring(n_tiles):
     torch.testing.assert_close(y, 3 * x)
     assert ck.metadata.num_warps == 8
     assert "ttg.warp_specialize" in ck.asm["ttgir"]
-    # one hardware named barrier per barrier slot, waited for and arrived at
+    # one hardware named barrier per barrier slot, waited for and arrived at by
+    # the THREADS of both groups, with the shared-memory fence
     llir = ck.asm["llir"]
-    assert "__ppukernel_barrier_sync_cnt_void" in llir
-    assert "__ppukernel_barrier_arrive_void" in llir
+    assert re.search(r"__ppukernel_barrier_sync_cnt_void\(i32 [^,]+, i32 256, i32 1\)", llir)
+    assert re.search(r"__ppukernel_barrier_arrive_void\(i32 [^,]+, i32 256, i32 1\)", llir)
+
+
+# ---------------------------------------------------------------- lowering paths of warp_specialize
+
+
+@triton.jit
+def _sum_rows_partition(x, y, rows, BLOCK: tl.constexpr):
+    # A reduction over several warps converts layouts through shared memory,
+    # and debug_barrier is a CTA barrier: both become barriers of this warp
+    # group, with its thread count.
+    for r in range(rows):
+        v = tl.load(x + r * BLOCK + tl.arange(0, BLOCK))
+        tl.store(y + r, tl.sum(v))
+        tl.debug_barrier()
+
+
+@triton.jit
+def _sum_rows_kernel(x, y, z, rows, BLOCK: tl.constexpr, WORKER_WARPS: tl.constexpr):
+    tle.gpu.warp_specialize([(_sum_rows_partition, (x, y, rows, BLOCK)), (_sum_rows_partition, (x, z, rows, BLOCK))],
+                            [WORKER_WARPS], [128])
+
+
+@pytest.mark.parametrize("worker_warps", [1, 4])
+def test_reductions_in_default_and_worker_partitions(worker_warps):
+    """The default warps reduce on barrier 0 with their own thread count while
+    the worker runs; a single-warp worker reduces on a 32-thread barrier."""
+    rows, block = 64, 256
+    x = torch.randn(rows, block, device="cuda")
+    y = torch.zeros(rows, device="cuda")
+    z = torch.zeros(rows, device="cuda")
+    ck = _sum_rows_kernel[(1, )](x, y, z, rows, BLOCK=block, WORKER_WARPS=worker_warps, num_warps=4)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(y, x.sum(1))
+    torch.testing.assert_close(z, x.sum(1))
+    llir = ck.asm["llir"]
+    assert re.search(r"__ppukernel_barrier_sync_cnt_void\(i32 0, i32 128, i32 31\)", llir)
+    assert re.search(rf"__ppukernel_barrier_sync_cnt_void\(i32 2, i32 {32 * worker_warps}, i32 31\)", llir)
+
+
+@triton.jit(noinline=True)
+def _sum_row_helper(x, y, r, BLOCK: tl.constexpr):
+    v = tl.load(x + r * BLOCK + tl.arange(0, BLOCK))
+    tl.store(y + r, tl.sum(v))
+
+
+@triton.jit
+def _helper_partition(x, y, rows, BLOCK: tl.constexpr):
+    for r in range(rows):
+        _sum_row_helper(x, y, r, BLOCK)
+
+
+@triton.jit
+def _helper_kernel(x, y, z, rows, BLOCK: tl.constexpr):
+    tle.gpu.warp_specialize([(_helper_partition, (x, y, rows, BLOCK)), (_helper_partition, (x, z, rows, BLOCK))], [4],
+                            [128])
+
+
+def test_reduction_in_noinline_helper():
+    """A helper that is not inlined gets the barrier of its caller's warp
+    group as an argument."""
+    rows, block = 64, 256
+    x = torch.randn(rows, block, device="cuda")
+    y = torch.zeros(rows, device="cuda")
+    z = torch.zeros(rows, device="cuda")
+    _helper_kernel[(1, )](x, y, z, rows, BLOCK=block, num_warps=4)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(y, x.sum(1))
+    torch.testing.assert_close(z, x.sum(1))
+
+
+@triton.jit
+def _capture_partition(v, y, BLOCK: tl.constexpr):
+    tl.store(y + tl.arange(0, BLOCK), tl.zeros([BLOCK], dtype=tl.float32) + v)
+
+
+@triton.jit
+def _capture_kernel(x, y, BLOCK: tl.constexpr):
+    v = tl.load(x) + tl.load(x + 1)
+    tle.gpu.warp_specialize([(_idle, ()), (_capture_partition, (v, y, BLOCK))], [4], [128])
+
+
+def test_capture_passed_through_shared_memory():
+    """A value loaded before the warp_specialize reaches the worker through
+    shared memory (a special register or constant would be recomputed)."""
+    block = 256
+    x = torch.randn(2, device="cuda")
+    y = torch.zeros(block, device="cuda")
+    ck = _capture_kernel[(1, )](x, y, BLOCK=block, num_warps=4)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(y, torch.full((block, ), (x[0] + x[1]).item(), device="cuda"))
+    assert "partition0(%" in ck.asm["ttgir"]
+
+
+@triton.jit
+def _looped_kernel(x, y, z, rounds, BLOCK: tl.constexpr):
+    for i in range(rounds):
+        tle.gpu.warp_specialize([(_sum_rows_partition, (x + i * BLOCK, y + i, 1, BLOCK)),
+                                 (_sum_rows_partition, (x + i * BLOCK, z + i, 1, BLOCK))], [4], [128])
+
+
+def test_warp_specialize_in_a_loop():
+    """Each execution publishes a new partition state to the workers and
+    collects them again; without a pipe, nothing carries over."""
+    rounds, block = 16, 256
+    x = torch.randn(rounds, block, device="cuda")
+    y = torch.zeros(rounds, device="cuda")
+    z = torch.zeros(rounds, device="cuda")
+    _looped_kernel[(1, )](x, y, z, rounds, BLOCK=block, num_warps=4)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(y, x.sum(1))
+    torch.testing.assert_close(z, x.sum(1))
 
 
 @triton.jit
@@ -181,3 +299,34 @@ def test_loop_invariant_operand_of_refilled_slot(n_blk):
     torch.cuda.synchronize()
     ref = sum(a.float() @ b[k].float() for k in range(n_blk))
     torch.testing.assert_close(out, ref, atol=1e-2 * n_blk, rtol=1e-2)
+
+
+_READ_ORDER_SCRIPT = textwrap.dedent("""
+    import importlib.util
+    import sys
+    import torch
+
+    spec = importlib.util.spec_from_file_location("ws", sys.argv[1])
+    ws = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ws)
+    bm, bk, bn, n_blk = 64, 64, 128, 3
+    a = torch.randn(bm, bk, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(n_blk, bk, bn, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty(bm, bn, device="cuda", dtype=torch.float32)
+    ck = ws._staged_operand_kernel[(1, )](a, b, out, n_blk, BM=bm, BN=bn, BK=bk, num_warps=4, num_stages=1)
+    ttgir = ck.asm["ttgir"]
+    print("loads before the loop:", ttgir[:ttgir.index("scf.for")].count("ttg.local_load"))
+""")
+
+
+@pytest.mark.parametrize("keep", ["1", "0"])
+def test_keep_smem_read_order_knob(tmp_path, keep):
+    """FLAGTREE_KEEP_SMEM_READ_ORDER reaches the passes: off, the read of a is re-issued inside the loop, after the
+    refills, as upstream does. A subprocess, since the in-process kernel cache does not key on the knob."""
+    script = tmp_path / "read_order.py"
+    script.write_text(_READ_ORDER_SCRIPT)
+    env = dict(os.environ, FLAGTREE_KEEP_SMEM_READ_ORDER=keep, TRITON_CACHE_DIR=str(tmp_path / "cache"))
+    result = subprocess.run([sys.executable, str(script), __file__], capture_output=True, text=True, timeout=300,
+                            env=env)
+    assert result.returncode == 0, result.stderr
+    assert f"loads before the loop: {keep}" in result.stdout

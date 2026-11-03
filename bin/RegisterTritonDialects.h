@@ -66,6 +66,10 @@
 #include "TritonPPUGPUTransforms/Passes.h"
 #endif
 
+#if defined(__PPU__) && defined(__TLE__)
+#include "TritonPPUGPUTransforms/Passes.h"
+#endif
+
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonInstrument/Transforms/Passes.h"

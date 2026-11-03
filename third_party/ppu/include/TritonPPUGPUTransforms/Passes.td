@@ -79,8 +79,15 @@ def TritonPPUTleLowerPipe : Pass<"tritonppu-tle-lower-pipe", "mlir::ModuleOp"> {
     - CTA-scoped pipes with one writer warp group and one reader per group,
       named or default; pipes that only order accesses inside one group lower
       to group barriers and need no hand-over.
-    - Capacity 1 and above; close and one_shot. A writer that runs its pipe
-      twice without an intervening reader drains is a hang, not diagnosed.
+    - A pipe handing over between warp groups is created, and its
+      warp_specialize runs, once per kernel: the hardware barriers keep their
+      state across executions, so neither may sit inside a loop (a persistent
+      kernel loops inside the partitions).
+    - Capacity 1 and above; close, or one_shot without close, as on NVIDIA.
+      A writer that runs its pipe twice without an intervening reader drains
+      is a hang, not diagnosed. The phase of the lifecycle ops continues
+      across the loops of a kernel, as on NVIDIA: the hardware barriers do not
+      read it, the shared-memory counters do.
     - cp.async payloads published through pipe.writer.commit; a stage is
       published only after its copies completed.
 

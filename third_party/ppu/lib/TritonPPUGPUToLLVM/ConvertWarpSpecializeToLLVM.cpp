@@ -137,10 +137,10 @@ static void retargetCtaBarrier(Operation *op, Value barIdx,
                                unsigned numThreads) {
   TritonLLVMIRRewriter b(op->getLoc(), op);
   unsigned fence = kPPUBarrierFenceAll;
-  if (auto call = dyn_cast<LLVM::CallOp>(op)) {
-    auto cst = call.getCalleeOperands()[2].getDefiningOp<LLVM::ConstantOp>();
-    fence = cast<IntegerAttr>(cst.getValue()).getInt();
-  }
+  if (auto call = dyn_cast<LLVM::CallOp>(op))
+    if (auto cst =
+            call.getCalleeOperands()[2].getDefiningOp<LLVM::ConstantOp>())
+      fence = cast<IntegerAttr>(cst.getValue()).getInt();
   createPPUBarrierSync(b, op->getLoc(), barIdx, numThreads, fence);
   op->erase();
 }

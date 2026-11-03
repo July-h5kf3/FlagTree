@@ -35,10 +35,11 @@ namespace {
 #ifdef __TLE__
 // TLE named barriers (tle.gpu.barrier_wait/arrive without a phase) lower to PPU
 // hardware barriers. They order shared memory between warp groups, so the
-// issuing warp drains only its shared-memory stores; its outstanding global
-// accesses keep flowing (draining them costs ~3000 cycles per barrier).
-// Asynchronous copies are covered by the explicit async_wait the producer
-// issues before signalling.
+// issuing warp drains only its shared-memory accesses; its outstanding global
+// accesses keep flowing (draining them costs ~3000 cycles per barrier), so
+// unlike bar.sync on NVIDIA they do not order global memory between the
+// groups. Asynchronous copies are covered by the explicit async_wait the
+// producer issues before signalling.
 unsigned getNumThreads(Value numThreads) {
   if (auto cst = numThreads.getDefiningOp<LLVM::ConstantOp>())
     if (auto attr = dyn_cast<IntegerAttr>(cst.getValue()))
