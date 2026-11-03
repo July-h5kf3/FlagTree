@@ -18,7 +18,8 @@ inline unsigned scheduleMlaPvTailImpl(llvm::Module &module, unsigned threads,
     if (function.isDeclaration() ||
         function.getCallingConv() != CallingConv::PTX_Kernel ||
         !function.hasFnAttribute("ppu.mla.kv.pipeline") ||
-        function.hasFnAttribute("ppu.mla.pv.tail_schedule"))
+        function.hasFnAttribute("ppu.mla.pv.tail_schedule") ||
+        function.hasFnAttribute("ppu.mla.pv.batch"))
       continue;
     BasicBlock *tail = nullptr;
     for (BasicBlock &block : function)

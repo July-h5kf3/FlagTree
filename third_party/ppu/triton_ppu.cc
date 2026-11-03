@@ -141,7 +141,8 @@ void init_triton_ppu(py::module &&m) {
         &::triton::ppu::publishSharedFloatScalesEarly);
   m.def("prefetch_mla_nope", &::triton::ppu::prefetchMlaNopeFragments);
   m.def("scalarize_mla_pv", &::triton::ppu::scalarizeMlaPv, py::arg("module"),
-        py::arg("threads"), py::arg("shared"), py::arg("allow_p15") = false);
+        py::arg("threads"), py::arg("shared"), py::arg("allow_p15") = false,
+        py::arg("batch_tiles") = 0);
   auto passes = m.def_submodule("passes");
   init_triton_ppu_passes_ttgpuir(passes.def_submodule("ttgpuir"));
   init_triton_ppu_passes_ttppugpuir(passes.def_submodule("ttppugpuir"));

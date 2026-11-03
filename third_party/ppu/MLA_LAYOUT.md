@@ -140,3 +140,10 @@ instructions. Loop indices retain their original 32-bit or 64-bit type.
 The two FP32 scale planes raise encoded shared storage from 94208 to 94464
 bytes. Two signed INT8 PV products and FP32 recurrence state are preserved.
 This option also defaults to false; existing configurations keep their lowering.
+
+The 64-head path schedules PV in batches of four independent output tiles.
+The dependency graph retains every original MMA input and FP32 expression,
+while completing a batch before starting more output state. The same KV-reader
+proof permits the next copy with 51 PV MMA instructions remaining. This whole
+PV schedule replaces the separate continuation-only tail schedule on that path;
+the 32-head path retains its existing continuation schedule.

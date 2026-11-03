@@ -104,8 +104,10 @@ inline bool pure(llvm::Instruction &instruction) {
 
 template <unsigned Width>
 inline unsigned rewrite(llvm::Function &function, bool allowP15,
-                        unsigned threads = 512) {
+                        unsigned threads = 512, unsigned batchTiles = 0) {
   using namespace llvm;
+  if (batchTiles && (batchTiles != 4 || Width != 64 || threads != 512))
+    return 0;
   SmallVector<CallInst *> products;
   for (BasicBlock &block : function)
     for (Instruction &instruction : block)
@@ -331,31 +333,64 @@ inline unsigned rewrite(llvm::Function &function, bool allowP15,
       emit(operand);
     ordered.push_back(instruction);
   };
-  for (unsigned index = 0; index < 64; ++index) {
-    emit(products[index + 32]);
-    for (auto *word : outputs[index])
-      emit(word);
-  }
-  for (Value *word : terminalOrder)
+  if (batchTiles) {
+    // Finish a bounded set of independent output tiles before starting more.
+    // Every producer is selected from the already-proved writer-free region.
+    for (unsigned start = 0; start < Width; start += batchTiles * 8) {
+      SmallPtrSet<Instruction *, 32> needed;
+      std::function<void(Value *)> collect = [&](Value *value) {
+        auto *instruction = dyn_cast<Instruction>(value);
+        if (!instruction || !members.contains(instruction) ||
+            !needed.insert(instruction).second)
+          return;
+        for (Value *operand : instruction->operands())
+          collect(operand);
+      };
+      unsigned end = std::min<unsigned>(Width, start + batchTiles * 8);
+      for (unsigned lane = start; lane < end; ++lane)
+        collect(scalars[roots[lane]]);
+      for (unsigned index = 0; index < 64; ++index) {
+        if (!needed.contains(products[index + 32]))
+          continue;
+        emit(products[index + 32]);
+        for (auto *word : outputs[index])
+          emit(word);
+      }
+      for (unsigned lane = start; lane < end; ++lane)
+        emit(scalars[roots[lane]]);
+    }
+  } else {
+    for (unsigned index = 0; index < 64; ++index) {
+      emit(products[index + 32]);
+      for (auto *word : outputs[index])
+        emit(word);
+    }
+    for (Value *word : terminalOrder)
+      for (unsigned index = 0; index < Width; ++index)
+        if (laneWord[index] == word)
+          emit(scalars[roots[index]]);
     for (unsigned index = 0; index < Width; ++index)
-      if (laneWord[index] == word)
+      if (!laneWord[index])
         emit(scalars[roots[index]]);
-  for (unsigned index = 0; index < Width; ++index)
-    if (!laneWord[index])
-      emit(scalars[roots[index]]);
+  }
   for (auto *instruction : region)
     emit(instruction);
   for (auto *instruction : ordered)
     instruction->moveBefore(*block, block->getTerminator()->getIterator());
+  if (batchTiles)
+    function.addFnAttr("ppu.mla.pv.batch", "4");
   return 1;
 }
 
 } // namespace mla_pv_scalarization
 
 inline unsigned scalarizeMlaPv(llvm::Module &module, unsigned threads,
-                               unsigned shared, bool allowP15 = false) {
+                               unsigned shared, bool allowP15 = false,
+                               unsigned batchTiles = 0) {
   if (!((threads == 512 && (shared == 168192 || shared == 123392)) ||
         (threads == 256 && shared == 94464)))
+    return 0;
+  if (batchTiles && (batchTiles != 4 || threads != 512 || shared != 123392))
     return 0;
   unsigned changed = 0;
   for (llvm::Function &function : module)
@@ -364,7 +399,8 @@ inline unsigned scalarizeMlaPv(llvm::Module &module, unsigned threads,
       changed +=
           shared == 168192
               ? mla_pv_scalarization::rewrite<32>(function, allowP15, threads)
-              : mla_pv_scalarization::rewrite<64>(function, allowP15, threads);
+              : mla_pv_scalarization::rewrite<64>(function, allowP15, threads,
+                                                  batchTiles);
   return changed;
 }
 

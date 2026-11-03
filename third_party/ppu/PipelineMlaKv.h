@@ -36,7 +36,10 @@ inline unsigned run(llvm::Function &function, unsigned shared, bool reusePages,
   bool h32 = threads == 256 && shared == 94464;
   unsigned kvBytes = small || h32 ? 65536 : 131072;
   unsigned pageStep = small || h32 ? 2 : 4;
-  unsigned remainingProducts = h32 ? 37 : (small ? 39 : 35);
+  bool pvBatch =
+      threads == 512 && shared == 123392 &&
+      function.getFnAttribute("ppu.mla.pv.batch").getValueAsString() == "4";
+  unsigned remainingProducts = pvBatch ? 51 : (h32 ? 37 : (small ? 39 : 35));
   SmallVector<CallInst *> products, copies;
   DenseMap<Instruction *, unsigned> position;
   for (BasicBlock &block : function)

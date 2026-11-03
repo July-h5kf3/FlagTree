@@ -658,7 +658,8 @@ class PPUBackend(BaseBackend):
                 and metadata["mla_nope_fragments_prefetched"] == 1
                 and metadata["shared_float_scales_published_early"] == 1):
             metadata["mla_pv_scalarized"] = ppu.scalarize_mla_pv(llvm_mod, 512, metadata["shared"],
-                                                                 options.ppu_scalarize_mla_p15 or h64)
+                                                                 options.ppu_scalarize_mla_p15 or h64, 4 if h64 else 0)
+        metadata["mla_pv_batches_scheduled"] = 4 if h64 and metadata["mla_pv_scalarized"] == 1 else 0
         metadata["mla_kv_pipelined"] = 0
         metadata["mla_kv_page_results_reused"] = 0
         if ((options.ppu_pipeline_mla_kv or h64) and capability == 80 and metadata["mla_pv_scalarized"] == 1
