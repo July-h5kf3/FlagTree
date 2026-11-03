@@ -103,7 +103,8 @@ inline bool pure(llvm::Instruction &instruction) {
 }
 
 template <unsigned Width>
-inline unsigned rewrite(llvm::Function &function, bool allowP15) {
+inline unsigned rewrite(llvm::Function &function, bool allowP15,
+                        unsigned threads = 512) {
   using namespace llvm;
   SmallVector<CallInst *> products;
   for (BasicBlock &block : function)
@@ -122,7 +123,7 @@ inline unsigned rewrite(llvm::Function &function, bool allowP15) {
   for (Instruction &instruction : *block) {
     if (&instruction == products[32])
       break;
-    if (early_shared_float_scales::barrier(&instruction))
+    if (early_shared_float_scales::barrier(&instruction, threads))
       publication = &instruction;
   }
   if (!publication)
@@ -353,15 +354,17 @@ inline unsigned rewrite(llvm::Function &function, bool allowP15) {
 
 inline unsigned scalarizeMlaPv(llvm::Module &module, unsigned threads,
                                unsigned shared, bool allowP15 = false) {
-  if (threads != 512 || (shared != 168192 && shared != 123392))
+  if (!((threads == 512 && (shared == 168192 || shared == 123392)) ||
+        (threads == 256 && shared == 94464)))
     return 0;
   unsigned changed = 0;
   for (llvm::Function &function : module)
     if (!function.isDeclaration() &&
         function.getCallingConv() == llvm::CallingConv::PTX_Kernel)
-      changed += shared == 123392
-                     ? mla_pv_scalarization::rewrite<64>(function, allowP15)
-                     : mla_pv_scalarization::rewrite<32>(function, allowP15);
+      changed +=
+          shared == 168192
+              ? mla_pv_scalarization::rewrite<32>(function, allowP15, threads)
+              : mla_pv_scalarization::rewrite<64>(function, allowP15, threads);
   return changed;
 }
 

@@ -30,8 +30,9 @@ module attributes {"ttg.num-warps" = 16 : i32, "ttg.num-ctas" = 1 : i32, "ttg.th
 """
 
 
+@pytest.mark.parametrize('geometry', ['legacy', 'h64', 'h32'])
 @pytest.mark.parametrize('case', ['aligned', 'unaligned', 'nonzero_padding', 'escaped_initializer', 'different_phase'])
-def test_mla_async_kv(case, tmp_path):
+def test_mla_async_kv(case, geometry, tmp_path):
     text = MODULE
     if case == 'unaligned':
         text = text.replace('tt.divisibility = 16', 'tt.divisibility = 1')
@@ -46,6 +47,12 @@ def test_mla_async_kv(case, tmp_path):
         text = text.replace('maxPhase = 16', 'maxPhase = 8')
     else:
         assert case == 'aligned'
+    if geometry != 'legacy':
+        text = text.replace('256', '128')
+        text = text.replace('module attributes {', f'module attributes {{ppu.mla_{geometry}_k128_pv_layout = 1 : i32, ')
+    if geometry == 'h32':
+        text = text.replace('warpsPerCTA = [16, 1]',
+                            'warpsPerCTA = [8, 1]').replace('"ttg.num-warps" = 16', '"ttg.num-warps" = 8')
     context = ir.context()
     ir.load_dialects(context)
     ppu.load_dialects(context)

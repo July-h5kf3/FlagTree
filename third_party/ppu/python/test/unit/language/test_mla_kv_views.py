@@ -70,14 +70,20 @@ def test_mla_kv_views(case, tmp_path):
         assert str(module) == before
 
 
+@pytest.mark.parametrize('geometry', ['h64', 'h32'])
 @pytest.mark.parametrize('case', ['reuse', 'marker_off', 'duplicate_root', 'insufficient_alignment', 'mutable'])
-def test_mla_h64_kv_views(case, tmp_path):
+def test_mla_k128_kv_views(case, geometry, tmp_path):
     text = MODULE.replace('256x512', '128x512').replace('512x256', '512x128')
     text = text.replace('[128, 0]', '[64, 0]').replace('warp = [[16, 0], [32, 0], [64, 0]',
                                                        'warp = [[16, 0], [32, 0], [0, 0]')
     text = text.replace('warpsPerCTA = [2, 8]', 'warpsPerCTA = [4, 4]')
+    if geometry == 'h32':
+        text = text.replace('warpsPerCTA = [16, 1]',
+                            'warpsPerCTA = [8, 1]').replace('"ttg.num-warps" = 16', '"ttg.num-warps" = 8')
+        text = text.replace('warpsPerCTA = [4, 4]', 'warpsPerCTA = [2, 4]')
+        text = text.replace('warp = [[16, 0], [32, 0], [0, 0], [0, 0]]', 'warp = [[16, 0], [32, 0], [0, 0]]')
     if case != 'marker_off':
-        text = text.replace('module attributes {', 'module attributes {ppu.mla_h64_k128_pv_layout = 1 : i32, ')
+        text = text.replace('module attributes {', f'module attributes {{ppu.mla_{geometry}_k128_pv_layout = 1 : i32, ')
     allocation = next(line for line in text.splitlines() if '%root = ttg.local_alloc' in line)
     if case == 'duplicate_root':
         text = text.replace(allocation, allocation + '\n' + allocation.replace('%root =', '%extra_root ='))

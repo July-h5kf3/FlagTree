@@ -2,11 +2,12 @@ import pytest
 from triton._C.libtriton import ir, ppu
 
 
+@pytest.mark.parametrize('geometry', ['legacy', 'h64', 'h32'])
 @pytest.mark.parametrize('case', [
     'arg', 'program', 'load', 'addptr', 'reduce', 'opaque_end', 'opaque_start', 'volatile', 'private', 'block_argument',
     'step', 'nested', 'none'
 ])
-def test_uniform(case, tmp_path):
+def test_uniform(case, geometry, tmp_path):
     source = '  %end = arith.addi %arg, %c4 : i32'
     start = '%c0'
     inner = ''
@@ -50,6 +51,11 @@ module attributes {{"ttg.num-warps" = 16 : i32, "ttg.num-ctas" = 1 : i32, "ttg.t
   cf.br ^next(%opaque : i32)
  ^next(%end: i32):''')
     if case == 'none': text = text.replace(f'  scf.for %i = {start} to {upper} step %c4 : i32 {{\n{inner}\n  }}', '')
+    if geometry != 'legacy':
+        text = text.replace('module attributes {', f'module attributes {{ppu.mla_{geometry}_k128_pv_layout = 1 : i32, ')
+    if geometry == 'h32':
+        text = text.replace('warpsPerCTA = [16]', 'warpsPerCTA = [8]').replace('"ttg.num-warps" = 16',
+                                                                               '"ttg.num-warps" = 8')
     context = ir.context()
     ir.load_dialects(context)
     ppu.load_dialects(context)
@@ -58,5 +64,6 @@ module attributes {{"ttg.num-warps" = 16 : i32, "ttg.num-ctas" = 1 : i32, "ttg.t
     module = ir.parse_mlir_module(str(path), context)
     module.context = context
     before = str(module)
-    assert ppu.prove_uniform_mla_loop(module) == int(case in ('arg', 'program', 'load', 'addptr', 'reduce'))
+    assert ppu.prove_uniform_mla_loop(module) == int(case in ('arg', 'program', 'load', 'addptr', 'reduce')
+                                                     or (case == 'step' and geometry != 'legacy'))
     assert str(module) == before

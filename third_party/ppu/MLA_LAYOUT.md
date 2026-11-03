@@ -127,6 +127,16 @@ configuration space without forwarding unsupported option keywords.
 reuses the 64 KiB KV buffer, hoists eight query fragments, publishes FP32
 scales, streams NoPE/PV operands, and pipelines the next KV tile before the
 remaining PV instructions. The same address, writer, SSA and uniform-loop
-proofs apply to both supported geometries. Encoded shared storage is 123392
+proofs apply to these supported geometries. Encoded shared storage is 123392
 bytes. Two signed INT8 PV products and FP32 recurrence state are preserved.
 The option defaults to false; unsupported shapes keep their existing lowering.
+
+`ppu_mla_h32_k128` enables the 32-head, 128-token path on an eight-warp
+PPU CTA. It uses a `[1, 8]` PV warp layout and a 64 KiB shared KV buffer.
+Query fragments remain in shared memory. FP32 scale publication, NoPE/PV
+streaming and KV prefetch use the same effect and SSA checks with the actual
+256-thread CTA: 16 copies, 64 unique PV word readers and 37 remaining PV MMA
+instructions. Loop indices retain their original 32-bit or 64-bit type.
+The two FP32 scale planes raise encoded shared storage from 94208 to 94464
+bytes. Two signed INT8 PV products and FP32 recurrence state are preserved.
+This option also defaults to false; existing configurations keep their lowering.

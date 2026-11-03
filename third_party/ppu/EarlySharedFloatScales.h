@@ -13,8 +13,8 @@
 namespace triton::ppu {
 namespace early_shared_float_scales {
 
-inline bool barrier(llvm::Instruction *instruction) {
-  return readonly_shared_matrices::ctaBarrier(instruction);
+inline bool barrier(llvm::Instruction *instruction, unsigned threads = 512) {
+  return readonly_shared_matrices::ctaBarrier(instruction, threads);
 }
 
 inline bool vector2(llvm::Type *type) {
@@ -66,7 +66,7 @@ inline unsigned rewrite(llvm::Function &function, unsigned shared,
   for (Instruction &instruction : *header) {
     if (&instruction == products.front())
       break;
-    if (barrier(&instruction))
+    if (barrier(&instruction, threads))
       headerBarrier = true;
     bool writes = false;
     if (auto *store = dyn_cast<StoreInst>(&instruction))
@@ -89,7 +89,7 @@ inline unsigned rewrite(llvm::Function &function, unsigned shared,
   for (Instruction &instruction : *pv) {
     if (&instruction == products[32])
       break;
-    if (barrier(&instruction))
+    if (barrier(&instruction, threads))
       anchor = &instruction;
   }
   if (!anchor)
@@ -108,7 +108,8 @@ inline unsigned rewrite(llvm::Function &function, unsigned shared,
     if (isa<CallBase>(instruction) || instruction->mayReadOrWriteMemory() ||
         isa<FenceInst>(instruction))
       effects.push_back(instruction);
-  if (effects.size() < 8 || !barrier(effects[0]) || !barrier(effects[2]))
+  if (effects.size() < 8 || !barrier(effects[0], threads) ||
+      !barrier(effects[2], threads))
     return shared;
   auto *store0 = dyn_cast<StoreInst>(effects[1]);
   if (!store0 || store0->isVolatile() || store0->isAtomic() ||
@@ -128,7 +129,8 @@ inline unsigned rewrite(llvm::Function &function, unsigned shared,
     phases.push_back(0);
   }
   if (reads.empty() || reads.size() > 8 || index + 3 >= effects.size() ||
-      !barrier(effects[index]) || !barrier(effects[index + 2]))
+      !barrier(effects[index], threads) ||
+      !barrier(effects[index + 2], threads))
     return shared;
   auto *store1 = dyn_cast<StoreInst>(effects[index + 1]);
   if (!store1 || store1->isVolatile() || store1->isAtomic() ||
@@ -247,8 +249,9 @@ inline std::pair<unsigned, unsigned>
 publishSharedFloatScalesEarly(llvm::Module &module, unsigned threads,
                               unsigned shared) {
   using namespace llvm;
-  if (threads != 512 ||
-      (shared != 217088 && shared != 167936 && shared != 122880))
+  if (!((threads == 512 &&
+         (shared == 217088 || shared == 167936 || shared == 122880)) ||
+        (threads == 256 && shared == 94208)))
     return {shared, 0};
   auto *annotations = module.getNamedMetadata("nvvm.annotations");
   if (!annotations)

@@ -15,7 +15,8 @@
 namespace triton::ppu {
 namespace readonly_shared_matrices {
 
-inline bool ctaBarrier(const llvm::Instruction *instruction) {
+inline bool ctaBarrier(const llvm::Instruction *instruction,
+                       unsigned threads = 512) {
   auto *call = llvm::dyn_cast<llvm::CallInst>(instruction);
   auto *callee = call ? call->getCalledFunction() : nullptr;
   if (!callee || !callee->isDeclaration() || !call->getType()->isVoidTy() ||
@@ -29,9 +30,9 @@ inline bool ctaBarrier(const llvm::Instruction *instruction) {
   };
   if (callee->getName() == "llvm.nvvm.barrier.cta.sync.aligned.all")
     return call->arg_size() == 1 && constant(0, 0);
-  // These MLA rewrites only admit a 512-thread CTA, never a warp-group barrier.
+  // The barrier must cover the complete admitted CTA, never a warp group.
   return callee->getName() == "__ppukernel_barrier_sync_cnt_void" &&
-         call->arg_size() == 3 && constant(0, 0) && constant(1, 512) &&
+         call->arg_size() == 3 && constant(0, 0) && constant(1, threads) &&
          (constant(2, 1) || constant(2, 31));
 }
 
@@ -178,7 +179,7 @@ inline bool proveNoQueryWrites(llvm::Loop &loop, const llvm::BitVector &query,
           }
         } else {
           auto *callee = call->getCalledFunction();
-          if (ctaBarrier(call))
+          if (ctaBarrier(call, threads))
             continue;
           if (callee && callee->getName() == "__builtin_ppu_rcpf" &&
               (call->arg_size() != 1 || !call->getType()->isFloatTy() ||
@@ -266,7 +267,7 @@ inline unsigned hoist(llvm::Function &function, unsigned count,
       continue;
     if (call == products.front())
       break;
-    if (ctaBarrier(call))
+    if (ctaBarrier(call, threads))
       barrier = call;
     if (uses.contains(call))
       matrices.push_back(call);
@@ -358,8 +359,10 @@ inline unsigned hoist(llvm::Function &function, unsigned count,
 inline unsigned hoistReadonlySharedMatrices(llvm::Module &module,
                                             unsigned count, unsigned threads,
                                             unsigned sharedBytes) {
-  if ((count != 8 && count != 12 && count != 16) || threads != 512 ||
-      (sharedBytes != 217088 && sharedBytes != 167936 && sharedBytes != 122880))
+  if ((count != 8 && count != 12 && count != 16) ||
+      !((threads == 512 && (sharedBytes == 217088 || sharedBytes == 167936 ||
+                            sharedBytes == 122880)) ||
+        (threads == 256 && sharedBytes == 94208)))
     return 0;
   unsigned changed = 0;
   for (auto &function : module)

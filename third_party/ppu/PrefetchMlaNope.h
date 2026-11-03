@@ -9,6 +9,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include <array>
 #include <functional>
+#include <vector>
 
 namespace triton::ppu {
 namespace mla_nope_prefetch {
@@ -155,7 +156,8 @@ inline std::optional<Fragment> fragment(llvm::CallInst *product,
   return result;
 }
 
-inline unsigned schedule(llvm::Function &function, unsigned shared) {
+inline unsigned schedule(llvm::Function &function, unsigned shared,
+                         unsigned threads = 512) {
   using namespace llvm;
   SmallVector<CallInst *> products;
   DenseMap<Instruction *, unsigned> position;
@@ -192,8 +194,8 @@ inline unsigned schedule(llvm::Function &function, unsigned shared) {
   SmallPtrSet<CallInst *, 32> keyCalls;
   SmallPtrSet<Instruction *, 32> allowedCalls;
   SmallPtrSet<Instruction *, 32> allowedExtracts;
-  std::array<DenseMap<Value *, Constant *>, 512> constants;
-  std::array<DenseMap<Value *, APInt>, 512> integers;
+  std::vector<DenseMap<Value *, Constant *>> constants(threads);
+  std::vector<DenseMap<Value *, APInt>> integers(threads);
   const DataLayout &layout = function.getParent()->getDataLayout();
   DominatorTree dominance(function);
   Instruction *begin = nullptr, *last = nullptr;
@@ -208,11 +210,13 @@ inline unsigned schedule(llvm::Function &function, unsigned shared) {
         !keyCalls.insert(key->call).second)
       return 0;
     ++queries[query->call];
-    for (unsigned tid = 0; tid < 512; ++tid) {
+    for (unsigned tid = 0; tid < threads; ++tid) {
       for (unsigned operand = 0; operand < 2; ++operand) {
         auto *input = operand ? &*key : &*query;
-        int64_t keyBytes =
-            shared == 122880 || shared == 123392 ? 65536 : 131072;
+        int64_t keyBytes = (shared == 122880 || shared == 123392 ||
+                            shared == 94208 || shared == 94464)
+                               ? 65536
+                               : 131072;
         int64_t low = operand ? 0 : keyBytes;
         int64_t high = operand ? keyBytes : shared;
         if (!preparePointer(input->pointer, tid, layout, constants[tid],
@@ -355,14 +359,15 @@ inline unsigned schedule(llvm::Function &function, unsigned shared) {
 
 inline unsigned prefetchMlaNopeFragments(llvm::Module &module, unsigned threads,
                                          unsigned shared) {
-  if (threads != 512 || (shared != 167936 && shared != 168192 &&
-                         shared != 122880 && shared != 123392))
+  if (!((threads == 512 && (shared == 167936 || shared == 168192 ||
+                            shared == 122880 || shared == 123392)) ||
+        (threads == 256 && (shared == 94208 || shared == 94464))))
     return 0;
   unsigned changed = 0;
   for (llvm::Function &function : module)
     if (!function.isDeclaration() &&
         function.getCallingConv() == llvm::CallingConv::PTX_Kernel)
-      changed += mla_nope_prefetch::schedule(function, shared);
+      changed += mla_nope_prefetch::schedule(function, shared, threads);
   return changed;
 }
 

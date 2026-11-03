@@ -16,7 +16,10 @@ inline unsigned reuseMlaKvViews(ModuleOp module) {
   module.walk([&](TransOp transpose) { transposes.push_back(transpose); });
   auto marker =
       module->getAttrOfType<IntegerAttr>("ppu.mla_h64_k128_pv_layout");
-  bool small = marker && marker.getInt() == 1;
+  auto h32Marker =
+      module->getAttrOfType<IntegerAttr>("ppu.mla_h32_k128_pv_layout");
+  bool h32 = h32Marker && h32Marker.getInt() == 1;
+  bool small = (marker && marker.getInt() == 1) || h32;
   unsigned changed = 0;
   for (auto transpose : transposes) {
     auto resultType = dyn_cast<RankedTensorType>(transpose.getType());
@@ -33,7 +36,8 @@ inline unsigned reuseMlaKvViews(ModuleOp module) {
         (mma.getWarpsPerCTA() != ArrayRef<unsigned>({2, 8}) &&
          mma.getWarpsPerCTA() != ArrayRef<unsigned>({1, 16}) &&
          !(small && resultType.getShape() == ArrayRef<int64_t>({512, 128}) &&
-           mma.getWarpsPerCTA() == ArrayRef<unsigned>({4, 4}))))
+           (mma.getWarpsPerCTA() == ArrayRef<unsigned>({4, 4}) ||
+            (h32 && mma.getWarpsPerCTA() == ArrayRef<unsigned>({2, 4}))))))
       continue;
     auto convert = transpose.getSrc().getDefiningOp<ConvertLayoutOp>();
     if (!convert || !convert.getResult().hasOneUse())

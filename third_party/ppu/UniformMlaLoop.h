@@ -20,7 +20,10 @@ inline unsigned proveUniformMlaLoop(ModuleOp module) {
   auto loop = loops.front();
   auto marker =
       module->getAttrOfType<IntegerAttr>("ppu.mla_h64_k128_pv_layout");
-  bool small = marker && marker.getInt() == 1;
+  auto h32Marker =
+      module->getAttrOfType<IntegerAttr>("ppu.mla_h32_k128_pv_layout");
+  bool h32 = h32Marker && h32Marker.getInt() == 1;
+  bool small = (marker && marker.getInt() == 1) || h32;
   llvm::APInt step;
   if (!loop.getLowerBound().getType().isInteger(32) ||
       !loop.getUpperBound().getType().isInteger(32) ||

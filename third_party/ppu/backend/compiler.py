@@ -230,6 +230,7 @@ class HGGCOptions:
     ppu_pipeline_mla_kv: bool = False
     ppu_pipeline_mla_kv_pages: bool = False
     ppu_mla_h64_k128: bool = False
+    ppu_mla_h32_k128: bool = False
     enable_fp_fusion: bool = True
     enable_reflect_ftz: bool = True  # ftz in libdevice
     launch_cooperative_grid: bool = False
@@ -427,6 +428,12 @@ class PPUBackend(BaseBackend):
                     and 'tensor<512x128xi8' in source):
                 mod.set_attr("ppu.mla_h64_k128_pv_layout", ir.builder(mod.context).get_int32_attr(1))
 
+        if opt.ppu_mla_h32_k128 and capability == 80 and opt.num_warps == 8 and opt.num_ctas == 1:
+            source = str(mod)
+            if ('@dense_int8_mla_kernel(' in source and 'tensor<32x128xi8' in source and 'tensor<128x512xi8' in source
+                    and 'tensor<512x128xi8' in source):
+                mod.set_attr("ppu.mla_h32_k128_pv_layout", ir.builder(mod.context).get_int32_attr(1))
+
         pm = ir.pass_manager(mod.context)
         dump_enabled = pm.enable_debug()
         emuTF32 = (capability // 10 >= 8)
@@ -496,7 +503,8 @@ class PPUBackend(BaseBackend):
         pm.run(mod, 'make_ttgir')
         metadata["mla_shared_kv_views_reused"] = 0
         metadata["mla_async_kv_copies"] = 0
-        if (opt.ppu_reuse_mla_kv and capability == 80 and opt.num_warps == 16 and opt.num_ctas == 1):
+        if (opt.ppu_reuse_mla_kv and capability == 80 and opt.num_ctas == 1 and
+            (opt.num_warps == 16 or (opt.num_warps == 8 and mod.get_int_attr("ppu.mla_h32_k128_pv_layout") == 1))):
             metadata["mla_shared_kv_views_reused"] = ppu.reuse_mla_kv_views(mod)
             if opt.ppu_async_mla_kv and metadata["mla_shared_kv_views_reused"]:
                 metadata["mla_async_kv_copies"] = ppu.promote_mla_kv_copy(mod)
@@ -526,8 +534,10 @@ class PPUBackend(BaseBackend):
         mod = src
         h64 = (options.ppu_mla_h64_k128 and capability == 80 and options.num_warps == 16 and options.num_ctas == 1
                and src.get_int_attr("ppu.mla_h64_k128_pv_layout") == 1)
+        h32 = (options.ppu_mla_h32_k128 and capability == 80 and options.num_warps == 8 and options.num_ctas == 1
+               and src.get_int_attr("ppu.mla_h32_k128_pv_layout") == 1)
         metadata["mla_kv_loop_uniform"] = 0
-        if (options.ppu_pipeline_mla_kv or h64) and capability == 80:
+        if (options.ppu_pipeline_mla_kv or h64 or h32) and capability == 80:
             metadata["mla_kv_loop_uniform"] = ppu.prove_uniform_mla_loop(mod)
         if options.ppu_vectorize_i8_shared_store and capability == 80:
             mod.set_attr("ppu.vector_i8_shared_store", ir.builder(mod.context).get_int32_attr(1))
@@ -662,6 +672,18 @@ class PPUBackend(BaseBackend):
         if h64 and metadata["mla_kv_pipelined"] == 1:
             metadata["mla_pv_tail_scheduled"] = ppu.schedule_mla_pv_tail(llvm_mod, metadata["num_warps"] * 32,
                                                                          metadata["shared"])
+        if (h32 and metadata["shared"] == 94208 and metadata["mla_shared_kv_views_reused"] == 1
+                and metadata["mla_async_kv_copies"] == 1 and metadata["mla_kv_loop_uniform"] == 1):
+            # Query fragments stay in shared memory for this 256-thread tile.
+            metadata["shared"], metadata["shared_float_scales_published_early"] = ppu.publish_shared_float_scales_early(
+                llvm_mod, 256, metadata["shared"])
+            metadata["mla_nope_fragments_prefetched"] = ppu.prefetch_mla_nope(llvm_mod, 256, metadata["shared"])
+            if metadata["shared_float_scales_published_early"] == 1 and metadata["mla_nope_fragments_prefetched"] == 1:
+                metadata["mla_pv_scalarized"] = ppu.scalarize_mla_pv(llvm_mod, 256, metadata["shared"], True)
+            if metadata["mla_pv_scalarized"] == 1:
+                metadata["mla_kv_pipelined"] = ppu.pipeline_mla_kv(llvm_mod, 256, metadata["shared"], False)
+            if metadata["mla_kv_pipelined"] == 1:
+                metadata["mla_pv_tail_scheduled"] = ppu.schedule_mla_pv_tail(llvm_mod, 256, metadata["shared"])
         metadata["global_scratch_size"] = src.get_int_attr("ttg.global_scratch_memory_size")
         metadata["global_scratch_align"] = src.get_int_attr("ttg.global_scratch_memory_alignment")
         metadata["profile_scratch_size"] = src.get_int_attr("ttg.profile_scratch_memory_size") or 0

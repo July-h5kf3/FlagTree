@@ -17,7 +17,10 @@ inline unsigned promoteMlaKvCopy(ModuleOp module) {
   module.walk([&](LocalAllocOp root) { roots.push_back(root); });
   auto marker =
       module->getAttrOfType<IntegerAttr>("ppu.mla_h64_k128_pv_layout");
-  bool small = marker && marker.getInt() == 1;
+  auto h32Marker =
+      module->getAttrOfType<IntegerAttr>("ppu.mla_h32_k128_pv_layout");
+  bool h32 = h32Marker && h32Marker.getInt() == 1;
+  bool small = (marker && marker.getInt() == 1) || h32;
   unsigned changed = 0;
   for (auto root : roots) {
     if (!root.getSrc())

@@ -138,6 +138,14 @@ SmallVector<unsigned, 2> warpsPerTileMmaV1(DotOpInterface dotOp,
       rhs.getShape() == ArrayRef<int64_t>({128, 512}))
     return {1u, 16u};
 
+  auto h32 = module->getAttrOfType<IntegerAttr>("ppu.mla_h32_k128_pv_layout");
+  if (h32 && h32.getInt() == 1 && numWarps == 8 &&
+      shape == ArrayRef<int64_t>({32, 512}) &&
+      lhs.getElementType().isInteger(8) && rhs.getElementType().isInteger(8) &&
+      lhs.getShape() == ArrayRef<int64_t>({32, 128}) &&
+      rhs.getShape() == ArrayRef<int64_t>({128, 512}))
+    return {1u, 8u};
+
   auto filter = [&dotOp](Operation *op) {
     return op->getParentRegion() == dotOp->getParentRegion() &&
            !isa<TransOp>(op);

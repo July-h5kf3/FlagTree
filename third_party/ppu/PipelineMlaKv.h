@@ -28,11 +28,15 @@ inline bool pageRead(llvm::CallInst *call) {
 }
 
 inline unsigned run(llvm::Function &function, unsigned shared, bool reusePages,
-                    bool small = false) {
+                    bool small = false, unsigned threads = 512) {
   using namespace llvm;
   if (function.getCallingConv() != CallingConv::PTX_Kernel ||
       function.hasFnAttribute("ppu.mla.kv.pipeline"))
     return 0;
+  bool h32 = threads == 256 && shared == 94464;
+  unsigned kvBytes = small || h32 ? 65536 : 131072;
+  unsigned pageStep = small || h32 ? 2 : 4;
+  unsigned remainingProducts = h32 ? 37 : (small ? 39 : 35);
   SmallVector<CallInst *> products, copies;
   DenseMap<Instruction *, unsigned> position;
   for (BasicBlock &block : function)
@@ -77,8 +81,10 @@ inline unsigned run(llvm::Function &function, unsigned shared, bool reusePages,
   auto *step = next ? dyn_cast<ConstantInt>(next->getOperand(1)) : nullptr;
   auto *iv = next ? dyn_cast<PHINode>(next->getOperand(0)) : nullptr;
   if (!next || next->getOpcode() != Instruction::Add ||
-      next->getParent() != latch || !step || !step->equalsInt(small ? 2 : 4) ||
-      !iv || iv->getParent() != header || !iv->getType()->isIntegerTy(32) ||
+      next->getParent() != latch || !step || !step->equalsInt(pageStep) ||
+      !iv || iv->getParent() != header ||
+      (!iv->getType()->isIntegerTy(32) &&
+       !(h32 && iv->getType()->isIntegerTy(64))) ||
       iv->getNumIncomingValues() != 2 || iv->getBasicBlockIndex(latch) < 0 ||
       iv->getIncomingValueForBlock(latch) != next ||
       iv->getBasicBlockIndex(preheader) < 0)
@@ -87,7 +93,7 @@ inline unsigned run(llvm::Function &function, unsigned shared, bool reusePages,
   unsigned commits = 0, waits = 0;
   for (Instruction &instruction : *header) {
     if (position[&instruction] < position[copies.front()] &&
-        early_shared_float_scales::barrier(&instruction))
+        early_shared_float_scales::barrier(&instruction, threads))
       protect = cast<CallInst>(&instruction);
     if (auto *call = dyn_cast<CallInst>(&instruction))
       if (auto *callee = call->getCalledFunction()) {
@@ -129,12 +135,13 @@ inline unsigned run(llvm::Function &function, unsigned shared, bool reusePages,
           return 0;
   const auto &layout = function.getParent()->getDataLayout();
   BitVector empty(shared);
-  if (!readonly_shared_matrices::proveNoQueryWrites(*loop, empty, layout, 512))
+  if (!readonly_shared_matrices::proveNoQueryWrites(*loop, empty, layout,
+                                                    threads))
     return 0;
   auto footprint = [&](Value *pointer,
                        unsigned width) -> std::optional<BitVector> {
     BitVector bytes(shared);
-    for (unsigned tid = 0; tid < 512; ++tid) {
+    for (unsigned tid = 0; tid < threads; ++tid) {
       DenseMap<Value *, Constant *> constants;
       DenseMap<Value *, APInt> integers;
       if (!mla_nope_prefetch::preparePointer(pointer, tid, layout, constants,
@@ -149,7 +156,7 @@ inline unsigned run(llvm::Function &function, unsigned shared, bool reusePages,
     return bytes;
   };
   BitVector kv(shared), destinations(shared), expected(shared);
-  expected.set(0, small ? 65536 : 131072);
+  expected.set(0, kvBytes);
   SmallPtrSet<LoadInst *, 32> readers;
   LoadInst *last = nullptr;
   for (auto *product : ArrayRef(products).drop_front(32))
@@ -232,7 +239,7 @@ inline unsigned run(llvm::Function &function, unsigned shared, bool reusePages,
         return 0;
     }
   }
-  if (remaining != (small ? 39 : 35) || position[next] <= position[last] ||
+  if (remaining != remainingProducts || position[next] <= position[last] ||
       position[condition] <= position[next])
     return 0;
   // Only the IV and a bounded pure integer/page-read DAG may be remapped.
@@ -289,7 +296,7 @@ inline unsigned run(llvm::Function &function, unsigned shared, bool reusePages,
         if (auto *call = dyn_cast<CallInst>(&instruction))
           if (pageRead(call))
             pages.push_back(call);
-    if (pages.size() != (small ? 2 : 4))
+    if (pages.size() != pageStep)
       return 0;
     for (unsigned i = 0; i < pages.size(); ++i) {
       SmallVector<CallInst *> matching;
@@ -373,18 +380,19 @@ inline unsigned run(llvm::Function &function, unsigned shared, bool reusePages,
   commit->eraseFromParent();
   protect->eraseFromParent();
   function.addFnAttr("ppu.mla.kv.pipeline", "1");
-  return reusePages ? (small ? 3 : 5) : 1;
+  return reusePages ? pageStep + 1 : 1;
 }
 } // namespace mla_kv_pipeline
 inline unsigned pipelineMlaKv(llvm::Module &module, unsigned threads,
                               unsigned shared, bool reusePages = false) {
-  if (threads != 512 || (shared != 168192 && shared != 123392))
+  if (!((threads == 512 && (shared == 168192 || shared == 123392)) ||
+        (threads == 256 && shared == 94464)))
     return 0;
   unsigned changed = 0;
   for (auto &function : module)
     if (!function.isDeclaration())
-      changed +=
-          mla_kv_pipeline::run(function, shared, reusePages, shared == 123392);
+      changed += mla_kv_pipeline::run(function, shared, reusePages,
+                                      shared == 123392, threads);
   if (changed && shared == 168192)
     scheduleMlaPvTail(module, threads, shared);
   return changed;

@@ -10,7 +10,8 @@ template <unsigned Width>
 inline unsigned scheduleMlaPvTailImpl(llvm::Module &module, unsigned threads,
                                       unsigned shared) {
   using namespace llvm;
-  if (threads != 512 || shared != (Width == 64 ? 123392 : 168192))
+  if (!((threads == 512 && shared == (Width == 64 ? 123392 : 168192)) ||
+        (Width == 64 && threads == 256 && shared == 94464)))
     return 0;
   unsigned changed = 0;
   for (Function &function : module) {
@@ -51,7 +52,8 @@ inline unsigned scheduleMlaPvTailImpl(llvm::Module &module, unsigned threads,
         root = insert;
       }
     }
-    if (!accepted || products != (Width == 64 ? 39 : 35) || !root)
+    if (!accepted ||
+        products != (threads == 256 ? 37 : (Width == 64 ? 39 : 35)) || !root)
       continue;
     std::array<Value *, Width> lanes;
     Value *cursor = root;
@@ -103,8 +105,9 @@ inline unsigned scheduleMlaPvTailImpl(llvm::Module &module, unsigned threads,
 }
 inline unsigned scheduleMlaPvTail(llvm::Module &module, unsigned threads,
                                   unsigned shared) {
-  return shared == 123392 ? scheduleMlaPvTailImpl<64>(module, threads, shared)
-                          : scheduleMlaPvTailImpl<32>(module, threads, shared);
+  return (shared == 123392 || shared == 94464)
+             ? scheduleMlaPvTailImpl<64>(module, threads, shared)
+             : scheduleMlaPvTailImpl<32>(module, threads, shared);
 }
 
 } // namespace triton::ppu
