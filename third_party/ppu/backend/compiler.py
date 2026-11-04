@@ -683,7 +683,16 @@ class PPUBackend(BaseBackend):
                 metadata["mla_pv_scalarized"] = ppu.scalarize_mla_pv(llvm_mod, 256, metadata["shared"], True, 4)
                 metadata["mla_pv_batches_scheduled"] = 4 if metadata["mla_pv_scalarized"] == 1 else 0
             if metadata["mla_pv_scalarized"] == 1:
-                metadata["mla_kv_pipelined"] = ppu.pipeline_mla_kv(llvm_mod, 256, metadata["shared"], False)
+                # H32/K128 has the same two page reads per iteration as the
+                # small pipeline layout.  The pipeline proof already checks
+                # both page reads and carries them through the continuation;
+                # keep those values instead of reloading the page table.
+                result = ppu.pipeline_mla_kv(llvm_mod, 256, metadata["shared"], True)
+                assert result in (0, 1, 3)
+                metadata["mla_kv_pipelined"] = int(result != 0)
+                metadata["mla_kv_page_results_reused"] = (
+                    result - 1 if result == 3 else 0
+                )
             if metadata["mla_kv_pipelined"] == 1:
                 metadata["mla_pv_tail_scheduled"] = ppu.schedule_mla_pv_tail(llvm_mod, 256, metadata["shared"])
         metadata["global_scratch_size"] = src.get_int_attr("ttg.global_scratch_memory_size")

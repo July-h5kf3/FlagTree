@@ -97,6 +97,11 @@ the canonical table loads and their exact pointer/predicate aliases. The skip
 edge cannot feed another loop iteration. Reads and copies remain inside each
 operator call; no input conversion or page lookup is cached across calls.
 
+The H32/K128 path has a fixed two-page step and always requests this proven
+reuse after its pipeline checks. Its application is reported as
+`mla_kv_page_results_reused=2`; the generic H64 path remains controlled by
+`ppu_pipeline_mla_kv_pages`.
+
 Inspect `mla_kv_loop_uniform`, `mla_kv_pipelined` and
 `mla_kv_page_results_reused` in compiled metadata. A requested option can still
 have an application count of zero. Consumers should retain their earlier
