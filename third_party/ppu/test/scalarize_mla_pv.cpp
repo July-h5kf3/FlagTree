@@ -39,7 +39,8 @@ static SmallPtrSet<Instruction *, 32> effects(Module &module) {
   return result;
 }
 
-static std::unique_ptr<Module> fixture(LLVMContext &context, unsigned variant) {
+static std::unique_ptr<Module> fixture(LLVMContext &context, unsigned variant,
+                                       unsigned width = 32) {
   auto module = std::make_unique<Module>("mla-pv-scalarization", context);
   module->setDataLayout("e-p:64:64-p3:32:32");
   IRBuilder<NoFolder> builder(context);
@@ -53,8 +54,8 @@ static std::unique_ptr<Module> fixture(LLVMContext &context, unsigned variant) {
   builder.SetInsertPoint(entry);
   builder.CreateBr(loop);
   builder.SetInsertPoint(loop);
-  auto *floatType = FixedVectorType::get(builder.getFloatTy(), 32);
-  auto *integerType = FixedVectorType::get(builder.getInt32Ty(), 32);
+  auto *floatType = FixedVectorType::get(builder.getFloatTy(), width);
+  auto *integerType = FixedVectorType::get(builder.getInt32Ty(), width);
   auto *carry = builder.CreatePHI(floatType, 2);
   carry->addIncoming(Constant::getNullValue(floatType), entry);
   Value *old30 = builder.CreateExtractElement(carry, builder.getInt64(30));
@@ -66,13 +67,34 @@ static std::unique_ptr<Module> fixture(LLVMContext &context, unsigned variant) {
   auto *mma = InlineAsm::get(
       mmaType, triton::ppu::mla_nope_prefetch::ProductAsm,
       "=r,=r,=r,=r,=r,=r,=r,=r,0,1,2,3,4,5,6,7,r,r,r,r,r,r,r,r", true);
+  auto *sharedType = ArrayType::get(builder.getInt32Ty(), 256);
+  auto *shared = new GlobalVariable(
+      *module, sharedType, false, GlobalValue::InternalLinkage,
+      ConstantAggregateZero::get(sharedType), "pv_shared", nullptr,
+      GlobalValue::NotThreadLocal, 3);
+  auto transposeType =
+      FunctionType::get(builder.getInt32Ty(), {builder.getInt32Ty()}, false);
+  auto transpose = module->getOrInsertFunction(
+      "__flagtree_ppu_intrinsic__mat.trans.b8", transposeType);
+  unsigned productIndex = 0;
   using Words = std::array<Value *, 8>;
   Words zeros;
   zeros.fill(builder.getInt32(0));
   auto multiply = [&](const Words &accumulator) {
     SmallVector<Value *> operands(accumulator.begin(), accumulator.end());
-    for (unsigned index = 0; index < 8; ++index)
-      operands.push_back(builder.getInt32(index + 1));
+    for (unsigned index = 0; index < 8; ++index) {
+      if (productIndex >= 32 && index >= 4) {
+        Value *address = builder.CreateInBoundsGEP(
+            sharedType, shared,
+            {builder.getInt32(0),
+             builder.getInt32((productIndex - 32) * 4 + index - 4)});
+        Value *load = builder.CreateLoad(builder.getInt32Ty(), address);
+        operands.push_back(builder.CreateCall(transpose, {load}));
+      } else {
+        operands.push_back(builder.getInt32(index + 1));
+      }
+    }
+    ++productIndex;
     auto *call = builder.CreateCall(mmaType, mma, operands);
     Words result;
     for (unsigned word = 0; word < 8; ++word)
@@ -86,27 +108,29 @@ static std::unique_ptr<Module> fixture(LLVMContext &context, unsigned variant) {
   builder.CreateCall(module->getOrInsertFunction(
                          "llvm.nvvm.barrier.cta.sync.aligned.all", barrierType),
                      {builder.getInt32(0)});
-  std::array<Words, 4> high, low, seeds;
+  std::array<Words, 8> high, low, seeds;
+  unsigned chains = width / 8;
+  unsigned steps = 32 / chains;
   high.fill(zeros);
   low.fill(zeros);
-  for (unsigned k = 0; k < 8; ++k)
-    for (auto &words : high)
-      words = multiply(words);
+  for (unsigned k = 0; k < steps; ++k)
+    for (unsigned chain = 0; chain < chains; ++chain)
+      high[chain] = multiply(high[chain]);
   Value *packedHigh = PoisonValue::get(integerType);
-  for (unsigned lane = 0; lane < 32; ++lane)
+  for (unsigned lane = 0; lane < width; ++lane)
     packedHigh = builder.CreateInsertElement(
         packedHigh, high[lane / 8][lane % 8], builder.getInt64(lane));
   auto *factor = ConstantVector::getSplat(
-      ElementCount::getFixed(32), builder.getInt32(variant == 11   ? 7
-                                                   : variant == 12 ? 9
-                                                   : variant >= 9  ? 8
-                                                                   : 127));
+      ElementCount::getFixed(width), builder.getInt32(variant == 11   ? 7
+                                                      : variant == 12 ? 9
+                                                      : variant >= 9  ? 8
+                                                                      : 127));
   Value *packedSeed = (variant == 1 || variant == 10 || variant == 12)
                           ? builder.CreateBinOp(variant >= 9 ? Instruction::Shl
                                                              : Instruction::Mul,
                                                 packedHigh, factor)
                           : nullptr;
-  for (unsigned lane = 0; lane < 32; ++lane)
+  for (unsigned lane = 0; lane < width; ++lane)
     seeds[lane / 8][lane % 8] =
         packedSeed
             ? builder.CreateExtractElement(packedSeed, builder.getInt64(lane))
@@ -116,11 +140,11 @@ static std::unique_ptr<Module> fixture(LLVMContext &context, unsigned variant) {
                                   builder.getInt32(variant == 11  ? 7
                                                    : variant >= 9 ? 8
                                                                   : 127));
-  for (unsigned k = 0; k < 8; ++k)
-    for (unsigned chain = 0; chain < 4; ++chain)
+  for (unsigned k = 0; k < steps; ++k)
+    for (unsigned chain = 0; chain < chains; ++chain)
       low[chain] = multiply(k ? low[chain] : seeds[chain]);
   Value *packedLow = PoisonValue::get(integerType);
-  for (unsigned lane = 0; lane < 32; ++lane)
+  for (unsigned lane = 0; lane < width; ++lane)
     packedLow = builder.CreateInsertElement(packedLow, low[lane / 8][lane % 8],
                                             builder.getInt64(lane));
   Value *contribution = builder.CreateSIToFP(packedLow, floatType);
@@ -137,8 +161,9 @@ static std::unique_ptr<Module> fixture(LLVMContext &context, unsigned variant) {
     contribution = builder.CreateShuffleVector(
         contribution, PoisonValue::get(floatType), mask);
   }
-  auto *scale = ConstantVector::getSplat(
-      ElementCount::getFixed(32), ConstantFP::get(builder.getFloatTy(), 0.125));
+  auto *scale =
+      ConstantVector::getSplat(ElementCount::getFixed(width),
+                               ConstantFP::get(builder.getFloatTy(), 0.125));
   auto *root = builder.CreateFAdd(builder.CreateFMul(carry, scale),
                                   builder.CreateFMul(contribution, scale));
   carry->addIncoming(root, loop);
@@ -233,5 +258,42 @@ int main(int argc, char **argv) {
         }
         ++checks;
       }
+  if (argc == 1) {
+    LLVMContext context;
+    auto module = fixture(context, 0, 64);
+    assert(!verifyModule(*module, &errs()));
+    assert(triton::ppu::scalarizeMlaPv(*module, 512, 123392, true, 4) == 1);
+    assert(!verifyModule(*module, &errs()));
+    assert(products(*module).size() == 96);
+    SmallVector<CallInst *> transposes;
+    SmallVector<Instruction *> conversions;
+    for (Function &function : *module)
+      for (BasicBlock &block : function)
+        for (Instruction &instruction : block) {
+          if (auto *call = dyn_cast<CallInst>(&instruction))
+            if (auto *callee = call->getCalledFunction())
+              if (callee->getName() == "__flagtree_ppu_intrinsic__mat.trans.b8")
+                transposes.push_back(call);
+          if (instruction.getName().starts_with("pv_stream_scalar") &&
+              instruction.getOpcode() == Instruction::SIToFP)
+            conversions.push_back(&instruction);
+        }
+    assert(transposes.size() >= 8);
+    assert(conversions.size() >= 16);
+    for (unsigned first = 0; first < conversions.size(); first += 8) {
+      unsigned end = std::min<unsigned>(conversions.size(), first + 8);
+      for (Instruction *instruction = conversions[first]->getNextNode();
+           instruction != conversions[end - 1];
+           instruction = instruction->getNextNode()) {
+        assert(instruction);
+        if (instruction->getName().starts_with("pv_stream_scalar"))
+          assert(!instruction->isBinaryOp());
+      }
+    }
+    std::string once = print(*module);
+    assert(triton::ppu::scalarizeMlaPv(*module, 512, 123392, true, 4) == 0);
+    assert(print(*module) == once);
+    ++checks;
+  }
   outs() << "Mla PV scalarization: " << checks << " checks passed\n";
 }

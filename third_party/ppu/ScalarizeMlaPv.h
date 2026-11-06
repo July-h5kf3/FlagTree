@@ -369,8 +369,27 @@ inline unsigned rewrite(llvm::Function &function, bool allowP15,
         for (auto *word : outputs[index])
           emit(word);
       }
-      for (unsigned lane = start; lane < end; ++lane)
-        emit(scalars[roots[lane]]);
+      SmallPtrSet<Instruction *, 32> conversionVisited;
+      std::function<void(Value *)> emitConversions = [&](Value *value) {
+        auto *instruction = dyn_cast<Instruction>(value);
+        if (!instruction || !members.contains(instruction) ||
+            emitted.contains(instruction) ||
+            !conversionVisited.insert(instruction).second)
+          return;
+        for (Value *operand : instruction->operands())
+          emitConversions(operand);
+        if (instruction->getOpcode() == Instruction::SIToFP)
+          emit(instruction);
+      };
+      // Group independent integer-to-float conversions in bounded lane waves.
+      // The remaining FP32 DAG keeps its original per-lane order.
+      for (unsigned laneStart = start; laneStart < end; laneStart += 8) {
+        unsigned laneEnd = std::min<unsigned>(end, laneStart + 8);
+        for (unsigned lane = laneStart; lane < laneEnd; ++lane)
+          emitConversions(scalars[roots[lane]]);
+        for (unsigned lane = laneStart; lane < laneEnd; ++lane)
+          emit(scalars[roots[lane]]);
+      }
     }
   } else {
     for (unsigned index = 0; index < 64; ++index) {
