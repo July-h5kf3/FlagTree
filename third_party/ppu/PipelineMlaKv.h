@@ -243,7 +243,10 @@ inline unsigned run(llvm::Function &function, unsigned shared, bool reusePages,
         return 0;
     }
   }
-  if (remaining != remainingProducts || position[next] <= position[last] ||
+  // The batch scheduler may make the final V read earlier, leaving more
+  // independent PV work after it.  That is safe (and gives the asynchronous
+  // copy more cover); only the original minimum product tail is required.
+  if (remaining < remainingProducts || position[next] <= position[last] ||
       position[condition] <= position[next])
     return 0;
   // Only the IV and a bounded pure integer/page-read DAG may be remapped.

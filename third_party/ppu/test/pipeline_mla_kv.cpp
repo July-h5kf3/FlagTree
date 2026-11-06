@@ -138,7 +138,7 @@ int main(int argc, char **argv) {
   assert(argc == 1 || argc == 2);
   for (unsigned barrierMode = 0; barrierMode < 6; ++barrierMode)
     for (bool reusePages : {false, true})
-      for (unsigned test = 0; test < 12; ++test) {
+      for (unsigned test = 0; test < 13; ++test) {
         LLVMContext context;
         SMDiagnostic diagnostic;
         auto module = argc == 1 ? fixture(context)
@@ -210,6 +210,23 @@ int main(int argc, char **argv) {
               last = load;
           }
         assert(last);
+        if (test == 12) {
+          // The PV batch scheduler can materialize the last V fragment early.
+          // A longer independent product tail must remain pipelineable.
+          auto *anchor = &last->getParent()->front();
+          SmallVector<Instruction *> dependencies;
+          if (auto *address =
+                  dyn_cast<Instruction>(last->getPointerOperand())) {
+            if (auto *offset = dyn_cast<Instruction>(address->getOperand(1)))
+              dependencies.push_back(offset);
+            dependencies.push_back(address);
+          }
+          dependencies.push_back(last);
+          for (User *user : last->users())
+            dependencies.push_back(cast<Instruction>(user));
+          for (Instruction *instruction : dependencies)
+            instruction->moveBefore(anchor->getIterator());
+        }
         IRBuilder<> builder(last->getNextNode());
         if (test == 1)
           builder.CreateLoad(builder.getInt32Ty(), last->getPointerOperand());
@@ -250,8 +267,9 @@ int main(int argc, char **argv) {
         unsigned changed = triton::ppu::pipelineMlaKv(
             *module, test == 9 ? 256 : 512, test == 10 ? 167936 : 168192,
             reusePages);
-        unsigned expected =
-            test == 0 && barrierMode <= 2 ? (reusePages ? 5u : 1u) : 0u;
+        unsigned expected = (test == 0 || test == 12) && barrierMode <= 2
+                                ? (reusePages ? 5u : 1u)
+                                : 0u;
         if (changed != expected)
           errs() << "case " << test << " changed " << changed << "\n";
         assert(changed == expected);
@@ -307,5 +325,5 @@ int main(int argc, char **argv) {
           assert(text(*module) == once);
         }
       }
-  outs() << "KV pipeline:144 checks passed\n";
+  outs() << "KV pipeline:156 checks passed\n";
 }

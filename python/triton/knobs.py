@@ -441,6 +441,8 @@ class compilation_knobs(base_knobs):
     front_end_debugging: env_bool = env_bool("TRITON_FRONT_END_DEBUGGING")
     allow_non_constexpr_globals: env_bool = env_bool("TRITON_ALLOW_NON_CONSTEXPR_GLOBALS")
     keep_smem_read_order: env_bool = env_bool("FLAGTREE_KEEP_SMEM_READ_ORDER", True)  # flagtree keep smem read order
+    # flagtree same warp layout shuffle; read by the layout analysis (Analysis/Utility.cpp)
+    same_warp_layout_shuffle: env_bool = env_bool("FLAGTREE_SAME_WARP_LAYOUT_SHUFFLE", True)
     # Instrumentation mode is checked on every run, which is expensive.
     # We cache the value here to avoid the expensive check on every run.
     instrumentation_mode: str = env_str("TRITON_INSTRUMENTATION_MODE", "").get()
@@ -563,6 +565,7 @@ class language_knobs(base_knobs):
     # flagtree low-precision float (fp8/fp4) support; 0 falls back to the upstream
     # interpreter float conversion and drops the backend opt-ins
     low_precision_float: env_bool = env_bool("FLAGTREE_LOW_PRECISION_FLOAT", True)
+    reorder_loop_loads: env_bool = env_bool("FLAGTREE_REORDER_LOOP_LOADS", True)  # flagtree reorder loop loads
 
 
 class nvidia_knobs(base_knobs):
@@ -578,6 +581,7 @@ class nvidia_knobs(base_knobs):
     dump_ptxas_log: env_bool = env_bool("TRITON_DUMP_PTXAS_LOG")
     rlc_enhance: env_bool = env_bool("FLAGTREE_RLC_ENHANCE", True)  # flagtree rlc enhance
     pipeline_enhance: env_bool = env_bool("FLAGTREE_PIPELINE_ENHANCE", True)  # flagtree pipeline enhance
+    concat_dot_operand: env_bool = env_bool("FLAGTREE_CONCAT_DOT_OPERAND", True)  # flagtree concat dot operand
 
     libdevice_path: env_opt_str = env_opt_str("TRITON_LIBDEVICE_PATH")
     libcuda_path: env_opt_str = env_opt_str("TRITON_LIBCUDA_PATH")

@@ -350,6 +350,18 @@ inline unsigned rewrite(llvm::Function &function, bool allowP15,
       unsigned end = std::min<unsigned>(Width, start + batchTiles * 8);
       for (unsigned lane = start; lane < end; ++lane)
         collect(scalars[roots[lane]]);
+      // Materialize every transposed V fragment used by this output batch
+      // before entering its MMA chain.  mat.trans.b8 and the INT8 MMA use
+      // different tensor modes on PPU; keeping each fragment group next to its
+      // first consumer otherwise alternates the mode for every V tile.  The
+      // fragments were already live for the residual products, so this only
+      // moves their first use earlier and does not change the arithmetic.
+      for (unsigned index = 0; index < 64; ++index) {
+        if (!needed.contains(products[index + 32]))
+          continue;
+        for (unsigned operand = 12; operand < 16; ++operand)
+          emit(products[index + 32]->getArgOperand(operand));
+      }
       for (unsigned index = 0; index < 64; ++index) {
         if (!needed.contains(products[index + 32]))
           continue;
