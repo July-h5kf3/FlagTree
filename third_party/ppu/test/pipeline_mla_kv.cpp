@@ -1,6 +1,7 @@
 // Copyright 2026 FlagOS Contributors
 // SPDX-License-Identifier: Apache-2.0
 #include "PipelineMlaKv.h"
+#include "PrefetchMlaRope.h"
 #include "llvm/IR/NoFolder.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
@@ -14,7 +15,8 @@ static std::string text(Module &module) {
   module.print(out, nullptr);
   return result;
 }
-static std::unique_ptr<Module> fixture(LLVMContext &context) {
+static std::unique_ptr<Module> fixture(LLVMContext &context, bool h32 = false,
+                                       bool wideIV = false) {
   auto module = std::make_unique<Module>("mla-kv-pipeline", context);
   module->setDataLayout("e-p:64:64-p3:32:32");
   IRBuilder<NoFolder> builder(context);
@@ -29,6 +31,8 @@ static std::unique_ptr<Module> fixture(LLVMContext &context) {
                         false),
       GlobalValue::ExternalLinkage, "decode", *module);
   function->setCallingConv(CallingConv::PTX_Kernel);
+  if (h32)
+    function->addFnAttr("ppu.mla.pv.batch", "4");
   auto *entry = BasicBlock::Create(context, "entry", function);
   auto *header = BasicBlock::Create(context, "header", function);
   auto *body = BasicBlock::Create(context, "body", function);
@@ -42,8 +46,9 @@ static std::unique_ptr<Module> fixture(LLVMContext &context) {
   Value *byte4 = builder.CreateMul(tid, builder.getInt32(4));
   builder.CreateBr(header);
   builder.SetInsertPoint(header);
-  auto *iv = builder.CreatePHI(builder.getInt32Ty(), 2);
-  iv->addIncoming(builder.getInt32(0), entry);
+  auto *ivType = h32 && wideIV ? builder.getInt64Ty() : builder.getInt32Ty();
+  auto *iv = builder.CreatePHI(ivType, 2);
+  iv->addIncoming(ConstantInt::get(ivType, 0), entry);
   // A second PHI supplies the deliberately invalid floating-dependency test.
   auto *stateType = FixedVectorType::get(builder.getFloatTy(), 2);
   auto *state = builder.CreatePHI(stateType, 2);
@@ -65,9 +70,10 @@ static std::unique_ptr<Module> fixture(LLVMContext &context) {
   auto *copyAsm = InlineAsm::get(
       copyType, "cp.async.cg.shared.global [ $0 + 0 ], [ $1 + 0 ], 0x10, $2;",
       "r,l,r", true);
-  std::array<Value *, 4> pages;
+  SmallVector<Value *> pages(h32 ? 2 : 4);
   for (unsigned index = 0; index < pages.size(); ++index) {
-    Value *offset = index ? builder.CreateAdd(iv, builder.getInt32(index)) : iv;
+    Value *offset =
+        index ? builder.CreateAdd(iv, ConstantInt::get(ivType, index)) : iv;
     auto *table =
         builder.CreateGEP(builder.getInt32Ty(), function->getArg(6), offset);
     pages[index] =
@@ -75,10 +81,11 @@ static std::unique_ptr<Module> fixture(LLVMContext &context) {
   }
   for (unsigned packet = 0; packet < 16; ++packet) {
     auto *source = builder.CreateGEP(builder.getInt8Ty(), function->getArg(2),
-                                     pages[packet / 4]);
+                                     pages[packet / (h32 ? 8 : 4)]);
     auto *destination = builder.CreateGEP(
         builder.getInt8Ty(), shared,
-        builder.CreateAdd(byte16, builder.getInt32(packet * 8192)));
+        builder.CreateAdd(byte16,
+                          builder.getInt32(packet * (h32 ? 4096 : 8192))));
     builder.CreateCall(copyType, copyAsm,
                        {destination, source, builder.getInt32(16)});
   }
@@ -88,6 +95,12 @@ static std::unique_ptr<Module> fixture(LLVMContext &context) {
   builder.CreateCall(
       module->getOrInsertFunction("llvm.nvvm.cp.async.wait.group", barrierType),
       {builder.getInt32(0)});
+  SmallVector<Value *> krPages;
+  if (h32)
+    for (auto *page : pages)
+      krPages.push_back(builder.CreateCall(
+          pageType, pageAsm,
+          {cast<CallInst>(page)->getArgOperand(0), builder.getTrue()}));
   auto *mmaResult =
       StructType::get(context, std::vector<Type *>(8, builder.getInt32Ty()));
   auto *mmaType = FunctionType::get(
@@ -98,6 +111,26 @@ static std::unique_ptr<Module> fixture(LLVMContext &context) {
   SmallVector<Value *> zero(16, builder.getInt32(0));
   for (unsigned index = 0; index < 32; ++index)
     builder.CreateCall(mmaType, mma, zero);
+  if (h32) {
+    auto *krType = FunctionType::get(
+        StructType::get(context, SmallVector<Type *>(4, builder.getInt32Ty())),
+        {builder.getInt32Ty(), builder.getInt32Ty(), builder.getInt32Ty(),
+         builder.getInt32Ty(), pointer, builder.getInt1Ty()},
+        false);
+    auto *krAsm =
+        InlineAsm::get(krType, triton::ppu::mla_rope_prefetch::LoadAsm,
+                       "=r,=r,=r,=r,r,r,r,r,l,b", true);
+    for (unsigned index = 0; index < 4; ++index) {
+      auto *source = builder.CreateGEP(builder.getInt8Ty(), function->getArg(3),
+                                       krPages[index / 2]);
+      source = builder.CreateGEP(builder.getInt8Ty(), source,
+                                 builder.getInt32(index * 16));
+      builder.CreateCall(krType, krAsm,
+                         {builder.getInt32(0), builder.getInt32(0),
+                          builder.getInt32(0), builder.getInt32(0), source,
+                          builder.getTrue()});
+    }
+  }
   builder.CreateBr(body);
   builder.SetInsertPoint(body);
   auto transpose = module->getOrInsertFunction(
@@ -108,24 +141,26 @@ static std::unique_ptr<Module> fixture(LLVMContext &context) {
   auto read = [&](unsigned index) {
     auto *address = builder.CreateGEP(
         builder.getInt8Ty(), shared,
-        builder.CreateAdd(byte4, builder.getInt32(index * 2048)));
+        builder.CreateAdd(byte4,
+                          builder.getInt32(index * (h32 ? 1024 : 2048))));
     auto *load = builder.CreateLoad(builder.getInt32Ty(), address);
     words[index] = builder.CreateCall(transpose, {load});
   };
   for (unsigned index = 0; index < 60; ++index)
     read(index);
+  unsigned tailStart = h32 ? 15 : 29;
   for (unsigned index = 0; index < 64; ++index) {
-    if (index == 29)
+    if (index == tailStart)
       for (unsigned word = 60; word < 64; ++word)
         read(word);
     SmallVector<Value *> args(12, builder.getInt32(0));
-    unsigned group = index < 29 ? index % 15 : index % 16;
+    unsigned group = index < tailStart ? index % 15 : index % 16;
     for (unsigned word = 0; word < 4; ++word)
       args.push_back(words[group * 4 + word]);
     builder.CreateCall(mmaType, mma, args);
   }
-  auto *next = builder.CreateAdd(iv, builder.getInt32(4));
-  auto *condition = builder.CreateICmpSLT(next, builder.getInt32(16));
+  auto *next = builder.CreateAdd(iv, ConstantInt::get(ivType, h32 ? 2 : 4));
+  auto *condition = builder.CreateICmpSLT(next, ConstantInt::get(ivType, 16));
   iv->addIncoming(next, body);
   state->addIncoming(state, body);
   builder.CreateCondBr(condition, header, exit);
@@ -134,8 +169,185 @@ static std::unique_ptr<Module> fixture(LLVMContext &context) {
   return module;
 }
 
+static unsigned testH32Pages(StringRef filename = {}, bool wideIV = false) {
+  unsigned passed = 0;
+  for (bool reusePages : {false, true})
+    for (unsigned test = 0; test < 4; ++test) {
+      LLVMContext context;
+      SMDiagnostic diagnostic;
+      auto module = filename.empty()
+                        ? fixture(context, true, wideIV)
+                        : parseIRFile(filename, diagnostic, context);
+      assert(module);
+      SmallVector<CallInst *> products, copies, sourcePages, aliases;
+      Function *kernel = nullptr;
+      for (Function &function : *module)
+        for (BasicBlock &block : function)
+          for (Instruction &instruction : block)
+            if (auto *call = dyn_cast<CallInst>(&instruction))
+              if (auto *code = dyn_cast<InlineAsm>(call->getCalledOperand())) {
+                if (code->getAsmString() ==
+                    triton::ppu::mla_nope_prefetch::ProductAsm) {
+                  products.push_back(call);
+                  kernel = &function;
+                }
+                if (code->getAsmString() == "cp.async.cg.shared.global [ $0 + "
+                                            "0 ], [ $1 + 0 ], 0x10, $2;")
+                  copies.push_back(call);
+              }
+      assert(kernel && products.size() == 96 && copies.size() == 16);
+      auto *header = products.front()->getParent();
+      SmallPtrSet<Value *, 32> seen;
+      std::function<void(Value *)> collect = [&](Value *value) {
+        auto *instruction = dyn_cast<Instruction>(value);
+        if (!instruction || instruction->getParent() != header ||
+            isa<PHINode>(instruction) || !seen.insert(value).second)
+          return;
+        if (auto *call = dyn_cast<CallInst>(instruction))
+          if (triton::ppu::mla_kv_pipeline::pageRead(call)) {
+            sourcePages.push_back(call);
+            return;
+          }
+        for (Value *operand : instruction->operands())
+          collect(operand);
+      };
+      for (auto *copy : copies)
+        collect(copy->getArgOperand(1));
+      assert(sourcePages.size() == 2);
+      for (Instruction &instruction : *header)
+        if (auto *call = dyn_cast<CallInst>(&instruction))
+          if (triton::ppu::mla_kv_pipeline::pageRead(call))
+            aliases.push_back(call);
+      DominatorTree dominance(*kernel);
+      LoopInfo loops(dominance);
+      auto *loop = loops.getLoopFor(header);
+      auto *preheader = loop->getLoopPreheader();
+      auto *latch = loop->getLoopLatch();
+      auto *originalBranch = cast<BranchInst>(latch->getTerminator());
+      auto *exit = originalBranch->getSuccessor(1);
+      auto *condition = cast<ICmpInst>(originalBranch->getCondition());
+      auto *next = cast<BinaryOperator>(condition->getOperand(0));
+      if (test == 1) {
+        sourcePages[1]->setArgOperand(0, sourcePages[0]->getArgOperand(0));
+        sourcePages[1]->setArgOperand(1, sourcePages[0]->getArgOperand(1));
+      }
+      if (test == 2) {
+        IRBuilder<> builder(copies.front());
+        auto *iteration = next->getOperand(0);
+        auto *index = builder.CreateAdd(
+            iteration, ConstantInt::get(iteration->getType(), 2));
+        auto *table =
+            builder.CreateGEP(builder.getInt32Ty(), kernel->getArg(6), index);
+        auto *page = builder.CreateCall(sourcePages[0]->getFunctionType(),
+                                        sourcePages[0]->getCalledOperand(),
+                                        {table, builder.getTrue()});
+        copies.front()->setArgOperand(
+            1, builder.CreateGEP(builder.getInt8Ty(), kernel->getArg(2), page));
+      }
+      if (test == 3) {
+        IRBuilder<> builder(latch->getTerminator());
+        builder.CreateStore(builder.getInt32(0), kernel->getArg(6));
+      }
+      assert(!verifyModule(*module, &errs()));
+      auto before = text(*module);
+      unsigned changed =
+          triton::ppu::pipelineMlaKv(*module, 256, 94464, reusePages);
+      unsigned expected =
+          test == 3 || (reusePages && test != 0) ? 0 : (reusePages ? 3 : 1);
+      assert(changed == expected);
+      assert(!verifyModule(*module, &errs()));
+      if (!changed) {
+        assert(text(*module) == before);
+        if (reusePages) {
+          changed = triton::ppu::pipelineMlaKv(*module, 256, 94464, false);
+          assert(changed == (test == 3 ? 0 : 1));
+          assert(!verifyModule(*module, &errs()));
+          if (!changed) {
+            assert(text(*module) == before);
+            ++passed;
+            continue;
+          }
+        } else {
+          ++passed;
+          continue;
+        }
+      }
+      bool pagesReused = changed == 3;
+      BasicBlock *prefetch = nullptr, *continuation = nullptr;
+      unsigned groupCopies = 0, commits = 0, current = 0, following = 0;
+      for (BasicBlock &block : *kernel) {
+        if (block.getName() == "mla.kv.prefetch")
+          prefetch = &block;
+        if (block.getName() == "mla.pv.cont")
+          continuation = &block;
+        for (Instruction &instruction : block)
+          if (auto *call = dyn_cast<CallInst>(&instruction)) {
+            if (auto *code = dyn_cast<InlineAsm>(call->getCalledOperand()))
+              groupCopies +=
+                  code->getAsmString() ==
+                  "cp.async.cg.shared.global [ $0 + 0 ], [ $1 + 0 ], 0x10, $2;";
+            else if (call->getCalledFunction() &&
+                     call->getCalledFunction()->getName() ==
+                         "llvm.nvvm.cp.async.commit.group")
+              ++commits;
+          }
+      }
+      assert(prefetch && continuation && groupCopies == 32 && commits == 2);
+      for (BasicBlock &block : *kernel)
+        for (PHINode &phi : block.phis()) {
+          if (phi.getName().starts_with("mla.kv.page.current")) {
+            ++current;
+            assert(&block == header && phi.getNumIncomingValues() == 2);
+            auto *initial =
+                cast<CallInst>(phi.getIncomingValueForBlock(preheader));
+            assert(initial->getParent() == preheader &&
+                   triton::ppu::mla_kv_pipeline::pageRead(initial));
+            assert(isa<PHINode>(phi.getIncomingValueForBlock(continuation)));
+          }
+          if (phi.getName().starts_with("mla.kv.page.next")) {
+            ++following;
+            assert(&block == continuation && phi.getNumIncomingValues() == 2);
+            auto *page = cast<CallInst>(phi.getIncomingValueForBlock(prefetch));
+            assert(page->getParent() == prefetch &&
+                   triton::ppu::mla_kv_pipeline::pageRead(page));
+            assert(isa<PoisonValue>(phi.getIncomingValueForBlock(latch)));
+          }
+        }
+      assert(current == (pagesReused ? 2 : 0) && following == current);
+      if (pagesReused && filename.empty())
+        for (auto *alias : aliases)
+          assert(alias->use_empty());
+      // The original next/end test gates the only following-copy block.
+      // Its false edge skips that block and reaches the original loop exit.
+      assert(prefetch->getSinglePredecessor() == latch);
+      auto *guard = cast<BranchInst>(latch->getTerminator());
+      assert(guard->isConditional() && guard->getCondition() == condition &&
+             guard->getSuccessor(0) == prefetch &&
+             guard->getSuccessor(1) == continuation);
+      auto *backedge = cast<BranchInst>(continuation->getTerminator());
+      assert(backedge->getCondition() == condition &&
+             backedge->getSuccessor(0) == header &&
+             backedge->getSuccessor(1) == exit);
+      assert(triton::ppu::prefetchMlaRope(*module, 256, 94464) == 4);
+      assert(!verifyModule(*module, &errs()));
+      auto once = text(*module);
+      assert(triton::ppu::pipelineMlaKv(*module, 256, 94464, reusePages) == 0);
+      assert(text(*module) == once);
+      ++passed;
+    }
+  return passed;
+}
+
 int main(int argc, char **argv) {
-  assert(argc == 1 || argc == 2);
+  assert(argc == 1 || argc == 2 ||
+         (argc == 3 && StringRef(argv[1]) == "--h32"));
+  unsigned h32Passed = testH32Pages() + testH32Pages({}, true);
+  if (argc == 3) {
+    unsigned realPassed = testH32Pages(argv[2]);
+    outs() << "H32 page reuse:" << h32Passed << " synthetic and " << realPassed
+           << " real checks passed\n";
+    return 0;
+  }
   for (unsigned barrierMode = 0; barrierMode < 6; ++barrierMode)
     for (bool reusePages : {false, true})
       for (unsigned test = 0; test < 13; ++test) {
@@ -325,5 +537,6 @@ int main(int argc, char **argv) {
           assert(text(*module) == once);
         }
       }
-  outs() << "KV pipeline:156 checks passed\n";
+  outs() << "KV pipeline:156 checks passed; H32 pages:" << h32Passed
+         << " checks passed\n";
 }

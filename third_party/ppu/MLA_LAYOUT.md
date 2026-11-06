@@ -14,7 +14,7 @@ They are disabled by default. They do not require warp specialization.
 | `ppu_scalarize_mla_pv` | `false` | Schedule supported PV seed and FP32 update lanes without changing their expressions. |
 | `ppu_scalarize_mla_p15` | `false` | Admit a proven radix256 shift seed when PV scalarization is requested. |
 | `ppu_pipeline_mla_kv` | `false` | Start the next KV copy after the current iteration's final KV read. |
-| `ppu_pipeline_mla_kv_pages` | `false` | Reuse the four page values already read by that pipeline. |
+| `ppu_pipeline_mla_kv_pages` | `false` | Request page-result reuse on legacy paths; the H32/K128 bundle tries it automatically. |
 
 The initial KV-view matcher targets the paged decode content tile
 `[256, 512]`, signed INT8 dot operands with `kWidth=4`, 16 warps and one CTA.
@@ -92,8 +92,9 @@ contain the expected 32-lane output pack and no writers, synchronization or
 unknown effects. Rejected continuations retain their instruction order. This is
 part of the existing pipeline option and adds no operator configuration.
 
-Optional page reuse adds four current/next page result PHIs only after matching
-the canonical table loads and their exact pointer/predicate aliases. The skip
+Page reuse adds one current/next result PHI pair per page: four for the 128 KiB
+KV tile and two for 64 KiB tiles, including H32/K128. It requires matching the
+canonical table loads and their exact pointer/predicate aliases. The skip
 edge cannot feed another loop iteration. Reads and copies remain inside each
 operator call; no input conversion or page lookup is cached across calls.
 
@@ -139,7 +140,13 @@ streaming and KV prefetch use the same effect and SSA checks with the actual
 instructions. Loop indices retain their original 32-bit or 64-bit type.
 The two FP32 scale planes raise encoded shared storage from 94208 to 94464
 bytes. Two signed INT8 PV products and FP32 recurrence state are preserved.
-This option also defaults to false; existing configurations keep their lowering.
+The bundle first tries to reuse the two page-table results. If the attempt is
+rejected without mutation, the compiler retries the existing KV pipeline without
+page-result reuse; if both attempts are rejected, the original lowering remains. Successful reuse
+records `mla_kv_pipelined=1` and `mla_kv_page_results_reused=2`, retaining the
+existing four KR prefetches. The `ppu_pipeline_mla_kv_pages` option continues to
+control the legacy paths. The H32 bundle option still defaults to false;
+configurations that do not enable it retain their prior lowering.
 
 The 64-head and 32-head paths schedule PV in batches of four independent output tiles.
 The dependency graph retains every original MMA input and FP32 expression,

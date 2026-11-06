@@ -683,7 +683,12 @@ class PPUBackend(BaseBackend):
                 metadata["mla_pv_scalarized"] = ppu.scalarize_mla_pv(llvm_mod, 256, metadata["shared"], True, 4)
                 metadata["mla_pv_batches_scheduled"] = 4 if metadata["mla_pv_scalarized"] == 1 else 0
             if metadata["mla_pv_scalarized"] == 1:
-                metadata["mla_kv_pipelined"] = ppu.pipeline_mla_kv(llvm_mod, 256, metadata["shared"], False)
+                page_result = ppu.pipeline_mla_kv(llvm_mod, 256, metadata["shared"], True)
+                assert page_result in (0, 3)
+                result = page_result or ppu.pipeline_mla_kv(llvm_mod, 256, metadata["shared"], False)
+                assert result in (0, 1, 3)
+                metadata["mla_kv_pipelined"] = int(result != 0)
+                metadata["mla_kv_page_results_reused"] = page_result - 1 if page_result == 3 else 0
             if metadata["mla_kv_pipelined"] == 1:
                 metadata["mla_pv_tail_scheduled"] = ppu.schedule_mla_pv_tail(llvm_mod, 256, metadata["shared"])
         metadata["mla_rope_global_loads_prefetched"] = 0
