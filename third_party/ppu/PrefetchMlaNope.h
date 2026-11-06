@@ -318,10 +318,17 @@ inline unsigned schedule(llvm::Function &function, unsigned shared,
     ordered.push_back(instruction);
     return true;
   };
+  // The 256-thread H32 path has fewer independent NoPE products in flight
+  // per CTA.  Prefetch four output tiles (eight chained products) there to
+  // cover the shared-matrix latency; keep the shorter distance on the wider
+  // H64 paths, where more live fragments compete with the PV accumulator.
+  const unsigned groupSize = shared == 94464 ? 8 : 2;
+  const unsigned groupCount = 32 / groupSize;
   auto load = [&](unsigned group) {
-    if (group == 16)
+    if (group == groupCount)
       return true;
-    for (unsigned index = group * 2; index < group * 2 + 2; ++index) {
+    for (unsigned index = group * groupSize; index < (group + 1) * groupSize;
+         ++index) {
       for (auto *word : queryInputs[index].words)
         if (!emit(word, false))
           return false;
@@ -333,8 +340,9 @@ inline unsigned schedule(llvm::Function &function, unsigned shared,
   };
   if (!load(0))
     return 0;
-  for (unsigned group = 0; group < 16; ++group) {
-    for (unsigned index = group * 2; index < group * 2 + 2; ++index) {
+  for (unsigned group = 0; group < groupCount; ++group) {
+    for (unsigned index = group * groupSize; index < (group + 1) * groupSize;
+         ++index) {
       if (!emit(products[index], true))
         return 0;
       for (auto *word : outputs[index])

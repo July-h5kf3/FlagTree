@@ -126,13 +126,14 @@ int main(int argc, char **argv) {
                   cast<ConstantInt>(
                       cast<ConstantAsMetadata>(node->getOperand(2))->getValue())
                       ->getZExtValue();
-      assert(shared == 167936 || shared == 168192);
+      assert(shared == 167936 || shared == 168192 || shared == 123392 ||
+             shared == 94464);
       auto calls = products(*module);
       assert(calls.size() == 96);
       auto query = triton::ppu::mla_nope_prefetch::fragment(calls.front(), 8);
       auto key = triton::ppu::mla_nope_prefetch::fragment(calls.front(), 12);
       assert(query && key);
-      unsigned threads = 512;
+      unsigned threads = shared == 94464 ? 256 : 512;
       if (test == 1)
         module->getGlobalVariable("global_smem")->setAlignment(Align(8));
       if (test == 2) {
@@ -174,10 +175,13 @@ int main(int argc, char **argv) {
                                           instruction.op_end());
       unsigned changed =
           triton::ppu::prefetchMlaNopeFragments(*module, threads, shared);
-      if (changed != (test == 0 ? 1 : 0))
+      // Real lowered modules may already have been scheduled by the backend;
+      // those runs check idempotence rather than requiring a second transform.
+      unsigned expected = test == 0 && argc == 1 ? 1 : 0;
+      if (changed != expected)
         errs() << module->getName() << ": case " << test
                << ", changed=" << changed << "\n";
-      assert(changed == (test == 0 ? 1 : 0));
+      assert(changed == expected);
       assert(!verifyModule(*module, &errs()));
       if (test != 0) {
         assert(print(*module) == before);
@@ -193,6 +197,22 @@ int main(int argc, char **argv) {
               ++count;
             }
         assert(count == operands.size());
+        DenseMap<Instruction *, unsigned> position;
+        for (Instruction &instruction : *calls.front()->getParent()) {
+          position[&instruction] = position.size();
+        }
+        unsigned groupSize = shared == 94464 ? 8 : 2;
+        for (unsigned group = 0; changed && group < 32 / groupSize; ++group) {
+          unsigned first = group * groupSize;
+          for (unsigned index = first; index < first + groupSize; ++index) {
+            auto key =
+                triton::ppu::mla_nope_prefetch::fragment(calls[index], 12);
+            assert(key);
+            assert(position[key->call] < position[calls[first]]);
+            if (index >= groupSize)
+              assert(position[calls[index - groupSize]] < position[key->call]);
+          }
+        }
         std::string once = print(*module);
         assert(triton::ppu::prefetchMlaNopeFragments(*module, threads,
                                                      shared) == 0);
