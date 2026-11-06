@@ -34,7 +34,9 @@ def min_dot_size(target: GPUTarget):
         assert lhs_bitwidth == rhs_bitwidth, "lhs and rhs bitwidth must be the same"
         if lhs_type.scalar.is_fp8():
             return (16, 16, 32)
-        # INT8 dot pads small M/N to the minimum MMA output tile.
+        # INT8 dot accepts M,N >= 1 and pads power-of-two tiles below 16
+        # onto the MMA tile. Sizes that doubling cannot land on 16 are
+        # rejected in the frontend before IR construction.
         if lhs_bitwidth == 8:
             return (1, 1, 32)
         else:

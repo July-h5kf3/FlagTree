@@ -5703,24 +5703,55 @@ def _metax_fp8_dot_operand(dtype, shape, pattern, rng, device):
     return tensor, _decode_float_to_fp64(bits, dtype)
 
 
+@triton.constexpr_function
+def _metax_int8_dot_block(size):
+    # Triton blocks are powers of two. Logical M/N that are not are masked
+    # inside the next power-of-two tile; dot padding then lifts that tile to 16.
+    if size <= 1:
+        return 1
+    return 1 << (size - 1).bit_length()
+
+
 @triton.jit
 def _metax_int8_dot(A, B, C, Y, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, A0: tl.constexpr, A1: tl.constexpr,
                     B0: tl.constexpr, B1: tl.constexpr, USE_ACC: tl.constexpr, EXPLICIT_OUT: tl.constexpr,
                     STAGES: tl.constexpr):
-    m, n, k = tl.arange(0, M), tl.arange(0, N), tl.arange(0, 32)
-    acc = tl.load(C + m[:, None] * N + n[None, :]) if USE_ACC else tl.zeros((M, N), tl.int32)
-    for start in tl.range(0, tl.cdiv(K, 32), num_stages=STAGES):
-        offsets = start * 32 + k
-        a = tl.load(A + m[:, None] * A0 + offsets[None, :] * A1, offsets[None, :] < K, other=0)
-        b = tl.load(B + offsets[:, None] * B0 + n[None, :] * B1, offsets[:, None] < K, other=0)
-        if not USE_ACC and K == 32:
-            acc = tl.dot(a, b)
-        elif EXPLICIT_OUT:
-            acc = tl.dot(a, b, acc=acc, out_dtype=tl.int32)
-        else:
-            acc = tl.dot(a, b, acc=acc)
-    tl.static_assert(acc.dtype == tl.int32)
-    tl.store(Y + m[:, None] * N + n[None, :], acc)
+    block_m: tl.constexpr = _metax_int8_dot_block(M)
+    block_n: tl.constexpr = _metax_int8_dot_block(N)
+    if block_m == M and block_n == N:
+        m, n, k = tl.arange(0, M), tl.arange(0, N), tl.arange(0, 32)
+        acc = tl.load(C + m[:, None] * N + n[None, :]) if USE_ACC else tl.zeros((M, N), tl.int32)
+        for start in tl.range(0, tl.cdiv(K, 32), num_stages=STAGES):
+            offsets = start * 32 + k
+            a = tl.load(A + m[:, None] * A0 + offsets[None, :] * A1, offsets[None, :] < K, other=0)
+            b = tl.load(B + offsets[:, None] * B0 + n[None, :] * B1, offsets[:, None] < K, other=0)
+            if not USE_ACC and K == 32:
+                acc = tl.dot(a, b)
+            elif EXPLICIT_OUT:
+                acc = tl.dot(a, b, acc=acc, out_dtype=tl.int32)
+            else:
+                acc = tl.dot(a, b, acc=acc)
+        tl.static_assert(acc.dtype == tl.int32)
+        tl.store(Y + m[:, None] * N + n[None, :], acc)
+    else:
+        m, n, k = tl.arange(0, block_m), tl.arange(0, block_n), tl.arange(0, 32)
+        row, col = m < M, n < N
+        mm, nn = tl.where(row, m, 0), tl.where(col, n, 0)
+        acc = tl.load(C + mm[:, None] * N + nn[None, :], row[:, None] & col[None, :],
+                      0) if USE_ACC else tl.zeros((block_m, block_n), tl.int32)
+        for start in tl.range(0, tl.cdiv(K, 32), num_stages=STAGES):
+            offsets = start * 32 + k
+            in_k = offsets < K
+            a = tl.load(A + mm[:, None] * A0 + offsets[None, :] * A1, row[:, None] & in_k[None, :], 0)
+            b = tl.load(B + offsets[:, None] * B0 + nn[None, :] * B1, in_k[:, None] & col[None, :], 0)
+            if not USE_ACC and K == 32:
+                acc = tl.dot(a, b)
+            elif EXPLICIT_OUT:
+                acc = tl.dot(a, b, acc=acc, out_dtype=tl.int32)
+            else:
+                acc = tl.dot(a, b, acc=acc)
+        tl.static_assert(acc.dtype == tl.int32)
+        tl.store(Y + mm[:, None] * N + nn[None, :], acc, row[:, None] & col[None, :])
 
 
 @pytest.mark.parametrize("m,n,k,stages,scenario", [
@@ -5735,6 +5766,12 @@ def _metax_int8_dot(A, B, C, Y, M: tl.constexpr, N: tl.constexpr, K: tl.constexp
     (8, 8, 96, 3, "fullstage"),
     (16, 16, 64, 2, "fullstage"),
     (32, 32, 136, 2, ""),
+    # Logical tiles that are not powers of two. The kernel masks them into the
+    # next power-of-two block; dot padding must still finish on a 16-wide tile.
+    (3, 16, 32, 1, ""),
+    (5, 5, 32, 1, ""),
+    (7, 15, 64, 1, ""),
+    (4, 16, 32, 1, ""),
 ])
 @pytest.mark.parametrize("row_major", [False, True])
 @pytest.mark.parametrize("use_acc", [False, True])
@@ -5758,6 +5795,49 @@ def test_metax_int8_dot(m, n, k, stages, scenario, row_major, use_acc, metax_dev
     np.testing.assert_array_equal(actual[:32], np.full(32, 0x13579, dtype=np.int32))
     np.testing.assert_array_equal(actual[-32:], np.full(32, 0x13579, dtype=np.int32))
     np.testing.assert_array_equal(actual[32:-32].reshape(m, n), expected)
+
+
+def test_metax_int8_dot_pad_reaches_mma_tile():
+    try:
+        from triton.language import semantic as sem
+    except ImportError:
+        pytest.skip("MetaX INT8 pad helper is not in the active language spec")
+
+    steps_of = getattr(sem, "_int8_mma_axis_steps", None)
+    if steps_of is None:
+        pytest.skip("MetaX INT8 pad helper is not in the active language spec")
+
+    def lands_on(current, target):
+        steps = steps_of(current, target)
+        assert abs(steps) <= 16
+        size = current
+        if steps >= 0:
+            for _ in range(steps):
+                size *= 2
+        else:
+            for _ in range(-steps):
+                assert size % 2 == 0
+                size //= 2
+        assert size == target
+
+    for size in (1, 2, 4, 8, 16, 32, 64):
+        lands_on(size, max(size, 16))
+        lands_on(max(size, 16), size)
+    # Non-power-of-two axes are rejected before any join/split search.
+    for size in (3, 5, 6, 7, 9, 10, 12, 14, 15):
+        with pytest.raises(ValueError, match="cannot pad axis"):
+            steps_of(size, 16)
+        with pytest.raises(ValueError, match="cannot pad axis"):
+            steps_of(16, size)
+    for m, n in ((3, 16), (5, 5), (7, 15), (4, 16), (1, 1), (8, 16)):
+        for current, target in ((m, max(m, 16)), (n, max(n, 16)), (max(m, 16), m), (max(n, 16), n)):
+            if current == target or (max(current, target) % min(current, target) == 0 and
+                                      (max(current, target) // min(current, target)) &
+                                      ((max(current, target) // min(current, target)) - 1) == 0):
+                lands_on(current, target)
+            else:
+                with pytest.raises(ValueError, match="cannot pad axis"):
+                    steps_of(current, target)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.int64])

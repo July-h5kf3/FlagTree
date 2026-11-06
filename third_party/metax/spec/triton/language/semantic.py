@@ -22,6 +22,33 @@ class IncompatibleTypeErrorImpl(Exception):
         super(IncompatibleTypeErrorImpl, self).__init__(self.message)
 
 
+def _is_pow2(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def _int8_mma_axis_steps(current: int, target: int) -> int:
+    """Doublings (positive) or halvings (negative) that resize one INT8 MMA axis.
+
+    A power-of-two ratio finishes in ``log2(ratio)`` steps and lands on
+    ``target``. Anything else is rejected before IR is built. Growing until the
+    axis is at least the tile and then shrinking (12 → 24 → 12) stops short of
+    16, and folding those two searches into one loop does not terminate.
+    """
+    current = int(current)
+    target = int(target)
+    if current == target:
+        return 0
+    if current <= 0 or target <= 0:
+        raise ValueError(f"MetaX INT8 dot cannot pad axis from {current} to {target}")
+    if current < target and target % current == 0 and _is_pow2(target // current):
+        return (target // current).bit_length() - 1
+    if current > target and current % target == 0 and _is_pow2(current // target):
+        return -((current // target).bit_length() - 1)
+    raise ValueError(f"MetaX INT8 dot cannot pad axis from {current} to {target}. "
+                     f"Only exact power-of-two doubling reaches the MMA tile; "
+                     f"{current} does not land on {target}.")
+
+
 class TritonSemantic(Generic[TensorTy]):
     tensor: Type[TensorTy] = tl.tensor
     lang = tl
@@ -1607,16 +1634,19 @@ class TritonSemantic(Generic[TensorTy]):
             # The MetaX MMA shared layout needs at least a 16x16 output tile.
             # Interleave zero rows/columns using register views, then undo the
             # interleaving after MMA. This never extends a global-memory load.
+            # Each axis takes a fixed number of doublings or halvings, so the
+            # pad cannot chase a non-power-of-two size.
             def resize(value, shape):
                 for axis, size in enumerate(shape):
-                    while value.type.shape[axis] < size:
+                    steps = _int8_mma_axis_steps(value.type.shape[axis], size)
+                    for _ in range(max(steps, 0)):
                         resized_shape = list(value.type.shape)
                         resized_shape[axis] *= 2
                         value = self.join(value, self.full(value.type.shape, 0, value.dtype))
                         if axis == 0:
                             value = self.permute(value, (0, 2, 1))
                         value = self.reshape(value, resized_shape, can_reorder=False)
-                    while value.type.shape[axis] > size:
+                    for _ in range(max(-steps, 0)):
                         resized_shape = list(value.type.shape)
                         resized_shape[axis] //= 2
                         resized_shape.insert(axis + 1, 2)
@@ -1624,6 +1654,9 @@ class TritonSemantic(Generic[TensorTy]):
                         if axis == 0:
                             value = self.permute(value, (0, 2, 1))
                         value, _ = self.split(value)
+                    if int(value.type.shape[axis]) != int(size):
+                        raise ValueError(f"MetaX INT8 dot pad left axis {axis} at "
+                                         f"{int(value.type.shape[axis])}, expected {int(size)}")
                 return value
 
             padded_shape = [max(M, 16), max(N, 16)]
