@@ -686,6 +686,10 @@ class PPUBackend(BaseBackend):
                 metadata["mla_kv_pipelined"] = ppu.pipeline_mla_kv(llvm_mod, 256, metadata["shared"], False)
             if metadata["mla_kv_pipelined"] == 1:
                 metadata["mla_pv_tail_scheduled"] = ppu.schedule_mla_pv_tail(llvm_mod, 256, metadata["shared"])
+        metadata["mla_rope_global_loads_prefetched"] = 0
+        if h32 and metadata["mla_pv_scalarized"] == 1 and metadata["mla_kv_pipelined"] == 1:
+            metadata["mla_rope_global_loads_prefetched"] = ppu.prefetch_mla_rope(llvm_mod, metadata["num_warps"] * 32,
+                                                                                 metadata["shared"])
         metadata["global_scratch_size"] = src.get_int_attr("ttg.global_scratch_memory_size")
         metadata["global_scratch_align"] = src.get_int_attr("ttg.global_scratch_memory_alignment")
         metadata["profile_scratch_size"] = src.get_int_attr("ttg.profile_scratch_memory_size") or 0

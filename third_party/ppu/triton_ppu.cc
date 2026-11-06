@@ -29,6 +29,7 @@
 #include "PPUGPUToLLVM/Passes.h"
 #include "PipelineMlaKv.h"
 #include "PrefetchMlaNope.h"
+#include "PrefetchMlaRope.h"
 #include "ReadonlySharedMatrices.h"
 #include "ReuseMlaKvViews.h"
 #include "ScalarizeMlaPv.h"
@@ -128,6 +129,7 @@ static void checkMatmulConstraints(const std::string &A_dtype,
 }
 
 void init_triton_ppu(py::module &&m) {
+  m.def("prefetch_mla_rope", &::triton::ppu::prefetchMlaRope);
   m.def("schedule_mla_pv_tail", &::triton::ppu::scheduleMlaPvTail);
   m.def("prove_uniform_mla_loop", &mlir::triton::ppu::proveUniformMlaLoop);
   m.def("pipeline_mla_kv", &::triton::ppu::pipelineMlaKv, py::arg("module"),
