@@ -231,6 +231,7 @@ class HGGCOptions:
     ppu_pipeline_mla_kv_pages: bool = False
     ppu_mla_h64_k128: bool = False
     ppu_mla_h32_k128: bool = False
+    ppu_gather_mla_row_reductions: bool = False
     enable_fp_fusion: bool = True
     enable_reflect_ftz: bool = True  # ftz in libdevice
     launch_cooperative_grid: bool = False
@@ -695,6 +696,9 @@ class PPUBackend(BaseBackend):
         if h32 and metadata["mla_pv_scalarized"] == 1 and metadata["mla_kv_pipelined"] == 1:
             metadata["mla_rope_global_loads_prefetched"] = ppu.prefetch_mla_rope(llvm_mod, metadata["num_warps"] * 32,
                                                                                  metadata["shared"])
+        metadata["mla_row_reductions_gathered"] = 0
+        if options.ppu_gather_mla_row_reductions and h32 and metadata["mla_rope_global_loads_prefetched"] == 4:
+            metadata["mla_row_reductions_gathered"] = ppu.gather_mla_row_reductions(llvm_mod, 256, metadata["shared"])
         metadata["global_scratch_size"] = src.get_int_attr("ttg.global_scratch_memory_size")
         metadata["global_scratch_align"] = src.get_int_attr("ttg.global_scratch_memory_alignment")
         metadata["profile_scratch_size"] = src.get_int_attr("ttg.profile_scratch_memory_size") or 0

@@ -155,3 +155,24 @@ proof permits the next copy with 51 or 49 PV MMA instructions remaining,
 respectively. This whole PV schedule replaces the separate continuation-only
 tail schedule on both paths. Scalarization callers that omit the batch argument
 retain their existing schedule.
+
+## Optional H32 row-partial gather
+
+`ppu_gather_mla_row_reductions` defaults to false. With the existing H32/K128
+bundle it can replace two supported row-reduction publication phases by six
+aligned vector reads of the original partial tables. Each reader combines
+partials in the original XOR2/XOR1 order, keeping FP32 arithmetic and flags.
+The NoPE/RoPE/PV operands, query/key layouts and shared capacity stay unchanged.
+
+The proof requires the exact two table regions, complete per-thread writer/read
+coverage, a closed intermediate reduction graph, and a subsequent overwrite
+before any other read of the removed writeback values. Unknown effects or
+unmatched geometry retain the original lowering. The initial publication and
+surrounding lifetime barriers remain; only the two intermediate completion
+barriers are removed after the proof succeeds. Inspect
+`mla_row_reductions_gathered` (0 or 6) in metadata.
+
+Keep retained operator configurations available. This transformation is an
+optional tuning candidate because representative head counts have different
+performance outcomes. The operator can discover the option schema and append
+enabled H32 candidates while preserving normalized disabled configurations.

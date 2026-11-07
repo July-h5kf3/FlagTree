@@ -25,6 +25,7 @@
 #include "Dialect/PPUGPU/IR/Dialect.h"
 #include "Dialect/TritonPPUGPU/IR/Dialect.h"
 #include "EarlySharedFloatScales.h"
+#include "GatherMlaRowReductions.h"
 #include "GlobalLoadOffsets.h"
 #include "PPUGPUToLLVM/Passes.h"
 #include "PipelineMlaKv.h"
@@ -129,6 +130,7 @@ static void checkMatmulConstraints(const std::string &A_dtype,
 }
 
 void init_triton_ppu(py::module &&m) {
+  m.def("gather_mla_row_reductions", &::triton::ppu::gatherMlaRowReductions);
   m.def("prefetch_mla_rope", &::triton::ppu::prefetchMlaRope);
   m.def("schedule_mla_pv_tail", &::triton::ppu::scheduleMlaPvTail);
   m.def("prove_uniform_mla_loop", &mlir::triton::ppu::proveUniformMlaLoop);
