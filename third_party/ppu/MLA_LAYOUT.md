@@ -176,3 +176,20 @@ Keep retained operator configurations available. This transformation is an
 optional tuning candidate because representative head counts have different
 performance outcomes. The operator can discover the option schema and append
 enabled H32 candidates while preserving normalized disabled configurations.
+
+## Optional unique scale writers
+
+`ppu_unique_mla_scale_writers` defaults to false. It selects one writer for
+each eight-byte packet in the two early FP32 scale tables. The recognized
+256-thread H32 layout has sixteen distinct packets per table, with sixteen
+threads storing each packet. The pass proves complete address coverage and
+equal payloads for each address class before replacing the two stores with
+predicated vector stores. Metadata `mla_scale_stores_deduplicated` is 0 or 2.
+
+Payload equivalence follows published row-table reads, pure operations, the
+branch condition of each exp2 diamond, and the initialized loop row state.
+Unknown values, effects, control or geometry reject before mutation. Original
+arithmetic, memory addresses, barriers and non-store instructions are retained.
+The SDK may lower the predicate through execution masks and scalar branches;
+fewer active writers do not imply fewer issued waits or improved latency.
+Retain disabled configurations and measure each tuning key before selection.
