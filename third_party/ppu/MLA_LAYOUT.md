@@ -225,3 +225,22 @@ fall back to pipelining without page-result reuse. Signed INT8 products, their
 reconstruction and FP32 recurrence expressions are retained. This option can
 increase register and private-frame usage, so resource validity and complete
 operator timing determine whether a configuration is useful.
+
+### H16 RoPE K asynchronous copy
+
+`ppu_mla_h16_kr_copy` defaults to false and requires the H16 KV pipeline,
+256 threads and 83968 bytes of shared memory. Four existing BF16 RoPE K
+load/store chains become zero-filling 16-byte asynchronous copies. The
+commit stays at the original load position; the wait, existing publication
+barrier and four matrix reads move after the 16 NoPE INT8 products.
+
+The matcher proves one writer for every byte in the 16 KiB KR plane at
+[65536,81920), checks every thread and address choice of crossed NoPE reads
+against [0,65536), and retains the prior wait-group-zero/CTA lifetime boundary.
+Unknown effects, other writers or barriers, unaligned sources, escaping
+matrix values and early consumers reject before mutation. MMA operands,
+FP32 arithmetic, shared size and CTA barrier count stay unchanged. The
+current source-alignment proof rejects half-typed offsets; unmatched cases
+keep their existing path.
+`test/async_mla_h16_kr.cpp` accepts actual pre-transform LLVM fixtures and
+checks preservation, idempotence and sixteen nonmutating rejection cases.

@@ -21,6 +21,7 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
+#include "AsyncMlaH16Kr.h"
 #include "AsyncMlaKvCopy.h"
 #include "Dialect/PPUGPU/IR/Dialect.h"
 #include "Dialect/TritonPPUGPU/IR/Dialect.h"
@@ -140,6 +141,7 @@ void init_triton_ppu(py::module &&m) {
   m.def("unique_mla_scale_writers", &::triton::ppu::uniqueMlaScaleWriters);
   m.def("unique_mla_final_rows", &::triton::ppu::uniqueMlaFinalRows);
   m.def("prefetch_mla_rope", &::triton::ppu::prefetchMlaRope);
+  m.def("async_mla_h16_kr", &::triton::ppu::asyncMlaH16Kr);
   m.def("joint_mla_kr_copy", &::triton::ppu::jointMlaKrCopy);
   m.def("fold_mla_logit_scale", &::triton::ppu::foldMlaLogitScale);
   m.def("repack_mla_low_probability", &::triton::ppu::repackMlaLowProbability);

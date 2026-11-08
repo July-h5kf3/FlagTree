@@ -6,6 +6,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
 
 namespace triton::ppu {

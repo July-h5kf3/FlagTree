@@ -231,6 +231,7 @@ class HGGCOptions:
     ppu_pipeline_mla_kv: bool = False
     ppu_pipeline_mla_kv_pages: bool = False
     ppu_mla_h16_kv_pipeline: bool = False
+    ppu_mla_h16_kr_copy: bool = False
     ppu_mla_h64_k128: bool = False
     ppu_mla_h32_k128: bool = False
     ppu_gather_mla_row_reductions: bool = False
@@ -731,6 +732,11 @@ class PPUBackend(BaseBackend):
         if options.ppu_unique_mla_final_rows and h32 and metadata["mla_kv_pipelined"] == 1:
             metadata["mla_final_rows_deduplicated"] = ppu.unique_mla_final_rows(llvm_mod, 256, metadata["shared"],
                                                                                 metadata["mla_kv_loop_uniform"] == 1)
+        metadata["mla_h16_kr_copies"] = 0
+        if (options.ppu_mla_h16_kr_copy and capability == 80 and metadata["num_warps"] == 8
+                and metadata["shared"] == 83968 and metadata["mla_kv_pipelined"] == 1
+                and metadata["mla_kv_loop_uniform"] == 1):
+            metadata["mla_h16_kr_copies"] = ppu.async_mla_h16_kr(llvm_mod, 256, metadata["shared"])
         metadata["mla_kr_joint_copies"] = 0
         if (options.ppu_mla_kr_joint_copy and h32 and metadata["mla_kv_loop_uniform"] == 1
                 and metadata["mla_kv_page_results_reused"] == 2 and metadata["mla_rope_global_loads_prefetched"] == 4):
