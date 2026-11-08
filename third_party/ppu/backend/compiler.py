@@ -236,6 +236,7 @@ class HGGCOptions:
     ppu_unique_mla_scale_writers: bool = False
     ppu_unique_mla_final_rows: bool = False
     ppu_mla_kr_joint_copy: bool = False
+    ppu_mla_logit_scale_fold: bool = False
     enable_fp_fusion: bool = True
     enable_reflect_ftz: bool = True  # ftz in libdevice
     launch_cooperative_grid: bool = False
@@ -721,6 +722,9 @@ class PPUBackend(BaseBackend):
                 and metadata["mla_kv_page_results_reused"] == 2 and metadata["mla_rope_global_loads_prefetched"] == 4):
             metadata["shared"], metadata["mla_kr_joint_copies"] = ppu.joint_mla_kr_copy(
                 llvm_mod, 256, metadata["shared"])
+        metadata["mla_logit_scale_folded"] = 0
+        if options.ppu_mla_logit_scale_fold and metadata["mla_kr_joint_copies"] == 1:
+            metadata["mla_logit_scale_folded"] = ppu.fold_mla_logit_scale(llvm_mod, 256, metadata["shared"])
         metadata["global_scratch_size"] = src.get_int_attr("ttg.global_scratch_memory_size")
         metadata["global_scratch_align"] = src.get_int_attr("ttg.global_scratch_memory_alignment")
         metadata["profile_scratch_size"] = src.get_int_attr("ttg.profile_scratch_memory_size") or 0
