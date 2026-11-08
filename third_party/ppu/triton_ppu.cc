@@ -37,6 +37,7 @@
 #include "TritonPPUGPUToLLVM/Passes.h"
 #include "TritonPPUGPUTransforms/Passes.h"
 #include "UniformMlaLoop.h"
+#include "UniqueMlaFinalRows.h"
 #include "UniqueMlaScaleWriters.h"
 #include "acblas_instance.h"
 #include "mlir/Pass/PassManager.h"
@@ -133,6 +134,7 @@ static void checkMatmulConstraints(const std::string &A_dtype,
 void init_triton_ppu(py::module &&m) {
   m.def("gather_mla_row_reductions", &::triton::ppu::gatherMlaRowReductions);
   m.def("unique_mla_scale_writers", &::triton::ppu::uniqueMlaScaleWriters);
+  m.def("unique_mla_final_rows", &::triton::ppu::uniqueMlaFinalRows);
   m.def("prefetch_mla_rope", &::triton::ppu::prefetchMlaRope);
   m.def("schedule_mla_pv_tail", &::triton::ppu::scheduleMlaPvTail);
   m.def("prove_uniform_mla_loop", &mlir::triton::ppu::proveUniformMlaLoop);

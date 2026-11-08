@@ -193,3 +193,17 @@ arithmetic, memory addresses, barriers and non-store instructions are retained.
 The SDK may lower the predicate through execution masks and scalar branches;
 fewer active writers do not imply fewer issued waits or improved latency.
 Retain disabled configurations and measure each tuning key before selection.
+
+## Optional unique final row packets
+
+`ppu_unique_mla_final_rows` defaults to false. The recognized H32 loop state
+reaches two final shared packets: denominators consumed by output normalization
+and the final LSE values. Each eight-byte packet has sixteen equivalent writers.
+The pass checks their complete use graph, uniform loop provenance, initialized
+row-state recurrence, exit selectors and per-thread address classes before
+selecting one writer per packet. Metadata `mla_final_rows_deduplicated` is 0 or 2.
+
+The loop, FP32 state, original arithmetic, memory addresses and publication
+barriers remain unchanged. Unknown values, effects, payloads or geometry retain
+the original stores. Keep retained configurations available and select this
+capability through measured tuning; it does not require the early-scale option.
