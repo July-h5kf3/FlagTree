@@ -34,6 +34,7 @@
 #include "PrefetchMlaNope.h"
 #include "PrefetchMlaRope.h"
 #include "ReadonlySharedMatrices.h"
+#include "RepackMlaLowProbability.h"
 #include "ReuseMlaKvViews.h"
 #include "ReuseMlaSplitKv.h"
 #include "ScalarizeMlaPv.h"
@@ -141,6 +142,7 @@ void init_triton_ppu(py::module &&m) {
   m.def("prefetch_mla_rope", &::triton::ppu::prefetchMlaRope);
   m.def("joint_mla_kr_copy", &::triton::ppu::jointMlaKrCopy);
   m.def("fold_mla_logit_scale", &::triton::ppu::foldMlaLogitScale);
+  m.def("repack_mla_low_probability", &::triton::ppu::repackMlaLowProbability);
   m.def("schedule_mla_pv_tail", &::triton::ppu::scheduleMlaPvTail);
   m.def("prove_uniform_mla_loop", &mlir::triton::ppu::proveUniformMlaLoop);
   m.def("pipeline_mla_kv", &::triton::ppu::pipelineMlaKv, py::arg("module"),
