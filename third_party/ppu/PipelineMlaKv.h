@@ -34,13 +34,16 @@ inline unsigned run(llvm::Function &function, unsigned shared, bool reusePages,
       function.hasFnAttribute("ppu.mla.kv.pipeline"))
     return 0;
   bool h32 = threads == 256 && shared == 94464;
-  unsigned kvBytes = small || h32 ? 65536 : 131072;
-  unsigned pageStep = small || h32 ? 2 : 4;
+  bool h16 = threads == 256 && shared == 83968;
+  unsigned qkProducts = h16 ? 16 : 32;
+  unsigned kvBytes = small || h32 || h16 ? 65536 : 131072;
+  unsigned pageStep = small || h32 || h16 ? 2 : 4;
   bool pvBatch =
       ((threads == 512 && shared == 123392) || h32) &&
       function.getFnAttribute("ppu.mla.pv.batch").getValueAsString() == "4";
-  unsigned remainingProducts =
-      pvBatch ? (h32 ? 49 : 51) : (h32 ? 37 : (small ? 39 : 35));
+  unsigned remainingProducts = h16       ? 32
+                               : pvBatch ? (h32 ? 49 : 51)
+                                         : (h32 ? 37 : (small ? 39 : 35));
   SmallVector<CallInst *> products, copies;
   DenseMap<Instruction *, unsigned> position;
   for (BasicBlock &block : function)
@@ -55,7 +58,7 @@ inline unsigned run(llvm::Function &function, unsigned shared, bool reusePages,
             copies.push_back(call);
         }
     }
-  if (products.size() != 96 || copies.size() != (small ? 8 : 16))
+  if (products.size() != (h16 ? 48 : 96) || copies.size() != (small ? 8 : 16))
     return 0;
   auto *header = products.front()->getParent();
   DominatorTree dominance(function);
@@ -68,7 +71,7 @@ inline unsigned run(llvm::Function &function, unsigned shared, bool reusePages,
   if (!preheader || !latch || latch == header ||
       llvm::any_of(copies,
                    [&](auto *call) { return call->getParent() != header; }) ||
-      llvm::any_of(ArrayRef(products).drop_front(32),
+      llvm::any_of(ArrayRef(products).drop_front(qkProducts),
                    [&](auto *call) { return call->getParent() != latch; }))
     return 0;
   auto *backedge = dyn_cast<BranchInst>(latch->getTerminator());
@@ -88,7 +91,7 @@ inline unsigned run(llvm::Function &function, unsigned shared, bool reusePages,
       next->getParent() != latch || !step || !step->equalsInt(pageStep) ||
       !iv || iv->getParent() != header ||
       (!iv->getType()->isIntegerTy(32) &&
-       !(h32 && iv->getType()->isIntegerTy(64))) ||
+       !((h32 || h16) && iv->getType()->isIntegerTy(64))) ||
       iv->getNumIncomingValues() != 2 || iv->getBasicBlockIndex(latch) < 0 ||
       iv->getIncomingValueForBlock(latch) != next ||
       iv->getBasicBlockIndex(preheader) < 0)
@@ -163,7 +166,7 @@ inline unsigned run(llvm::Function &function, unsigned shared, bool reusePages,
   expected.set(0, kvBytes);
   SmallPtrSet<LoadInst *, 32> readers;
   LoadInst *last = nullptr;
-  for (auto *product : ArrayRef(products).drop_front(32))
+  for (auto *product : ArrayRef(products).drop_front(qkProducts))
     for (unsigned index = 12; index < 16; ++index) {
       if (product->arg_size() != 16)
         return 0;
@@ -393,7 +396,7 @@ inline unsigned run(llvm::Function &function, unsigned shared, bool reusePages,
 inline unsigned pipelineMlaKv(llvm::Module &module, unsigned threads,
                               unsigned shared, bool reusePages = false) {
   if (!((threads == 512 && (shared == 168192 || shared == 123392)) ||
-        (threads == 256 && shared == 94464)))
+        (threads == 256 && (shared == 94464 || shared == 83968))))
     return 0;
   unsigned changed = 0;
   for (auto &function : module)

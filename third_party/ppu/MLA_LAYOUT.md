@@ -15,6 +15,7 @@ They are disabled by default. They do not require warp specialization.
 | `ppu_scalarize_mla_p15` | `false` | Admit a proven radix256 shift seed when PV scalarization is requested. |
 | `ppu_pipeline_mla_kv` | `false` | Start the next KV copy after the current iteration's final KV read. |
 | `ppu_pipeline_mla_kv_pages` | `false` | Request page-result reuse on legacy paths; the H32/K128 bundle tries it automatically. |
+| `ppu_mla_h16_kv_pipeline` | `false` | Admit the H16 split-KV tile to KV pipelining when `ppu_pipeline_mla_kv` is enabled. |
 
 The initial KV-view matcher targets the paged decode content tile
 `[256, 512]`, signed INT8 dot operands with `kWidth=4`, 16 warps and one CTA.
@@ -207,3 +208,20 @@ The loop, FP32 state, original arithmetic, memory addresses and publication
 barriers remain unchanged. Unknown values, effects, payloads or geometry retain
 the original stores. Keep retained configurations available and select this
 capability through measured tuning; it does not require the early-scale option.
+
+## Optional H16 KV pipeline
+
+`ppu_mla_h16_kv_pipeline` admits the already shared, asynchronous H16/K128
+tile with eight warps and 83968 bytes of shared memory. It requires sixteen
+NoPE and thirty-two PV INT8 MMA operations, sixty-four unique V word readers,
+and all thirty-two PV operations after the last V read. The existing complete
+thread-address, writer, effect, SSA and loop-uniformity checks run before
+mutation. Equivalent constant PHI inputs may be evaluated per thread; differing,
+unknown and cyclic inputs retain the original code.
+
+The next copy remains conditional on another KV iteration. Page-result reuse
+continues to follow `ppu_pipeline_mla_kv_pages`; a rejected reuse attempt may
+fall back to pipelining without page-result reuse. Signed INT8 products, their
+reconstruction and FP32 recurrence expressions are retained. This option can
+increase register and private-frame usage, so resource validity and complete
+operator timing determine whether a configuration is useful.

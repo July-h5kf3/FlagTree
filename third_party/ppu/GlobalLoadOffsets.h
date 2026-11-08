@@ -35,6 +35,13 @@ evaluate(llvm::Value *value, unsigned tid,
       if (function->getName() == "llvm.nvvm.read.ptx.sreg.tid.x")
         result = llvm::APInt(32, tid);
     }
+  } else if (auto *phi = llvm::dyn_cast<llvm::PHINode>(value)) {
+    for (llvm::Value *incoming : phi->incoming_values()) {
+      auto constant = evaluate(incoming, tid, cache, depth + 1);
+      if (!constant || (result && *result != *constant))
+        return std::nullopt;
+      result = constant;
+    }
   } else if (auto *cast = llvm::dyn_cast<llvm::CastInst>(value)) {
     auto source = evaluate(cast->getOperand(0), tid, cache, depth + 1);
     if (source) {

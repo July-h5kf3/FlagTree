@@ -230,6 +230,7 @@ class HGGCOptions:
     ppu_scalarize_mla_p15: bool = False
     ppu_pipeline_mla_kv: bool = False
     ppu_pipeline_mla_kv_pages: bool = False
+    ppu_mla_h16_kv_pipeline: bool = False
     ppu_mla_h64_k128: bool = False
     ppu_mla_h32_k128: bool = False
     ppu_gather_mla_row_reductions: bool = False
@@ -705,6 +706,17 @@ class PPUBackend(BaseBackend):
                 metadata["mla_kv_page_results_reused"] = page_result - 1 if page_result == 3 else 0
             if metadata["mla_kv_pipelined"] == 1:
                 metadata["mla_pv_tail_scheduled"] = ppu.schedule_mla_pv_tail(llvm_mod, 256, metadata["shared"])
+        if (options.ppu_mla_h16_kv_pipeline and options.ppu_pipeline_mla_kv and capability == 80
+                and metadata["num_warps"] == 8 and metadata["shared"] == 83968
+                and metadata.get("mla_split_kv_reused", 0) == 1 and metadata.get("mla_async_kv_copies", 0) == 1
+                and metadata["mla_kv_loop_uniform"] == 1):
+            page_result = (ppu.pipeline_mla_kv(llvm_mod, 256, metadata["shared"], True)
+                           if options.ppu_pipeline_mla_kv_pages else 0)
+            assert page_result in (0, 3)
+            result = page_result or ppu.pipeline_mla_kv(llvm_mod, 256, metadata["shared"], False)
+            assert result in (0, 1, 3)
+            metadata["mla_kv_pipelined"] = int(result != 0)
+            metadata["mla_kv_page_results_reused"] = page_result - 1 if page_result == 3 else 0
         metadata["mla_rope_global_loads_prefetched"] = 0
         if h32 and metadata["mla_pv_scalarized"] == 1 and metadata["mla_kv_pipelined"] == 1:
             metadata["mla_rope_global_loads_prefetched"] = ppu.prefetch_mla_rope(llvm_mod, metadata["num_warps"] * 32,

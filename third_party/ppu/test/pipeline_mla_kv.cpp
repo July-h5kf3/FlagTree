@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "PipelineMlaKv.h"
 #include "PrefetchMlaRope.h"
+#include "llvm/AsmParser/Parser.h"
 #include "llvm/IR/NoFolder.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
@@ -16,7 +17,8 @@ static std::string text(Module &module) {
   return result;
 }
 static std::unique_ptr<Module> fixture(LLVMContext &context, bool h32 = false,
-                                       bool wideIV = false) {
+                                       bool wideIV = false, bool h16 = false) {
+  bool narrow = h32 || h16;
   auto module = std::make_unique<Module>("mla-kv-pipeline", context);
   module->setDataLayout("e-p:64:64-p3:32:32");
   IRBuilder<NoFolder> builder(context);
@@ -46,7 +48,7 @@ static std::unique_ptr<Module> fixture(LLVMContext &context, bool h32 = false,
   Value *byte4 = builder.CreateMul(tid, builder.getInt32(4));
   builder.CreateBr(header);
   builder.SetInsertPoint(header);
-  auto *ivType = h32 && wideIV ? builder.getInt64Ty() : builder.getInt32Ty();
+  auto *ivType = narrow && wideIV ? builder.getInt64Ty() : builder.getInt32Ty();
   auto *iv = builder.CreatePHI(ivType, 2);
   iv->addIncoming(ConstantInt::get(ivType, 0), entry);
   // A second PHI supplies the deliberately invalid floating-dependency test.
@@ -70,7 +72,7 @@ static std::unique_ptr<Module> fixture(LLVMContext &context, bool h32 = false,
   auto *copyAsm = InlineAsm::get(
       copyType, "cp.async.cg.shared.global [ $0 + 0 ], [ $1 + 0 ], 0x10, $2;",
       "r,l,r", true);
-  SmallVector<Value *> pages(h32 ? 2 : 4);
+  SmallVector<Value *> pages(narrow ? 2 : 4);
   for (unsigned index = 0; index < pages.size(); ++index) {
     Value *offset =
         index ? builder.CreateAdd(iv, ConstantInt::get(ivType, index)) : iv;
@@ -81,11 +83,11 @@ static std::unique_ptr<Module> fixture(LLVMContext &context, bool h32 = false,
   }
   for (unsigned packet = 0; packet < 16; ++packet) {
     auto *source = builder.CreateGEP(builder.getInt8Ty(), function->getArg(2),
-                                     pages[packet / (h32 ? 8 : 4)]);
+                                     pages[packet / (narrow ? 8 : 4)]);
     auto *destination = builder.CreateGEP(
         builder.getInt8Ty(), shared,
         builder.CreateAdd(byte16,
-                          builder.getInt32(packet * (h32 ? 4096 : 8192))));
+                          builder.getInt32(packet * (narrow ? 4096 : 8192))));
     builder.CreateCall(copyType, copyAsm,
                        {destination, source, builder.getInt32(16)});
   }
@@ -109,7 +111,7 @@ static std::unique_ptr<Module> fixture(LLVMContext &context, bool h32 = false,
       mmaType, triton::ppu::mla_nope_prefetch::ProductAsm,
       "=r,=r,=r,=r,=r,=r,=r,=r,0,1,2,3,4,5,6,7,r,r,r,r,r,r,r,r", true);
   SmallVector<Value *> zero(16, builder.getInt32(0));
-  for (unsigned index = 0; index < 32; ++index)
+  for (unsigned index = 0; index < (h16 ? 16 : 32); ++index)
     builder.CreateCall(mmaType, mma, zero);
   if (h32) {
     auto *krType = FunctionType::get(
@@ -142,24 +144,25 @@ static std::unique_ptr<Module> fixture(LLVMContext &context, bool h32 = false,
     auto *address = builder.CreateGEP(
         builder.getInt8Ty(), shared,
         builder.CreateAdd(byte4,
-                          builder.getInt32(index * (h32 ? 1024 : 2048))));
+                          builder.getInt32(index * (narrow ? 1024 : 2048))));
     auto *load = builder.CreateLoad(builder.getInt32Ty(), address);
     words[index] = builder.CreateCall(transpose, {load});
   };
-  for (unsigned index = 0; index < 60; ++index)
+  for (unsigned index = 0; index < (h16 ? 64 : 60); ++index)
     read(index);
   unsigned tailStart = h32 ? 15 : 29;
-  for (unsigned index = 0; index < 64; ++index) {
-    if (index == tailStart)
+  for (unsigned index = 0; index < (h16 ? 32 : 64); ++index) {
+    if (!h16 && index == tailStart)
       for (unsigned word = 60; word < 64; ++word)
         read(word);
     SmallVector<Value *> args(12, builder.getInt32(0));
-    unsigned group = index < tailStart ? index % 15 : index % 16;
+    unsigned group =
+        h16 ? index % 16 : (index < tailStart ? index % 15 : index % 16);
     for (unsigned word = 0; word < 4; ++word)
       args.push_back(words[group * 4 + word]);
     builder.CreateCall(mmaType, mma, args);
   }
-  auto *next = builder.CreateAdd(iv, ConstantInt::get(ivType, h32 ? 2 : 4));
+  auto *next = builder.CreateAdd(iv, ConstantInt::get(ivType, narrow ? 2 : 4));
   auto *condition = builder.CreateICmpSLT(next, ConstantInt::get(ivType, 16));
   iv->addIncoming(next, body);
   state->addIncoming(state, body);
@@ -338,9 +341,142 @@ static unsigned testH32Pages(StringRef filename = {}, bool wideIV = false) {
   return passed;
 }
 
+static unsigned testH16() {
+  unsigned passed = 0;
+  for (bool wideIV : {false, true})
+    for (bool pages : {false, true})
+      for (unsigned test = 0; test < 11; ++test) {
+        LLVMContext context;
+        auto module = fixture(context, false, wideIV, true);
+        SmallVector<CallInst *> products, copies;
+        CallInst *wait = nullptr;
+        for (Function &function : *module)
+          for (BasicBlock &block : function)
+            for (Instruction &instruction : block)
+              if (auto *call = dyn_cast<CallInst>(&instruction)) {
+                if (auto *assembly =
+                        dyn_cast<InlineAsm>(call->getCalledOperand())) {
+                  if (assembly->getAsmString().contains(".s32.s8.s8.s32"))
+                    products.push_back(call);
+                  if (assembly->getAsmString().starts_with(
+                          "cp.async.cg.shared.global"))
+                    copies.push_back(call);
+                } else if (call->getCalledFunction() &&
+                           call->getCalledFunction()->getName() ==
+                               "llvm.nvvm.cp.async.wait.group") {
+                  wait = call;
+                }
+              }
+        assert(products.size() == 48 && copies.size() == 16 && wait);
+        auto *function = products.front()->getFunction();
+        DominatorTree dominance(*function);
+        LoopInfo loops(dominance);
+        auto *loop = loops.getLoopFor(products.front()->getParent());
+        auto *branch = cast<BranchInst>(loop->getLoopLatch()->getTerminator());
+        auto *condition = cast<ICmpInst>(branch->getCondition());
+        auto *next = cast<BinaryOperator>(condition->getOperand(0));
+        auto *transpose = cast<CallInst>(products[16]->getArgOperand(12));
+        auto *read = cast<LoadInst>(transpose->getArgOperand(0));
+        IRBuilder<> builder(products[16]);
+        if (test == 1)
+          builder.CreateLoad(builder.getInt32Ty(), read->getPointerOperand());
+        if (test == 2)
+          builder.CreateStore(builder.getInt32(0), function->getArg(6));
+        if (test == 3)
+          builder.CreateCall(module->getOrInsertFunction(
+              "unknown_h16_effect",
+              FunctionType::get(builder.getVoidTy(), false)));
+        if (test == 4)
+          wait->setArgOperand(0, builder.getInt32(1));
+        if (test == 5)
+          next->setOperand(1, ConstantInt::get(next->getType(), 4));
+        if (test == 6) {
+          IRBuilder<> before(copies.front());
+          copies.front()->setArgOperand(
+              0, before.CreateGEP(before.getInt8Ty(),
+                                  copies.front()->getArgOperand(0),
+                                  before.getInt32(4)));
+        }
+        if (test == 7)
+          read->setVolatile(true);
+        if (test == 10)
+          copies.front()->eraseFromParent();
+        assert(!verifyModule(*module, &errs()));
+        auto before = text(*module);
+        unsigned rewritten = triton::ppu::pipelineMlaKv(
+            *module, test == 8 ? 512 : 256, test == 9 ? 83969 : 83968, pages);
+        assert(rewritten == (test == 0 ? (pages ? 3u : 1u) : 0u));
+        assert(!verifyModule(*module, &errs()));
+        if (!rewritten)
+          assert(text(*module) == before);
+        auto once = text(*module);
+        assert(triton::ppu::pipelineMlaKv(*module, test == 8 ? 512 : 256,
+                                          test == 9 ? 83969 : 83968,
+                                          pages) == 0);
+        assert(text(*module) == once);
+        ++passed;
+      }
+  return passed;
+}
+
+static void testEqualPhis() {
+  LLVMContext context;
+  SMDiagnostic diagnostic;
+  for (StringRef right :
+       {"and i32 %tid, 3", "xor i32 %tid, -1", "add i32 %unknown, 0"}) {
+    std::string source = R"(
+      declare i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+      define i32 @test(i1 %condition, i32 %unknown) {
+      entry:
+        %tid = call i32 @llvm.nvvm.read.ptx.sreg.tid.x()
+        br i1 %condition, label %left, label %right
+      left:
+        %a = and i32 %tid, 3
+        br label %merge
+      right:
+        %b = )" + right.str() +
+                         R"(
+        br label %merge
+      merge:
+        %joined = phi i32 [ %a, %left ], [ %b, %right ]
+        ret i32 %joined
+      }
+    )";
+    auto module = parseAssemblyString(source, diagnostic, context);
+    assert(module && !verifyModule(*module, &errs()));
+    auto *phi = &module->getFunction("test")->back().front();
+    for (unsigned tid = 0; tid < 256; ++tid) {
+      DenseMap<Value *, APInt> cache;
+      auto value = triton::ppu::global_load_offsets::evaluate(phi, tid, cache);
+      if (right == "and i32 %tid, 3")
+        assert(value && value->getZExtValue() == (tid & 3));
+      else
+        assert(!value);
+    }
+  }
+  auto module = parseAssemblyString(R"(
+    define i32 @cycle(i1 %condition) {
+    entry:
+      br label %loop
+    loop:
+      %joined = phi i32 [ 0, %entry ], [ %joined, %loop ]
+      br i1 %condition, label %loop, label %exit
+    exit:
+      ret i32 %joined
+    }
+  )",
+                                    diagnostic, context);
+  assert(module && !verifyModule(*module, &errs()));
+  DenseMap<Value *, APInt> cache;
+  auto *phi = &std::next(module->getFunction("cycle")->begin())->front();
+  assert(!triton::ppu::global_load_offsets::evaluate(phi, 0, cache));
+}
+
 int main(int argc, char **argv) {
   assert(argc == 1 || argc == 2 ||
          (argc == 3 && StringRef(argv[1]) == "--h32"));
+  testEqualPhis();
+  outs() << "H16 pipeline:" << testH16() << " synthetic checks passed\n";
   unsigned h32Passed = testH32Pages() + testH32Pages({}, true);
   if (argc == 3) {
     unsigned realPassed = testH32Pages(argv[2]);
