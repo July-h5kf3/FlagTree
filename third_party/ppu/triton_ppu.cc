@@ -144,7 +144,8 @@ void init_triton_ppu(py::module &&m) {
   m.def("fold_mla_logit_scale", &::triton::ppu::foldMlaLogitScale);
   m.def("repack_mla_low_probability", &::triton::ppu::repackMlaLowProbability);
   m.def("schedule_mla_pv_tail", &::triton::ppu::scheduleMlaPvTail);
-  m.def("prove_uniform_mla_loop", &mlir::triton::ppu::proveUniformMlaLoop);
+  m.def("prove_uniform_mla_loop", &mlir::triton::ppu::proveUniformMlaLoop,
+        py::arg("module"), py::arg("allow_uniform_if") = false);
   m.def("pipeline_mla_kv", &::triton::ppu::pipelineMlaKv, py::arg("module"),
         py::arg("threads"), py::arg("shared"), py::arg("reuse_pages") = false);
   m.def("promote_mla_kv_copy", &mlir::triton::ppu::promoteMlaKvCopy);

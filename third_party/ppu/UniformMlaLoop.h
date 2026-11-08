@@ -12,7 +12,7 @@
 namespace mlir::triton::ppu {
 // Triton scalars are per-program values. Reject opaque scalar assembly and
 // unknown producers rather than assuming that their result is CTA-uniform.
-inline unsigned proveUniformMlaLoop(ModuleOp module) {
+inline unsigned proveUniformMlaLoop(ModuleOp module, bool allowUniformIf) {
   SmallVector<scf::ForOp> loops;
   module.walk([&](scf::ForOp loop) { loops.push_back(loop); });
   if (loops.size() != 1)
@@ -63,6 +63,24 @@ inline unsigned proveUniformMlaLoop(ModuleOp module) {
             (nested.getName().getDialectNamespace() != "arith" ||
              nested.getNumRegions()))
           return false;
+      proved.insert(value);
+      return true;
+    }
+    if (auto branch = dyn_cast<scf::IfOp>(op)) {
+      if (!allowUniformIf || !uniform(branch.getCondition()) ||
+          !llvm::hasSingleElement(branch.getThenRegion()) ||
+          !llvm::hasSingleElement(branch.getElseRegion()))
+        return false;
+      unsigned result = cast<OpResult>(value).getResultNumber();
+      auto thenYield = dyn_cast<scf::YieldOp>(
+          branch.getThenRegion().front().getTerminator());
+      auto elseYield = dyn_cast<scf::YieldOp>(
+          branch.getElseRegion().front().getTerminator());
+      if (!thenYield || !elseYield || result >= thenYield.getNumOperands() ||
+          result >= elseYield.getNumOperands() ||
+          !uniform(thenYield.getOperand(result)) ||
+          !uniform(elseYield.getOperand(result)))
+        return false;
       proved.insert(value);
       return true;
     }

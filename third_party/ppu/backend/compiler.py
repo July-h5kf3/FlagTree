@@ -238,6 +238,7 @@ class HGGCOptions:
     ppu_mla_kr_joint_copy: bool = False
     ppu_mla_logit_scale_fold: bool = False
     ppu_mla_low_probability_layout: bool = False
+    ppu_mla_uniform_request_sort: bool = False
     enable_fp_fusion: bool = True
     enable_reflect_ftz: bool = True  # ftz in libdevice
     launch_cooperative_grid: bool = False
@@ -551,7 +552,7 @@ class PPUBackend(BaseBackend):
                and src.get_int_attr("ppu.mla_h32_k128_pv_layout") == 1)
         metadata["mla_kv_loop_uniform"] = 0
         if (options.ppu_pipeline_mla_kv or h64 or h32) and capability == 80:
-            metadata["mla_kv_loop_uniform"] = ppu.prove_uniform_mla_loop(mod)
+            metadata["mla_kv_loop_uniform"] = ppu.prove_uniform_mla_loop(mod, options.ppu_mla_uniform_request_sort)
         if options.ppu_vectorize_i8_shared_store and capability == 80:
             mod.set_attr("ppu.vector_i8_shared_store", ir.builder(mod.context).get_int32_attr(1))
         # TritonGPU -> LLVM-IR (MLIR)
