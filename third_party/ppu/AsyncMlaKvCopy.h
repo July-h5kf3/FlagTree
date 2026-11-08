@@ -20,7 +20,9 @@ inline unsigned promoteMlaKvCopy(ModuleOp module) {
   auto h32Marker =
       module->getAttrOfType<IntegerAttr>("ppu.mla_h32_k128_pv_layout");
   bool h32 = h32Marker && h32Marker.getInt() == 1;
-  bool small = (marker && marker.getInt() == 1) || h32;
+  auto h16Marker = module->getAttrOfType<IntegerAttr>("ppu.mla_h16_split_kv");
+  bool h16 = h16Marker && h16Marker.getInt() == 1;
+  bool small = (marker && marker.getInt() == 1) || h32 || h16;
   unsigned changed = 0;
   for (auto root : roots) {
     if (!root.getSrc())
@@ -48,6 +50,8 @@ inline unsigned promoteMlaKvCopy(ModuleOp module) {
       for (auto *user : descriptors[index].getUsers()) {
         if (auto view = dyn_cast<MemDescTransOp>(user))
           descriptors.push_back(view.getResult());
+        else if (auto slice = dyn_cast<MemDescSubsliceOp>(user); h16 && slice)
+          descriptors.push_back(slice.getResult());
         else if (auto reader = dyn_cast<LocalLoadOp>(user))
           readers.push_back(reader);
         else
@@ -70,9 +74,10 @@ inline unsigned promoteMlaKvCopy(ModuleOp module) {
         builder.create<AsyncWaitOp>(load.getLoc(), commit.getResult(), 0);
     for (Value descriptor : descriptors) {
       auto previous = cast<MemDescType>(descriptor.getType());
-      descriptor.setType(MemDescType::get(
-          previous.getShape(), previous.getElementType(),
-          previous.getEncoding(), previous.getMemorySpace(), true));
+      descriptor.setType(
+          MemDescType::get(previous.getShape(), previous.getElementType(),
+                           previous.getEncoding(), previous.getMemorySpace(),
+                           true, previous.getAllocShape()));
     }
     root.replaceAllUsesWith(allocation.getResult());
     for (auto reader : readers)

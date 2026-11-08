@@ -224,6 +224,7 @@ class HGGCOptions:
     ppu_publish_shared_float_scales_early: bool = False
     ppu_reuse_mla_kv: bool = False
     ppu_async_mla_kv: bool = False
+    ppu_reuse_mla_split_kv: bool = False
     ppu_prefetch_mla_nope: bool = False
     ppu_scalarize_mla_pv: bool = False
     ppu_scalarize_mla_p15: bool = False
@@ -510,6 +511,12 @@ class PPUBackend(BaseBackend):
             (opt.num_warps == 16 or (opt.num_warps == 8 and mod.get_int_attr("ppu.mla_h32_k128_pv_layout") == 1))):
             metadata["mla_shared_kv_views_reused"] = ppu.reuse_mla_kv_views(mod)
             if opt.ppu_async_mla_kv and metadata["mla_shared_kv_views_reused"]:
+                metadata["mla_async_kv_copies"] = ppu.promote_mla_kv_copy(mod)
+        metadata["mla_split_kv_reused"] = 0
+        if (opt.ppu_reuse_mla_split_kv and capability == 80 and opt.num_ctas == 1 and opt.num_warps == 8
+                and not opt.ppu_reuse_mla_kv):
+            metadata["mla_split_kv_reused"] = ppu.reuse_mla_split_kv(mod)
+            if opt.ppu_async_mla_kv and metadata["mla_split_kv_reused"]:
                 metadata["mla_async_kv_copies"] = ppu.promote_mla_kv_copy(mod)
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod

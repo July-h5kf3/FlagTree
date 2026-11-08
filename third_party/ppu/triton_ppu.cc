@@ -33,6 +33,7 @@
 #include "PrefetchMlaRope.h"
 #include "ReadonlySharedMatrices.h"
 #include "ReuseMlaKvViews.h"
+#include "ReuseMlaSplitKv.h"
 #include "ScalarizeMlaPv.h"
 #include "TritonPPUGPUToLLVM/Passes.h"
 #include "TritonPPUGPUTransforms/Passes.h"
@@ -142,6 +143,7 @@ void init_triton_ppu(py::module &&m) {
         py::arg("threads"), py::arg("shared"), py::arg("reuse_pages") = false);
   m.def("promote_mla_kv_copy", &mlir::triton::ppu::promoteMlaKvCopy);
   m.def("reuse_mla_kv_views", &mlir::triton::ppu::reuseMlaKvViews);
+  m.def("reuse_mla_split_kv", &mlir::triton::ppu::reuseMlaSplitKv);
   m.def("fold_global_load_offsets", &::triton::ppu::foldGlobalLoadOffsets);
   m.def("hoist_readonly_shared_matrices",
         &::triton::ppu::hoistReadonlySharedMatrices);
