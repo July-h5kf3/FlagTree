@@ -235,6 +235,7 @@ class HGGCOptions:
     ppu_mla_h64_k128: bool = False
     ppu_mla_h32_k128: bool = False
     ppu_gather_mla_row_reductions: bool = False
+    ppu_mla_row_subgroups: bool = False
     ppu_unique_mla_scale_writers: bool = False
     ppu_unique_mla_final_rows: bool = False
     ppu_mla_kr_joint_copy: bool = False
@@ -723,8 +724,12 @@ class PPUBackend(BaseBackend):
             metadata["mla_rope_global_loads_prefetched"] = ppu.prefetch_mla_rope(llvm_mod, metadata["num_warps"] * 32,
                                                                                  metadata["shared"])
         metadata["mla_row_reductions_gathered"] = 0
+        metadata["mla_row_groups_scoped"] = 0
         if options.ppu_gather_mla_row_reductions and h32 and metadata["mla_rope_global_loads_prefetched"] == 4:
-            metadata["mla_row_reductions_gathered"] = ppu.gather_mla_row_reductions(llvm_mod, 256, metadata["shared"])
+            result = ppu.gather_mla_row_reductions(llvm_mod, 256, metadata["shared"], options.ppu_mla_row_subgroups)
+            assert result in (0, 6, 9)
+            metadata["mla_row_reductions_gathered"] = 6 if result == 9 else result
+            metadata["mla_row_groups_scoped"] = 3 if result == 9 else 0
         metadata["mla_scale_stores_deduplicated"] = 0
         if options.ppu_unique_mla_scale_writers and h32 and metadata["mla_rope_global_loads_prefetched"] == 4:
             metadata["mla_scale_stores_deduplicated"] = ppu.unique_mla_scale_writers(llvm_mod, 256, metadata["shared"])

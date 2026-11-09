@@ -120,7 +120,116 @@ inline llvm::Value *combine(llvm::IRBuilder<llvm::NoFolder> &builder,
   return value;
 }
 
-inline unsigned run(llvm::Function &function) {
+// Admit two independent physical groups after gather removes
+// the cross-group intermediate exchange. Initial and final CTA guards remain.
+inline llvm::CallInst *
+groupThread(llvm::Function &function,
+            llvm::ArrayRef<mla_row_groups::Region> regions,
+            const llvm::DataLayout &layout) {
+  using namespace llvm;
+  CallInst *tid = nullptr;
+  for (auto &block : function)
+    for (auto &instruction : block)
+      if (auto *call = dyn_cast<CallInst>(&instruction)) {
+        if (auto *code = dyn_cast<InlineAsm>(call->getCalledOperand())) {
+          if (code->getAsmString().contains("bar.") ||
+              code->getAsmString().contains("barrier"))
+            return nullptr;
+        }
+        auto *callee = call->getCalledFunction();
+        if (!callee)
+          continue;
+        if (callee->getName() == "llvm.nvvm.read.ptx.sreg.tid.x") {
+          if (tid || call->arg_size() || !call->getType()->isIntegerTy(32))
+            return nullptr;
+          tid = call;
+        }
+        if ((callee->getName().starts_with("llvm.nvvm.bar") ||
+             callee->getName().contains("barrier")) &&
+            !readonly_shared_matrices::ctaBarrier(call, 256))
+          return nullptr;
+      }
+  if (!tid || tid->getParent() != &function.getEntryBlock())
+    return nullptr;
+  DominatorTree dominance(function);
+  for (auto &region : regions) {
+    if (!dominance.dominates(tid, region.begin) ||
+        !dominance.dominates(tid, region.end))
+      return nullptr;
+    std::array<std::vector<unsigned>, 2> written = {
+        std::vector<unsigned>(region.fields * 512),
+        std::vector<unsigned>(region.fields * 512)};
+    for (auto &memory : region.partial)
+      for (unsigned thread = 0; thread < 256; ++thread) {
+        auto active =
+            mla_row_groups::predicate(memory.predicate, thread, layout);
+        auto address = mla_row_groups::offset(memory.pointer, thread, layout);
+        if (!active || !address)
+          return nullptr;
+        if (!*active)
+          continue;
+        auto byte = *address - 81920;
+        if (byte < 0 || byte + 4 > region.fields * 512 || byte % 4 ||
+            unsigned(byte % 512) / 256 != thread / 128)
+          return nullptr;
+        for (unsigned i = 0; i < 4; ++i)
+          if (++written[thread / 128][byte + i] != 1)
+            return nullptr;
+      }
+    for (unsigned group = 0; group < 2; ++group)
+      for (unsigned field = 0; field < region.fields; ++field)
+        for (unsigned byte = 0; byte < 256; ++byte)
+          if (written[group][field * 512 + group * 256 + byte] != 1)
+            return nullptr;
+    for (auto &memory : region.final)
+      for (unsigned thread = 0; thread < 256; ++thread) {
+        auto address = mla_row_groups::offset(memory.pointer, thread, layout);
+        if (!address)
+          return nullptr;
+        auto byte = *address - 81920;
+        if (byte < 0 || byte + 16 > region.fields * 512 || byte % 16 ||
+            unsigned(byte % 512) / 256 != thread / 128 ||
+            unsigned(byte % 256) + 16 > 256)
+          return nullptr;
+        for (unsigned i = 0; i < 16; ++i)
+          if (written[thread / 128][byte + i] != 1)
+            return nullptr;
+      }
+  }
+  return tid;
+}
+
+inline bool groupBarrier(llvm::Instruction *instruction, unsigned first,
+                         unsigned second, const llvm::DataLayout &layout) {
+  using namespace llvm;
+  if (first >= 256 || second >= 256 || first / 128 != second / 128 ||
+      !instruction->getMetadata("ppu.mla.row.group.barrier") ||
+      instruction->getFunction()
+              ->getFnAttribute("ppu.mla.row.groups128")
+              .getValueAsString() != "1")
+    return false;
+  auto *call = dyn_cast<CallInst>(instruction);
+  auto *callee = call ? call->getCalledFunction() : nullptr;
+  if (!callee || callee->getName() != "__ppukernel_barrier_sync_cnt_void" ||
+      !callee->isDeclaration() || call->arg_size() != 3 ||
+      !call->getType()->isVoidTy() || call->hasOperandBundles())
+    return false;
+  auto *count = dyn_cast<ConstantInt>(call->getArgOperand(1));
+  auto *scope = dyn_cast<ConstantInt>(call->getArgOperand(2));
+  if (!count || !count->getType()->isIntegerTy(32) || !count->equalsInt(128) ||
+      !scope || !scope->getType()->isIntegerTy(32) || !scope->equalsInt(1))
+    return false;
+  for (unsigned tid : {first, second}) {
+    DenseMap<Value *, Constant *> cache;
+    auto *id = dyn_cast_or_null<ConstantInt>(mla_nope_prefetch::constantValue(
+        call->getArgOperand(0), tid, layout, cache));
+    if (!id || !id->getType()->isIntegerTy(32) || !id->equalsInt(1 + tid / 128))
+      return false;
+  }
+  return true;
+}
+
+inline unsigned run(llvm::Function &function, bool subgroups = false) {
   using namespace llvm;
   if (function.getCallingConv() != CallingConv::PTX_Kernel ||
       function.hasFnAttribute("ppu.mla.row.gather"))
@@ -177,6 +286,14 @@ inline unsigned run(llvm::Function &function) {
           return 0;
       }
   }
+  auto *tid = subgroups ? groupThread(function, regions, layout) : nullptr;
+  auto *sync = regions[0].begin->getCalledFunction();
+  bool scoped =
+      tid && sync && regions[0].begin->arg_size() == 3 &&
+      isa<ConstantInt>(regions[0].begin->getArgOperand(2)) &&
+      cast<ConstantInt>(regions[0].begin->getArgOperand(2))->equalsInt(1);
+  SmallVector<CallInst *> scopeBarriers = {
+      regions[0].barriers[0], regions[0].end, regions[1].barriers[0]};
   unsigned treeBase = 0;
   for (auto &region : regions) {
     SmallVector<Instruction *> middle;
@@ -234,19 +351,38 @@ inline unsigned run(llvm::Function &function) {
     } while (changed);
     treeBase += region.fields;
   }
+  if (scoped) {
+    IRBuilder<> builder(tid->getNextNode());
+    builder.SetCurrentDebugLocation(DebugLoc());
+    auto *group =
+        builder.CreateAdd(builder.CreateLShr(tid, builder.getInt32(7)),
+                          builder.getInt32(1), "mla.row.group");
+    for (auto *barrier : scopeBarriers) {
+      builder.SetInsertPoint(barrier);
+      builder.SetCurrentDebugLocation(barrier->getDebugLoc());
+      auto *scopedBarrier = builder.CreateCall(
+          sync, {group, builder.getInt32(128), builder.getInt32(1)});
+      scopedBarrier->setTailCallKind(CallInst::TCK_Tail);
+      scopedBarrier->setMetadata("ppu.mla.row.group.barrier",
+                                 MDNode::get(function.getContext(), {}));
+      barrier->eraseFromParent();
+    }
+    function.addFnAttr("ppu.mla.row.groups128", "1");
+  }
   function.addFnAttr("ppu.mla.row.gather", "1");
-  return 6;
+  return scoped ? 9 : 6;
 }
 } // namespace mla_row_gather
 
 inline unsigned gatherMlaRowReductions(llvm::Module &module, unsigned threads,
-                                       unsigned shared) {
+                                       unsigned shared,
+                                       bool subgroups = false) {
   if (threads != 256 || shared != 94464)
     return 0;
   unsigned changed = 0;
   for (llvm::Function &function : module)
     if (!function.isDeclaration())
-      changed += mla_row_gather::run(function);
+      changed += mla_row_gather::run(function, subgroups);
   return changed;
 }
 } // namespace triton::ppu

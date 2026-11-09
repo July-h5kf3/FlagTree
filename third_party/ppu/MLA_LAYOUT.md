@@ -244,3 +244,20 @@ current source-alignment proof rejects half-typed offsets; unmatched cases
 keep their existing path.
 `test/async_mla_h16_kr.cpp` accepts actual pre-transform LLVM fixtures and
 checks preservation, idempotence and sixteen nonmutating rejection cases.
+
+### H32 row reduction groups
+
+`ppu_mla_row_subgroups` defaults to false. After gather removes the
+cross-group intermediate exchange, three internal barriers may synchronize
+two independent groups of 128 threads, using IDs 1 and 2. Admission checks
+complete per-group producer coverage, every vector reader, existing barrier
+IDs and the unique entry thread index. Initial KR scratch protection and the
+final P publication remain complete CTA barriers. MMA operands, FP32 trees,
+shared allocation and memory layout stay unchanged.
+
+Certified barriers carry an internal marker. Scale-writer equivalence accepts
+one only when both threads belong to the same group and its evaluated ID,
+thread count and scope match. Unknown cases retain ordinary gather. The
+return value 9 denotes gather plus three scoped barriers; ordinary gather
+returns 6. `test/row_subgroups.cpp` exercises actual pre-gather fixtures,
+conservative fallback, nonmutating rejection and barrier certification.

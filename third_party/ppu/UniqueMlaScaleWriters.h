@@ -51,7 +51,8 @@ struct Equivalent {
           *a + width <= 82944) {
         for (Instruction *previous = load->getPrevNode(); previous;
              previous = previous->getPrevNode()) {
-          if (readonly_shared_matrices::ctaBarrier(previous, 256)) {
+          if (readonly_shared_matrices::ctaBarrier(previous, 256) ||
+              mla_row_gather::groupBarrier(previous, first, second, layout)) {
             equal = true;
             break;
           }
