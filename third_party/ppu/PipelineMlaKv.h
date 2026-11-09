@@ -81,15 +81,15 @@ inline unsigned run(llvm::Function &function, unsigned shared, bool reusePages,
     return 0;
   auto *condition = dyn_cast<ICmpInst>(backedge->getCondition());
   if (!condition || condition->getPredicate() != CmpInst::ICMP_SLT ||
-      condition->getParent() != latch ||
+      (condition->getParent() != latch && condition->getParent() != header) ||
       !loop->isLoopInvariant(condition->getOperand(1)))
     return 0;
   auto *next = dyn_cast<BinaryOperator>(condition->getOperand(0));
   auto *step = next ? dyn_cast<ConstantInt>(next->getOperand(1)) : nullptr;
   auto *iv = next ? dyn_cast<PHINode>(next->getOperand(0)) : nullptr;
   if (!next || next->getOpcode() != Instruction::Add ||
-      next->getParent() != latch || !step || !step->equalsInt(pageStep) ||
-      !iv || iv->getParent() != header ||
+      next->getParent() != condition->getParent() || !step ||
+      !step->equalsInt(pageStep) || !iv || iv->getParent() != header ||
       (!iv->getType()->isIntegerTy(32) &&
        !((h32 || h16) && iv->getType()->isIntegerTy(64))) ||
       iv->getNumIncomingValues() != 2 || iv->getBasicBlockIndex(latch) < 0 ||
@@ -249,8 +249,10 @@ inline unsigned run(llvm::Function &function, unsigned shared, bool reusePages,
   // The batch scheduler may make the final V read earlier, leaving more
   // independent PV work after it.  That is safe (and gives the asynchronous
   // copy more cover); only the original minimum product tail is required.
-  if (remaining < remainingProducts || position[next] <= position[last] ||
-      position[condition] <= position[next])
+  if (remaining < remainingProducts ||
+      (condition->getParent() == latch &&
+       (position[next] <= position[last] ||
+        position[condition] <= position[next])))
     return 0;
   // Only the IV and a bounded pure integer/page-read DAG may be remapped.
   SmallPtrSet<Value *, 32> checked;
@@ -328,8 +330,13 @@ inline unsigned run(llvm::Function &function, unsigned shared, bool reusePages,
   }
   // No modification precedes the complete range/effect/SSA proofs above.
   Instruction *anchor = last->getNextNode();
-  next->moveBefore(anchor->getIterator());
-  condition->moveBefore(anchor->getIterator());
+  // A mask using the loop continuation may already compute both values in
+  // the header. They dominate the prefetch there; do not sink those
+  // definitions.
+  if (condition->getParent() == latch) {
+    next->moveBefore(anchor->getIterator());
+    condition->moveBefore(anchor->getIterator());
+  }
   auto *continuation =
       latch->splitBasicBlock(anchor->getIterator(), "mla.pv.cont");
   auto *prefetch = BasicBlock::Create(function.getContext(), "mla.kv.prefetch",

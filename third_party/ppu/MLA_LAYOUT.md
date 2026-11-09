@@ -261,3 +261,44 @@ thread count and scope match. Unknown cases retain ordinary gather. The
 return value 9 denotes gather plus three scoped barriers; ordinary gather
 returns 6. `test/row_subgroups.cpp` exercises actual pre-gather fixtures,
 conservative fallback, nonmutating rejection and barrier certification.
+
+### H32 complete page pairs
+
+`ppu_mla_full_tiles` is off by default. For the pipelined H32/K128 loop
+with eight warps, row-group synchronization and joint KV/RoPE copies, the
+compiler can generate a second loop for requests whose length is a multiple
+of 128. The program checks the selected request on device, before entering
+the loop. Other lengths and unsupported IR keep the masked path.
+
+The specialization requires split zero, a CTA-uniform length and the original
+two-page induction. A token comparison can be folded when its lane offset is
+in [0, 127]. A comparison for the next tile also needs a dominating check that
+the iteration exists. Causal limits are folded only if they cover the entire
+request for every admitted lane and head tile. Both versions keep the original
+MMA operations, FP32 reductions, prefetch guard and barriers. The metadata
+field `mla_tile_bounds_folded` counts the comparisons replaced in the fast copy.
+
+With `ppu_mla_q2_tail`, the same full-page specialization may also admit
+a query limit of `length - 1`. The compiler checks the offset range for
+every lane and head tile covered by the dispatch guard. Offsets below 127
+cannot reach the excluded token. For offset 127, masking still depends on
+the page pair being the last one and the query offset being -1. Other
+query limits and tile layouts keep their original predicates.
+
+### Score mask guards
+
+`ppu_mla_score_guard` defaults to 0. On eligible H32 loops, modes 1 and 2
+keep the existing masked selects in one branch and use the original FP32
+scores directly when all token and page checks succeed. Mode 1 checks the
+two-page tile end in 64 bits; mode 2 hoists a nonnegative exclusive page
+cutoff when both limits dominate the preheader. Each bound used for control
+flow is frozen separately. Trip counts, address predicates, memory operations
+and barriers are unchanged.
+
+Mode 3 also supports H16. When the dense operator provides a common
+`OR` operand to all masks, one branch on that operand suffices. The operator
+uses the existing loop continuation: a later page in this split contains at
+least one more token, so the whole current tile is visible to both draft
+queries. The slow branch retains the other mask operands. The KV pipeline
+may reuse an increment and continuation condition already defined in the
+loop header without sinking them past earlier uses.
