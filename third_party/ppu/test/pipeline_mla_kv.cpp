@@ -472,9 +472,40 @@ static void testEqualPhis() {
   assert(!triton::ppu::global_load_offsets::evaluate(phi, 0, cache));
 }
 
+static void testEarlyCondition() {
+  for (bool complete : {false, true}) {
+    LLVMContext context;
+    auto module = fixture(context, true);
+    auto *f = module->getFunction("decode");
+    DominatorTree dt(*f);
+    LoopInfo loops(dt);
+    auto *loop = loops.getTopLevelLoops().front();
+    auto *header = loop->getHeader();
+    auto *branch = cast<BranchInst>(loop->getLoopLatch()->getTerminator());
+    auto *condition = cast<ICmpInst>(branch->getCondition());
+    auto *next = cast<BinaryOperator>(condition->getOperand(0));
+    next->moveBefore(header->getTerminator()->getIterator());
+    if (complete) {
+      condition->moveBefore(header->getTerminator()->getIterator());
+      IRBuilder<NoFolder> b(header->getTerminator());
+      b.CreateOr(condition, b.getFalse());
+    }
+    auto before = text(*module);
+    assert(!verifyModule(*module, &errs()));
+    assert(triton::ppu::pipelineMlaKv(*module, 256, 94464, true) ==
+           (complete ? 3u : 0u));
+    assert(!verifyModule(*module, &errs()));
+    if (complete)
+      assert(next->getParent() == header && condition->getParent() == header);
+    else
+      assert(text(*module) == before);
+  }
+}
+
 int main(int argc, char **argv) {
   assert(argc == 1 || argc == 2 ||
          (argc == 3 && StringRef(argv[1]) == "--h32"));
+  testEarlyCondition();
   testEqualPhis();
   outs() << "H16 pipeline:" << testH16() << " synthetic checks passed\n";
   unsigned h32Passed = testH32Pages() + testH32Pages({}, true);

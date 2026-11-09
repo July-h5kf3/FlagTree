@@ -236,6 +236,9 @@ class HGGCOptions:
     ppu_mla_h32_k128: bool = False
     ppu_gather_mla_row_reductions: bool = False
     ppu_mla_row_subgroups: bool = False
+    ppu_mla_full_tiles: bool = False
+    ppu_mla_q2_tail: bool = False
+    ppu_mla_score_guard: int = 0
     ppu_unique_mla_scale_writers: bool = False
     ppu_unique_mla_final_rows: bool = False
     ppu_mla_kr_joint_copy: bool = False
@@ -753,6 +756,15 @@ class PPUBackend(BaseBackend):
         metadata["mla_low_probability_repacked"] = 0
         if options.ppu_mla_low_probability_layout and metadata["mla_kr_joint_copies"] == 1:
             metadata["mla_low_probability_repacked"] = ppu.repack_mla_low_probability(llvm_mod, 256, metadata["shared"])
+        metadata["mla_tile_bounds_folded"] = 0
+        if (options.ppu_mla_full_tiles and h32 and metadata["mla_kv_loop_uniform"] == 1
+                and metadata["mla_row_groups_scoped"] == 3 and metadata["mla_kr_joint_copies"] == 1):
+            metadata["mla_tile_bounds_folded"] = ppu.version_mla_tiles(llvm_mod, options.ppu_mla_q2_tail)
+        metadata["mla_scores_guarded"] = 0
+        if ((options.ppu_mla_score_guard in (1, 2, 3) and h32 and metadata["mla_row_groups_scoped"] == 3
+             and metadata["mla_kr_joint_copies"] == 1)
+                or (options.ppu_mla_score_guard == 3 and metadata["mla_h16_kr_copies"] == 1)):
+            metadata["mla_scores_guarded"] = ppu.guard_mla_scores(llvm_mod, options.ppu_mla_score_guard)
         metadata["global_scratch_size"] = src.get_int_attr("ttg.global_scratch_memory_size")
         metadata["global_scratch_align"] = src.get_int_attr("ttg.global_scratch_memory_alignment")
         metadata["profile_scratch_size"] = src.get_int_attr("ttg.profile_scratch_memory_size") or 0

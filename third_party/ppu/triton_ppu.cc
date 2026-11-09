@@ -29,6 +29,7 @@
 #include "FoldMlaLogitScale.h"
 #include "GatherMlaRowReductions.h"
 #include "GlobalLoadOffsets.h"
+#include "GuardMlaScores.h"
 #include "JointMlaKrCopy.h"
 #include "PPUGPUToLLVM/Passes.h"
 #include "PipelineMlaKv.h"
@@ -44,6 +45,7 @@
 #include "UniformMlaLoop.h"
 #include "UniqueMlaFinalRows.h"
 #include "UniqueMlaScaleWriters.h"
+#include "VersionMlaTiles.h"
 #include "acblas_instance.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/NVVM/NVVMToLLVMIRTranslation.h"
@@ -140,6 +142,14 @@ void init_triton_ppu(py::module &&m) {
   m.def("gather_mla_row_reductions", &::triton::ppu::gatherMlaRowReductions,
         py::arg("module"), py::arg("threads"), py::arg("shared"),
         py::arg("subgroups") = false);
+  m.def(
+      "version_mla_tiles",
+      [](llvm::Module &mod, bool q2Tail) {
+        auto *f = mod.getFunction("dense_int8_mla_kernel");
+        return f ? ::triton::ppu::mla_full_tiles::run(*f, q2Tail) : 0u;
+      },
+      py::arg("module"), py::arg("q2_tail") = false);
+  m.def("guard_mla_scores", &::triton::ppu::mla_score_guard::run);
   m.def("unique_mla_scale_writers", &::triton::ppu::uniqueMlaScaleWriters);
   m.def("unique_mla_final_rows", &::triton::ppu::uniqueMlaFinalRows);
   m.def("prefetch_mla_rope", &::triton::ppu::prefetchMlaRope);
