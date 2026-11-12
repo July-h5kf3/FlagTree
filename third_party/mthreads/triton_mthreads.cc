@@ -276,6 +276,7 @@ void init_triton_musa_passes_ttgpuir(py::module m) {
 
 void init_triton_mthreads(py::module &&m) {
 #ifdef __TLE__
+  m.attr("SUPPORTS_TLE_WGMMA_INT8") = true;
   init_triton_musa_tle_ir(m.def_submodule("ir"));
 #endif // __TLE__
 

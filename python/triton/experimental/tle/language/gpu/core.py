@@ -1088,7 +1088,7 @@ def wgmma(
             raise ValueError("max_num_imprecise_acc must be non-negative")
 
     if mthreads_enabled:
-        mthreads_wgmma.validate_options(max_num_imprecise_acc, out_dtype)
+        mthreads_wgmma.validate_options(max_num_imprecise_acc, out_dtype, input_dtype=a.dtype)
 
     ret_scalar_ty = _wgmma_ret_scalar_ty(a.dtype, out_dtype)
     ret_ty = tl.block_type(ret_scalar_ty, [m, n])

@@ -547,14 +547,22 @@ LogicalResult SqmmaOp::verify() {
     return emitOpError("expects A and B in shared memory");
   Type aElemTy = aTy.getElementType();
   Type bElemTy = bTy.getElementType();
-  bool supportedInput =
-      aElemTy.isF16() || aElemTy.isBF16() || isa<Float8E4M3FNType>(aElemTy);
+  // Triton's signed int8 operands use signless i8 storage in memdescs.
+  bool isInt8 = aElemTy.isSignlessInteger(8);
+  bool supportedInput = isInt8 || aElemTy.isF16() || aElemTy.isBF16() ||
+                        isa<Float8E4M3FNType>(aElemTy);
   if (!supportedInput || aElemTy != bElemTy)
     return emitOpError(
-        "mthreads TLE SQMMA requires matching f16, bf16, or fp8e4nv A/B");
-  if (!cTy.getElementType().isF32() || !dTy.getElementType().isF32())
+        "mthreads TLE SQMMA requires matching i8, f16, bf16, or fp8e4nv A/B");
+  if (isInt8) {
+    if (!cTy.getElementType().isSignlessInteger(32) ||
+        !dTy.getElementType().isSignlessInteger(32))
+      return emitOpError(
+          "mthreads TLE integer SQMMA requires an i32 accumulator/result");
+  } else if (!cTy.getElementType().isF32() || !dTy.getElementType().isF32()) {
     return emitOpError(
-        "initial mthreads TLE SQMMA requires an f32 accumulator/result");
+        "mthreads TLE floating SQMMA requires an f32 accumulator/result");
+  }
 
   ArrayRef<int64_t> aShape = aTy.getShape();
   ArrayRef<int64_t> bShape = bTy.getShape();

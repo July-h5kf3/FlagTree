@@ -46,14 +46,16 @@ def validate_operands(a, b, acc) -> None:
         shape = tuple(int(_unwrap(dim)) for dim in operand_type.shape)
         if len(shape) != 2:
             raise ValueError(f"initial mthreads TLE wgmma requires rank-2 {name}, got {shape}")
-        if operand.dtype not in (tl.float16, tl.bfloat16, tl.float8e4nv):
-            raise ValueError("mthreads TLE wgmma requires f16, bf16, or fp8e4nv "
+        if operand.dtype not in (tl.int8, tl.float16, tl.bfloat16, tl.float8e4nv):
+            raise ValueError("mthreads TLE wgmma requires int8, f16, bf16, or fp8e4nv "
                              f"{name}, got {operand.dtype}")
     if a.dtype != b.dtype:
         raise ValueError("mthreads TLE wgmma requires matching A/B dtypes, "
                          f"got {a.dtype} and {b.dtype}")
-    if acc is not None and getattr(acc, "dtype", None) != tl.float32:
-        raise ValueError("mthreads TLE wgmma requires an f32 accumulator")
+    acc_dtype = tl.int32 if a.dtype == tl.int8 else tl.float32
+    if acc is not None and acc.dtype != acc_dtype:
+        acc_name = "i32" if acc_dtype == tl.int32 else "f32"
+        raise ValueError(f"mthreads TLE wgmma requires an {acc_name} accumulator")
 
 
 def _transpose_smem_operand(operand, semantic):
@@ -88,10 +90,17 @@ def prepare_operands(a, b, acc, trans_a: bool, trans_b: bool, semantic):
     return a, b
 
 
-def validate_options(max_num_imprecise_acc: int, out_dtype) -> None:
+def validate_options(max_num_imprecise_acc: int, out_dtype, input_dtype=None) -> None:
     if max_num_imprecise_acc != 0:
         raise ValueError("mthreads TLE wgmma requires max_num_imprecise_acc=0")
-    if out_dtype != tl.float32:
+    if input_dtype == tl.int8:
+        # The common API defaults to f32, but integer operands already resolve
+        # to i32 in _wgmma_ret_scalar_ty. Accept that default without promising
+        # floating-point accumulation; explicit integer callers should use i32.
+        if out_dtype not in (tl.int32, tl.float32):
+            raise ValueError("mthreads TLE wgmma requires out_dtype=tl.int32 for int8 "
+                             "(the tl.float32 API default also resolves to int32)")
+    elif out_dtype != tl.float32:
         raise ValueError("mthreads TLE wgmma requires out_dtype=tl.float32")
 
 

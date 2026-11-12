@@ -81,11 +81,10 @@ static SmallVector<unsigned, 2> getPreferredWarpsPerCTA(
   return warps;
 }
 
-static std::optional<SelectedSqmmaConfig>
-selectSqmmaConfig(unsigned m, unsigned n, unsigned k, unsigned numWarps,
-                  musa::SQMMAEltType operandType,
-                  ArrayRef<unsigned> preferredWarps,
-                  bool disableMSplitPreference) {
+static std::optional<SelectedSqmmaConfig> selectSqmmaConfig(
+    unsigned m, unsigned n, unsigned k, unsigned numWarps,
+    musa::SQMMAEltType operandType, musa::SQMMAEltType accumulatorType,
+    ArrayRef<unsigned> preferredWarps, bool disableMSplitPreference) {
   if (numWarps < 4 || numWarps % 4 != 0)
     return std::nullopt;
   const auto *sqTraits = musa::getMusaSqmmaArchTraits(musa::MusaArch::PH1);
@@ -103,10 +102,9 @@ selectSqmmaConfig(unsigned m, unsigned n, unsigned k, unsigned numWarps,
           !musa::isSupportedSqmmaInstrMN(operandType, instM, instN, *sqTraits))
         continue;
       for (unsigned instK : kK) {
-        if (k % instK != 0 ||
-            !musa::isSupportedSqmmaWithK128Compatibility(
-                operandType, operandType, musa::SQMMAEltType::f32, instM, instN,
-                instK, *sqTraits))
+        if (k % instK != 0 || !musa::isSupportedSqmmaWithK128Compatibility(
+                                  operandType, operandType, accumulatorType,
+                                  instM, instN, instK, *sqTraits))
           continue;
         for (unsigned warpsM = 4; warpsM <= numWarps; warpsM *= 2) {
           if (numWarps % warpsM != 0)
@@ -951,14 +949,18 @@ struct TritonMUSAGPUTLELowerSqmmaPass
         preferredWarps = to_vector(explicitEnc.getWarpsPerCTA());
       else
         preferredWarps = getPreferredWarpsPerCTA(dot, numWarps, encodings);
+      auto accTy = cast<RankedTensorType>(dot.getC().getType());
+      auto accumulatorType = accTy.getElementType().isSignlessInteger(32)
+                                 ? musa::SQMMAEltType::s32
+                                 : musa::SQMMAEltType::f32;
       auto config = selectSqmmaConfig(aTy.getShape()[0], bTy.getShape()[1],
                                       aTy.getShape()[1], numWarps, *operandType,
-                                      preferredWarps, disableMSplitPreference);
+                                      accumulatorType, preferredWarps,
+                                      disableMSplitPreference);
       if (!config) {
         dot.emitOpError("cannot select a supported SQMMA configuration");
         return signalPassFailure();
       }
-      auto accTy = cast<RankedTensorType>(dot.getC().getType());
       auto cga = ttg::getCGALayout(accTy.getEncoding());
       auto mmaEnc = ttg::MUSASqmmaEncodingAttr::get(
           dot.getContext(), 3, 1, config->warpsPerCTA, cga, config->instrShape);
@@ -986,7 +988,8 @@ struct TritonMUSAGPUTLELowerSqmmaPass
         auto nativeTy = RankedTensorType::get(
             oldAccTy.getShape(), oldAccTy.getElementType(), encodings[dot]);
         Value nativeAcc = nativeAccumulators.lookup(dot.getC());
-        if (nativeAcc) {
+        // A completed wait result may redistribute C before the next SQMMA.
+        if (nativeAcc && !nativeAcc.getDefiningOp<musa::SquadDotWaitOp>()) {
           auto carriedTy = cast<RankedTensorType>(nativeAcc.getType());
           auto carriedEncoding =
               dyn_cast<ttg::MUSASqmmaEncodingAttr>(carriedTy.getEncoding());
@@ -1022,9 +1025,12 @@ struct TritonMUSAGPUTLELowerSqmmaPass
         auto operandType = musa::getWmmaEltType(
             cast<ttg::MemDescType>(dot.getA().getType()).getElementType());
         assert(operandType && "SQMMA operand type must be verified");
+        auto accumulatorType = nativeTy.getElementType().isSignlessInteger(32)
+                                   ? musa::SQMMAEltType::s32
+                                   : musa::SQMMAEltType::f32;
         auto nativeDot = musa::SquadDotOp::create(
             builder, dot.getLoc(), nativeTy, dot.getA(), dot.getB(), nativeAcc,
-            useC, instr[0], instr[1], instructionK, musa::SQMMAEltType::f32,
+            useC, instr[0], instr[1], instructionK, accumulatorType,
             *operandType, *operandType,
             inferLayout(cast<ttg::MemDescType>(dot.getA().getType())),
             inferLayout(cast<ttg::MemDescType>(dot.getB().getType())), true,
