@@ -119,8 +119,6 @@ if _detect_backend() == "ascend":
             backend, _, name = op.partition("_")
             if backend != "ascend":
                 raise ValueError(f"unknown raw backend prefix in {op!r}")
-            if isinstance(out, (list, tuple, tl.tuple)) and len(out) == 0:
-                return _ascend_raw(name, *args, _semantic=_semantic)
             return _ascend_raw(name, *args, out=out, _semantic=_semantic)
         from triton.experimental.tle.raw.cann import CANNJITFunction
         if isinstance(op, CANNJITFunction):
