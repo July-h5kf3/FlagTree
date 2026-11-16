@@ -9,6 +9,33 @@ CUSTOM_OPS_BITCODE = str(Path(__file__).with_name("custom_ops.bc").resolve())
 _GATHER_SUFFIX_BY_DTYPE = {tl.float16: "half", tl.bfloat16: "bf16"}
 
 
+@al.register_custom_op
+class cube_copy_l0c2gm_deqf16:
+    """Copy caller-owned INT32 L0C to FP16 GM with scalar Fixpipe dequantization.
+
+    Ascend 910B/dav-c220, DEQF16, NZ-to-ND, no ReLU or channel split.
+    dst is a 64-bit GM byte address; src is a 32-bit L0C byte offset.
+    n_size/m_size are columns/rows; dst_stride is measured in FP16 elements
+    and src_stride in INT32 elements. scale_bits is the raw 64-bit DEQSCALE
+    register encoding, not a floating-point scale. Dimensions, alignment,
+    strides and scale must satisfy the device instruction's constraints.
+
+    No tensor output is returned. The caller configures ND_PARA and owns
+    L0C allocation, producer-to-FIX synchronization, completion before
+    buffer reuse, and ordering of shared Fixpipe register updates. This
+    cannot consume a compiler-managed tl.dot result by passing its address.
+    """
+
+    core = al.CORE.CUBE
+    pipe = al.PIPE.PIPE_FIX
+    mode = al.MODE.SIMD
+
+    def __init__(self, dst: tl.uint64, src: tl.uint32, n_size: tl.int32, m_size: tl.int32, dst_stride: tl.int32,
+                 src_stride: tl.int32, unit_flag: tl.int32, scale_bits: tl.uint64):
+        self.symbol = "copy_l0c2gm_deqf16"
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
 def _element_dtype(value):
     # Block-pointer tensors (tl.make_block_ptr) carry a nested dtype:
     # pointer<block<[shape], dtype>>. Unwrap element_ty down to the scalar.

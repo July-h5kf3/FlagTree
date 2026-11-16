@@ -34,6 +34,7 @@ set(ASCEND_CUSTOM_OPS
   "mem_ops/gather_gm_to_l1.cpp::dav-c220-cube"
   "mem_ops/gather_gm_to_ub.cpp::dav-c220-vec"
   "mem_ops/gather_mask.cpp::dav-c220-vec"
+  "mem_ops/copy_l0c2gm_deqf16.cpp::dav-c220-cube"
   "reduction_ops/pair_reduce_sum.cpp::dav-c220-vec"
   "sort_ops/sort32.cpp::dav-c220-vec"
   "sort_ops/sort_1d_pack.cpp::dav-c220-vec"

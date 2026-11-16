@@ -86,6 +86,7 @@ custom op 入口，与旧写法 `tle.dsa.ascend.raw("<op_name>", ...)` 生成的
 | `duplicate_bitwise_mask` | VECTOR / V | 将一个变量或立即数复制多次并填充到向量中 | 需要填充数据的向量，对应 Ascend C `const LocalTensor<T>& dst` | `mem_ops/ duplicate.cpp` |
 | `gather_gm_to_l1` | CUBE / MTE2 | 按索引将 GM 连续张量中的 half/bf16 数据行收集到 L1/CBUF，并完成 ND2NZ 搬运 | L1/CBUF half/bf16 目标张量，对应 C++ `dst` | `mem_ops/gather_gm_to_l1.cpp` |
 | `gather_gm_to_ub` | VECTOR / MTE2 | 按索引将 GM 连续张量中的 half/bf16 数据行收集到 UB | UB half/bf16 目标张量，对应 C++ `dst` | `mem_ops/gather_gm_to_ub.cpp` |
+| `cube_copy_l0c2gm_deqf16` | CUBE / FIX | INT32 L0C × scalar scale → FP16 GM, NZ-to-ND | No tensor result; writes to a GM byte address | `mem_ops/copy_l0c2gm_deqf16.cpp` |
 | `gather_mask_builtin_pattern` | VECTOR / V | 以内置固定模式对应的二进制对应的二进制为 gather mask, 从源操作数中选取元素写入目的操作数中 | 目的操作数，`out[0]` 对应 Ascend C `const LocalTensor<T>& dst`, `out[1]` 对应 Ascend C `uint64_t& rsvdCnt` | `mem_ops/gather_mask.cpp` |
 | `gather_mask_custom_pattern` | VECTOR / V | 以用户自定义输入的 Tensor 数值对应的二进制为 gather mask, 从源操作数中选取元素写入目的操作数中 | 目的操作数，`out[0]`对应 Ascend C `const LocalTensor<T>& dst`, `out[1]`对应 Ascend C `uint64_t& rsvdCnt` | `mem_ops/gather_mask.cpp` |
 | `pair_reduce_sum_continuous_mask` | VECTOR / V | 以 mask 连续模式进行相邻两个（奇偶）元素的求和 | 规约操作结果，对应 Ascend C `const LocalTensor<T>& dst` | `reduction_ops/pair_reduce_sum.cpp` |
@@ -96,6 +97,59 @@ custom op 入口，与旧写法 `tle.dsa.ascend.raw("<op_name>", ...)` 生成的
 | `unpack_sort` | VECTOR / V | 将 `[value, encoded_index]` proposal 拆分成 value 和 index | `[dst_value, dst_index]` | `sort_ops/unpack_sort.cpp:20-24` |
 
 ## 算子使用方法
+
+### `cube_copy_l0c2gm_deqf16`
+
+This Ascend 910B/dav-c220 instruction-level interface converts an existing,
+caller-owned INT32 L0C tile to FP16 while writing it to GM. It avoids writing an
+INT32 intermediate to GM and loading it again for Vector scaling/conversion.
+Ordinary Triton can express the arithmetic, but cannot request this writeback
+instruction for a caller-owned L0C address. It is registered and linked into
+`custom_ops.bc` using the existing build, without a CANN/IR compiler patch or
+new custom-op ABI. Empty tensor outputs are omitted by the raw dispatcher for
+this void operation. The loader uses CANN's inferred task kind to distinguish
+pure Cube kernels from the frontend's default AIV label.
+
+```python
+tle_raw.call(
+    "ascend_cube_copy_l0c2gm_deqf16",
+    destination.to(tl.uint64),  # GM byte address, after pointer arithmetic
+    l0c_byte_offset,           # caller-owned INT32 NZ matrix
+    columns,
+    rows,
+    destination_row_stride,    # FP16 elements
+    source_row_stride,         # physical INT32 row pitch in the NZ matrix
+    unit_flag,
+    scale_bits,               # raw uint64 DEQSCALE register encoding
+)
+```
+
+There is no `out=` tensor or returned value. The destination is row-major FP16;
+ReLU and channel split are disabled. For one matrix the caller sets ND_PARA to
+`1`, orders the producer before PIPE_FIX, and waits for completion before reusing
+L0C or changing shared Fixpipe registers. Addresses, dimensions, strides, and
+unit flags use the hardware instruction's constraints; this is not the complete
+AscendC Fixpipe tiling API. The scalar implementation follows CANN 9.1
+`dav_c220/kernel_operator_fixpipe_impl.h` (`SetFixpipePreQuantFlagImpl` and
+the `copy_matrix_cc_to_gm` DEQF16 call).
+
+For the scalar FP19 scale used in the example, encode the FP32 bit pattern with
+its low 13 bits cleared, stored in the low 32 bits of `scale_bits`. Reference
+calculations must use that effective scale rather than the original FP32 value.
+The result rounds to FP16 during writeback. Applying this independently to K
+partials can lose cancellation information; it does not preserve FP32 partial
+accumulation semantics. Compiler-managed `tl.dot` results are not accepted as
+L0C addresses by this interface.
+
+`python python/tutorials/tle/custom/test_fixpipe_dequant.py` runs the exact CPU
+INT64-reference checks and a full-tile comparison with ordinary Triton
+`tl.dot(...).to(tl.float32) * scale`, followed by `.to(tl.float16)`. The adjacent
+`fixpipe_test_setup.cpp` is a source-JIT test fixture that prepares L0C; it is not
+part of the public custom-op library. The tutorial and benchmark launch one
+128x128x128 tile on one block; multi-block Cube scheduling is outside this
+example's scope. The benchmark includes each path's input
+loads, matrix product, dequantization, and output write, so its timing is not an
+isolated measurement of the Fixpipe instruction.
 
 ### `duplicate_bitwise_mask`
 
