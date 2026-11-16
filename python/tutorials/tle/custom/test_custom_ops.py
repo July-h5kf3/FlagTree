@@ -14,8 +14,13 @@ custom_ops.bc, one group per op:
   - merge_exhaust_sort4  (4-way / 2-way / 3-way with a hole way)
   - unpack_sort          (split proposals into value / index)
 
-Correctness only, no benchmarking.
+Includes an INT32-to-FP16 Fixpipe reference check and focused benchmark.
 """
+
+import os
+import platform
+import struct
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -24,6 +29,8 @@ import triton
 import triton.experimental.tle as tle
 import triton.experimental.tle.language.raw as tle_raw
 import triton.language as tl
+import triton.language.extra.cann.extension as al
+from triton.experimental.tle.raw import dialect
 from triton.experimental.tle.language.dsa.ascend.custom_ops import (
     SORT_IMPL_BASE,
     SORT_IMPL_S4096_K1_128_K2048,
@@ -678,6 +685,137 @@ def test_duplicate():
     print("[PASS] duplicate correctness")
 
 
+# AscendC's public Fixpipe is compiled only into this test fixture.
+FIXPIPE_SOURCE = str(Path(__file__).with_name("fixpipe_reference.cpp"))
+FIXPIPE_INCLUDE = Path(os.environ["ASCEND_HOME_PATH"]) / f"{platform.machine()}-linux/asc/include"
+FIXPIPE_INCLUDES = [str(FIXPIPE_INCLUDE.parent), str(FIXPIPE_INCLUDE), str(FIXPIPE_INCLUDE / "basic_api")]
+
+
+@dialect(name="cann", file=FIXPIPE_SOURCE, includes=FIXPIPE_INCLUDES, extern_func_name="prepare_fixpipe",
+         pipeline={"core": "cube", "pipe": "PIPE_M"})
+def prepare_fixpipe(*args, **kwargs):
+    ...
+
+
+@dialect(name="cann", file=FIXPIPE_SOURCE, includes=FIXPIPE_INCLUDES, extern_func_name="reference_fixpipe",
+         pipeline={"core": "cube", "pipe": "PIPE_FIX"})
+def reference_fixpipe(*args, **kwargs):
+    ...
+
+
+@triton.jit
+def fixpipe_kernel(A, B, Out, ROWS: tl.constexpr, COLUMNS: tl.constexpr, STRIDE: tl.constexpr, SOURCE: tl.constexpr,
+                   SCALE, ND: tl.constexpr, RELU: tl.constexpr, UNIT: tl.constexpr, REFERENCE: tl.constexpr):
+    BASE_SIZE: tl.constexpr = 64 if ND > 1 else 128
+    with al.scope(core_mode="cube"):
+        src = tl.full((), SOURCE, tl.uint32)
+        tle_raw.call(
+            prepare_fixpipe,
+            [A.to(tl.uint64),
+             B.to(tl.uint64), src,
+             tl.full((), UNIT, tl.uint8),
+             tl.full((), BASE_SIZE, tl.uint16)])
+        if REFERENCE:
+            tle_raw.call(reference_fixpipe, [
+                Out.to(tl.uint64),
+                src,
+                tl.full((), COLUMNS, tl.uint16),
+                tl.full((), ROWS, tl.uint16),
+                tl.full((), BASE_SIZE, tl.uint16),
+                tl.full((), STRIDE, tl.uint32),
+                11,
+                tl.full((), SCALE, tl.uint64),
+                tl.full((), ND, tl.uint16),
+                tl.full((), BASE_SIZE * BASE_SIZE // 256 if ND > 1 else 0, tl.uint16),
+                tl.full((), ROWS * STRIDE + 16 if ND > 1 else 0, tl.uint16),
+                RELU,
+                tl.full((), UNIT, tl.uint8),
+                False,
+            ])
+        else:
+            al.custom("fixpipe_int32_to_fp16", Out.to(tl.uint64), src, COLUMNS, ROWS, BASE_SIZE, STRIDE,
+                      tl.full((), 11, tl.int32), SCALE, ND, BASE_SIZE * BASE_SIZE // 256 if ND > 1 else 0,
+                      ROWS * STRIDE + 16 if ND > 1 else 0, RELU, UNIT, tl.full((), False, tl.int1))
+        tl.debug_barrier()
+
+
+@triton.jit
+def fixpipe_triton_kernel(A, B, Out, SCALE: tl.constexpr):
+    offsets = tl.arange(0, 128)
+    a = tl.load(A + offsets[:, None] * 128 + offsets[None, :])
+    b = tl.load(B + offsets[:, None] * 128 + offsets[None, :])
+    values = (tl.dot(a, tl.trans(b)).to(tl.float32) * SCALE).to(tl.float16)
+    tl.store(Out + offsets[:, None] * 128 + offsets[None, :], values)
+
+
+def test_fixpipe_int32_to_fp16():
+    generator = torch.Generator().manual_seed(110231)
+    a = torch.randint(-127, 128, (2, 128, 128), dtype=torch.int8, generator=generator)
+    b = torch.randint(-127, 128, (2, 128, 128), dtype=torch.int8, generator=generator)
+    dots = a.numpy().astype(np.int64) @ b.numpy().astype(np.int64).transpose(0, 2, 1)
+    a, b = a.to(DEVICE), b.to(DEVICE)
+    geometries = [(128, 128, 128, 0, 1, False, 0), (64, 128, 144, 65536, 1, False, 0), (16, 16, 32, 0, 1, False, 0),
+                  (31, 47, 64, 0, 1, False, 0), (64, 64, 80, 0, 2, False, 0), (64, 64, 80, 0, 2, True, 0),
+                  (128, 128, 128, 0, 1, True, 0), (128, 128, 128, 0, 1, False, 3)]
+    cases = 0
+    for rows, columns, stride, source, nd, relu, unit in geometries:
+        for scale in (0.0, 1 / 256, -1 / 256, 0.0001):
+            bits = struct.unpack("I", struct.pack("f", scale))[0] & 0xFFFFE000
+            effective = struct.unpack("f", struct.pack("I", bits))[0]
+            nd_stride = rows * stride + 16
+            expected = np.full(16 + nd * nd_stride + 16, 123, dtype=np.float16)
+            for matrix in range(nd):
+                values = dots[0, :rows, matrix * columns:(matrix + 1) * columns].astype(np.float32)
+                values = np.maximum(values, 0) if relu else values
+                values = (values * effective).astype(np.float16)
+                start = 16 + matrix * nd_stride
+                expected[start:start + rows * stride].reshape(rows, stride)[:, :columns] = values
+            outputs = []
+            for reference in (False, True):
+                storage = torch.full((expected.size, ), 123, dtype=torch.float16, device=DEVICE)
+                fixpipe_kernel[(1, )](a, b, storage[16:], rows, columns, stride, source, bits, nd, relu, unit,
+                                      reference, num_warps=1, multibuffer=False, disable_auto_inject_block_sync=True,
+                                      enable_auto_bind_sub_block=True)
+                actual = storage.cpu().numpy()
+                outputs.append(actual)
+            np.testing.assert_array_equal(outputs[0].view(np.uint16), outputs[1].view(np.uint16),
+                                          err_msg="custom Fixpipe differs from AscendC Fixpipe")
+            np.testing.assert_array_equal(
+                outputs[0], expected,
+                err_msg=f"Fixpipe CPU mismatch: M={rows}, N={columns}, ND={nd}, relu={relu}, unit={unit}, scale={scale}"
+            )
+            cases += 1
+    print(f"[PASS] Fixpipe INT32-to-FP16: {cases} CPU/AscendC-reference cases, including padding guards")
+
+
+def bench_fixpipe_int32_to_fp16():
+    torch.manual_seed(110231)
+    a = torch.randint(-127, 128, (128, 128), dtype=torch.int8, device=DEVICE)
+    b = torch.randint(-127, 128, (128, 128), dtype=torch.int8, device=DEVICE)
+    custom = torch.empty((128, 128), dtype=torch.float16, device=DEVICE)
+    ordinary = torch.empty_like(custom)
+    bits = struct.unpack("I", struct.pack("f", 1 / 256))[0]
+
+    def launch_custom():
+        return fixpipe_kernel[(1, )](a, b, custom, 128, 128, 128, 0, bits, 1, False, 0, False, num_warps=1,
+                                     multibuffer=False, disable_auto_inject_block_sync=True,
+                                     enable_auto_bind_sub_block=True)
+
+    def launch_triton():
+        return fixpipe_triton_kernel[(1, )](a, b, ordinary, 1 / 256, num_warps=1, multibuffer=False)
+
+    launch_custom()
+    launch_triton()
+    np.testing.assert_array_equal(custom.cpu().numpy(), ordinary.cpu().numpy())
+    timings = {"custom": [], "triton": []}
+    for order in (("triton", "custom"), ("custom", "triton")):
+        for name in order:
+            launch = launch_custom if name == "custom" else launch_triton
+            timings[name].append(triton.testing.do_bench(launch, return_mode="median"))
+    print(f"[BENCH] Fixpipe 128x128x128, one block: rounds_ms={timings}; "
+          f"triton/custom={np.mean(timings['triton']) / np.mean(timings['custom']):.3f}x")
+
+
 def main():
     from test_cast_ops import main as test_cast_ops
     from test_compare_scalar import main as test_compare_scalar
@@ -695,6 +833,8 @@ def main():
     test_gather_mask()
     test_pair_reduce_sum()
     test_duplicate()
+    test_fixpipe_int32_to_fp16()
+    bench_fixpipe_int32_to_fp16()
     print("\nAll custom op correctness tests passed.")
 
 

@@ -9,6 +9,37 @@ CUSTOM_OPS_BITCODE = str(Path(__file__).with_name("custom_ops.bc").resolve())
 _GATHER_SUFFIX_BY_DTYPE = {tl.float16: "half", tl.bfloat16: "bf16"}
 
 
+@al.register_custom_op
+class fixpipe_int32_to_fp16:
+    """AscendC Fixpipe<half, int32_t, CFG_ROW_MAJOR>, scalar DEQF16 overload.
+
+    dst/src are the GM/L0C byte addresses of the AscendC tensor operands.
+    The remaining arguments expose every FixpipeParamsV220 field in SDK
+    declaration order, retaining the SDK names, integer widths and units.
+    srcStride is measured in C0_SIZE (16 INT32 elements); dstStride and
+    dstNdStride are FP16 element counts; srcNdStride is in 1024-byte units.
+    quantPre must be DEQF16 (11 on dav-c220); isChannelSplit must be false
+    for this dtype/layout specialization. deqScalar is the uint64 register
+    encoding, not a floating-point scale. ND_PARA, DEQSCALE and the pre-copy
+    PIPE_FIX barrier follow CANN 9.1 FixpipeL0C2GMImpl. No value is returned.
+    The caller owns L0C, producer synchronization and completion before reuse.
+    """
+
+    core = al.CORE.CUBE
+    pipe = al.PIPE.PIPE_FIX
+    mode = al.MODE.SIMD
+
+    def __init__(self, dst: tl.uint64, src: tl.uint32, nSize: tl.uint16, mSize: tl.uint16, srcStride: tl.uint16,
+                 dstStride: tl.uint32, quantPre: tl.int32, deqScalar: tl.uint64, ndNum: tl.uint16,
+                 srcNdStride: tl.uint16, dstNdStride: tl.uint16, reluEn: tl.int1, unitFlag: tl.uint8,
+                 isChannelSplit: tl.int1):
+        assert not isinstance(quantPre, int) or quantPre == 11, "INT32-to-FP16 scalar Fixpipe requires DEQF16 (11)"
+        assert not isinstance(isChannelSplit, (bool, int)) or not isChannelSplit, (
+            "AscendC Fixpipe forbids channel splitting for INT32-to-FP16")
+        self.symbol = "custom_fixpipe_int32_to_fp16"
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
 def _element_dtype(value):
     # Block-pointer tensors (tl.make_block_ptr) carry a nested dtype:
     # pointer<block<[shape], dtype>>. Unwrap element_ty down to the scalar.

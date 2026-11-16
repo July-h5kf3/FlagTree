@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import subprocess
 import os
+from types import SimpleNamespace
 import triton
 import triton.language as tl
 import triton.language.extra.cann.extension as al
@@ -9,6 +10,7 @@ from triton.compiler.code_generator import ast_to_ttir
 from triton._C.libtriton import ir
 from triton._C.libtriton.ascend import ir as ascend_ir
 from triton.backends.ascend.compiler import NPUOptions, ttir_to_linalg
+from triton.backends.ascend import compiler
 import pytest
 
 
@@ -283,6 +285,22 @@ def test_custom_op_without_extra_buffers_has_no_extra_buffer_attrs():
     for line in _custom_lines(mlir, "my_custom_op"):
         assert "extra_buffers_types" not in line
         assert "extra_buffers_sizes" not in line
+
+
+@pytest.mark.parametrize("task_type,frontend_mode,loader_mode", [(10, "aiv", "aiv"), (20, "aiv", "aic"),
+                                                                 (31, "aiv", "mix"), (42, "aiv", "mix"),
+                                                                 (20, "aic", "aic"), (31, "mix", "mix")])
+def test_void_cube_loader_uses_cann_task_kind(monkeypatch, task_type, frontend_mode, loader_mode):
+
+    def compile_binary(linalg, metadata, options):
+        metadata["bs_task_type"] = task_type
+        return b"kernel"
+
+    monkeypatch.setattr(compiler, "_USE_CUSTOM_COMPILE_OPT", None)
+    monkeypatch.setattr(compiler, "linalg_to_bin_enable_npu_compile_A2_A3", compile_binary)
+    metadata = {"mix_mode": frontend_mode}
+    compiler._compile_linalg_to_npu_bin("", metadata, SimpleNamespace(compile_on_910_95=False))
+    assert metadata["mix_mode"] == loader_mode
 
 
 # ============== Main for manual testing ==============

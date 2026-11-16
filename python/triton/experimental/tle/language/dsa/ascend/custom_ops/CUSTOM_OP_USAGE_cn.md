@@ -27,6 +27,7 @@ custom_ops/
 │   ├── duplicate.cpp               # 将一个变量或立即数复制多次并填充到向量中，暂只支持 tensor 高维切分计算中 mask 逐比特模式
 │   ├── gather_gm_to_l1.cpp         # GM → L1/CBUF 按索引行 gather
 │   ├── gather_gm_to_ub.cpp         # GM → UB 按索引行 gather
+│   ├── fixpipe_int32_to_fp16.cpp   # scalar Fixpipe INT32 L0C → FP16 GM
 │   └── gather_mask.cpp             # 以内置固定模式对应的二进制或用户自定义输入的 Tensor 数值对应的二进制为 gather mask, 从源操作数中选取元素写入目的操作数中
 ├── cast_ops/
 │   └── cast_int4_to_fp16.cpp       # packed signed INT4 → FP16
@@ -86,6 +87,7 @@ custom op 入口，与旧写法 `tle.dsa.ascend.raw("<op_name>", ...)` 生成的
 | `duplicate_bitwise_mask` | VECTOR / V | 将一个变量或立即数复制多次并填充到向量中 | 需要填充数据的向量，对应 Ascend C `const LocalTensor<T>& dst` | `mem_ops/ duplicate.cpp` |
 | `gather_gm_to_l1` | CUBE / MTE2 | 按索引将 GM 连续张量中的 half/bf16 数据行收集到 L1/CBUF，并完成 ND2NZ 搬运 | L1/CBUF half/bf16 目标张量，对应 C++ `dst` | `mem_ops/gather_gm_to_l1.cpp` |
 | `gather_gm_to_ub` | VECTOR / MTE2 | 按索引将 GM 连续张量中的 half/bf16 数据行收集到 UB | UB half/bf16 目标张量，对应 C++ `dst` | `mem_ops/gather_gm_to_ub.cpp` |
+| `fixpipe_int32_to_fp16` | CUBE / FIX | AscendC scalar DEQF16, INT32 L0C → FP16 GM | Writes to the positional GM address; no tensor result | `mem_ops/fixpipe_int32_to_fp16.cpp` |
 | `gather_mask_builtin_pattern` | VECTOR / V | 以内置固定模式对应的二进制对应的二进制为 gather mask, 从源操作数中选取元素写入目的操作数中 | 目的操作数，`out[0]` 对应 Ascend C `const LocalTensor<T>& dst`, `out[1]` 对应 Ascend C `uint64_t& rsvdCnt` | `mem_ops/gather_mask.cpp` |
 | `gather_mask_custom_pattern` | VECTOR / V | 以用户自定义输入的 Tensor 数值对应的二进制为 gather mask, 从源操作数中选取元素写入目的操作数中 | 目的操作数，`out[0]`对应 Ascend C `const LocalTensor<T>& dst`, `out[1]`对应 Ascend C `uint64_t& rsvdCnt` | `mem_ops/gather_mask.cpp` |
 | `pair_reduce_sum_continuous_mask` | VECTOR / V | 以 mask 连续模式进行相邻两个（奇偶）元素的求和 | 规约操作结果，对应 Ascend C `const LocalTensor<T>& dst` | `reduction_ops/pair_reduce_sum.cpp` |
@@ -96,6 +98,63 @@ custom op 入口，与旧写法 `tle.dsa.ascend.raw("<op_name>", ...)` 生成的
 | `unpack_sort` | VECTOR / V | 将 `[value, encoded_index]` proposal 拆分成 value 和 index | `[dst_value, dst_index]` | `sort_ops/unpack_sort.cpp:20-24` |
 
 ## 算子使用方法
+
+### `fixpipe_int32_to_fp16`
+
+This matches the CANN 9.1 scalar overload
+`Fixpipe<half, int32_t, CFG_ROW_MAJOR>(dst, src, intriParams)`.
+As with the other registered primitives, the structure fields are flattened
+into positional arguments, in `FixpipeParamsV220` declaration order:
+
+```python
+tle.dsa.ascend.raw(
+    "fixpipe_int32_to_fp16", dst.to(tl.uint64), src_l0c_byte_offset,
+    nSize, mSize, srcStride, dstStride, quantPre, deqScalar,
+    ndNum, srcNdStride, dstNdStride, reluEn, unitFlag, isChannelSplit,
+)
+```
+
+| Field | SDK type | Meaning / unit |
+| --- | --- | --- |
+| `nSize` | uint16 | Columns copied |
+| `mSize` | uint16 | Rows copied |
+| `srcStride` | uint16 | Source Z-tile pitch in C0_SIZE = 16 × sizeof(int32) = 64 bytes |
+| `dstStride` | uint32 | Destination ND row stride in FP16 elements |
+| `quantPre` | QuantMode_t | Must be scalar `DEQF16` (11 on dav-c220) |
+| `deqScalar` | uint64 | Raw scalar DEQSCALE encoding; FP19 value is in bits 31:13 |
+| `ndNum` | uint16 | Number of matrices |
+| `srcNdStride` | uint16 | Source matrix stride in 16 × C0_SIZE = 1024 bytes |
+| `dstNdStride` | uint16 | Destination matrix stride in FP16 elements |
+| `reluEn` | bool | Clamp the INT32 accumulator before scalar dequantization |
+| `unitFlag` | uint8 | SDK Mmad/Fixpipe unit-flag mode (0, 2 or 3) |
+| `isChannelSplit` | bool | Must be false for INT32-to-FP16 |
+
+`dst` is a GM byte address and `src` a 64-byte-aligned caller-owned L0C byte
+address, carrying the SDK GlobalTensor/LocalTensor operands across the TLE ABI.
+There is no `out=` or return value. Use the existing `tle.dsa.ascend.raw` alias
+or `al.custom`; these entries do not add a placeholder output operand.
+
+The implementation reproduces the scalar row-major specialization in
+`dav_c220/kernel_operator_fixpipe_v2_impl.h`: it sets ND_PARA from all three ND
+fields, sets DEQSCALE, executes the SDK's pre-copy PIPE_FIX barrier, and performs
+DEQF16 writeback with the supplied ReLU and unit flag. No external ND_PARA setup
+is needed. ReLU is applied before the scale, which matters for negative scales.
+The caller still owns L0C allocation, Mmad-to-FIX ordering and
+completion before reuse. The output rounds to FP16; this does not preserve
+FP32 accumulation if used independently on K partials.
+
+The repository check compares the custom op both with the actual AscendC
+`Fixpipe` API and with an independent CPU INT64 matrix-product reference:
+
+```bash
+pytest -q python/tutorials/tle/custom/test_custom_ops.py -k fixpipe
+```
+
+The existing tutorial entry also runs its single-block benchmark against
+ordinary Triton dot + FP32 scaling + FP16 conversion. The adjacent
+`fixpipe_reference.cpp` is a source-JIT test fixture, outside `custom_ops.bc`.
+The tested scope is one block; other dtypes, layouts and tensor-scale overloads
+are outside this specialization. A multi-block fixture remains unvalidated.
 
 ### `duplicate_bitwise_mask`
 
