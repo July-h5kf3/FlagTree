@@ -10,29 +10,33 @@ _GATHER_SUFFIX_BY_DTYPE = {tl.float16: "half", tl.bfloat16: "bf16"}
 
 
 @al.register_custom_op
-class cube_copy_l0c2gm_deqf16:
-    """Copy caller-owned INT32 L0C to FP16 GM with scalar Fixpipe dequantization.
+class fixpipe_int32_to_fp16:
+    """AscendC Fixpipe<half, int32_t, CFG_ROW_MAJOR>, scalar DEQF16 overload.
 
-    Ascend 910B/dav-c220, DEQF16, NZ-to-ND, no ReLU or channel split.
-    dst is a 64-bit GM byte address; src is a 32-bit L0C byte offset.
-    n_size/m_size are columns/rows; dst_stride is measured in FP16 elements
-    and src_stride in INT32 elements. scale_bits is the raw 64-bit DEQSCALE
-    register encoding, not a floating-point scale. Dimensions, alignment,
-    strides and scale must satisfy the device instruction's constraints.
-
-    No tensor output is returned. The caller configures ND_PARA and owns
-    L0C allocation, producer-to-FIX synchronization, completion before
-    buffer reuse, and ordering of shared Fixpipe register updates. This
-    cannot consume a compiler-managed tl.dot result by passing its address.
+    dst/src are the GM/L0C byte addresses of the AscendC tensor operands.
+    The remaining arguments expose every FixpipeParamsV220 field in SDK
+    declaration order, retaining the SDK names, integer widths and units.
+    srcStride is measured in C0_SIZE (16 INT32 elements); dstStride and
+    dstNdStride are FP16 element counts; srcNdStride is in 1024-byte units.
+    quantPre must be DEQF16 (11 on dav-c220); isChannelSplit must be false
+    for this dtype/layout specialization. deqScalar is the uint64 register
+    encoding, not a floating-point scale. ND_PARA, DEQSCALE and the pre-copy
+    PIPE_FIX barrier follow CANN 9.1 FixpipeL0C2GMImpl. No value is returned.
+    The caller owns L0C, producer synchronization and completion before reuse.
     """
 
     core = al.CORE.CUBE
     pipe = al.PIPE.PIPE_FIX
     mode = al.MODE.SIMD
 
-    def __init__(self, dst: tl.uint64, src: tl.uint32, n_size: tl.int32, m_size: tl.int32, dst_stride: tl.int32,
-                 src_stride: tl.int32, unit_flag: tl.int32, scale_bits: tl.uint64):
-        self.symbol = "copy_l0c2gm_deqf16"
+    def __init__(self, dst: tl.uint64, src: tl.uint32, nSize: tl.uint16, mSize: tl.uint16, srcStride: tl.uint16,
+                 dstStride: tl.uint32, quantPre: tl.int32, deqScalar: tl.uint64, ndNum: tl.uint16,
+                 srcNdStride: tl.uint16, dstNdStride: tl.uint16, reluEn: tl.int1, unitFlag: tl.uint8,
+                 isChannelSplit: tl.int1):
+        assert not isinstance(quantPre, int) or quantPre == 11, "INT32-to-FP16 scalar Fixpipe requires DEQF16 (11)"
+        assert not isinstance(isChannelSplit, (bool, int)) or not isChannelSplit, (
+            "AscendC Fixpipe forbids channel splitting for INT32-to-FP16")
+        self.symbol = "custom_fixpipe_int32_to_fp16"
         self.bitcode = CUSTOM_OPS_BITCODE
 
 
