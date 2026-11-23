@@ -47,6 +47,40 @@ struct SelectedSqmmaConfig {
   SmallVector<unsigned, 2> warpsPerCTA;
 };
 
+static musa_tle::SqmmaOp findProducerSqmma(Value value) {
+  llvm::SmallPtrSet<void *, 16> visited;
+  while (value && visited.insert(value.getAsOpaquePointer()).second) {
+    if (auto sqmma = value.getDefiningOp<musa_tle::SqmmaOp>())
+      return sqmma;
+    if (auto wait = value.getDefiningOp<musa_tle::SqmmaWaitOp>()) {
+      value = wait.getInput();
+      continue;
+    }
+    if (auto cvt = value.getDefiningOp<ttg::ConvertLayoutOp>()) {
+      value = cvt.getSrc();
+      continue;
+    }
+    if (auto arg = dyn_cast<BlockArgument>(value)) {
+      auto forOp = dyn_cast_or_null<scf::ForOp>(arg.getOwner()->getParentOp());
+      if (!forOp || arg.getArgNumber() == 0)
+        break;
+      value = forOp.getInitArgs()[arg.getArgNumber() - 1];
+      continue;
+    }
+    if (auto result = dyn_cast<OpResult>(value)) {
+      if (auto forOp = dyn_cast<scf::ForOp>(result.getOwner())) {
+        if (auto yield =
+                dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator())) {
+          value = yield.getOperand(result.getResultNumber());
+          continue;
+        }
+      }
+    }
+    break;
+  }
+  return {};
+}
+
 static SmallVector<unsigned, 2> getPreferredWarpsPerCTA(
     musa_tle::SqmmaOp dot, unsigned numWarps,
     const DenseMap<musa_tle::SqmmaOp, ttg::MUSASqmmaEncodingAttr> &encodings) {
@@ -956,8 +990,11 @@ struct TritonMUSAGPUTLELowerSqmmaPass
       }
       unsigned numWarps = ttg::maybeLookupNumWarps(dot).value_or(0);
       SmallVector<unsigned, 2> preferredWarps;
-      // An async C dependency cannot redistribute its producer's registers.
-      if (auto previous = dot.getC().getDefiningOp<musa_tle::SqmmaOp>())
+      // Preserve the producer's warp split across both direct async C chains
+      // and waited/loop-carried accumulator chains to avoid shared-memory
+      // redistributions between chained SQMMAs.
+      if (auto previous = findProducerSqmma(dot.getC());
+          previous && encodings.contains(previous))
         preferredWarps = to_vector(encodings[previous].getWarpsPerCTA());
       else if (auto explicitEnc = dyn_cast_or_null<ttg::MUSASqmmaEncodingAttr>(
                    cast<RankedTensorType>(dot.getC().getType()).getEncoding()))
@@ -1006,16 +1043,21 @@ struct TritonMUSAGPUTLELowerSqmmaPass
           auto carriedTy = cast<RankedTensorType>(nativeAcc.getType());
           auto carriedEncoding =
               dyn_cast<ttg::MUSASqmmaEncodingAttr>(carriedTy.getEncoding());
-          if (!carriedEncoding ||
-              carriedEncoding.toLinearLayout(carriedTy.getShape()) !=
-                  encodings[dot].toLinearLayout(nativeTy.getShape())) {
+          bool layoutsCompatible =
+              carriedEncoding &&
+              carriedEncoding.toLinearLayout(carriedTy.getShape()) ==
+                  encodings[dot].toLinearLayout(nativeTy.getShape());
+          if (layoutsCompatible) {
+            // C ownership is independent of K. Keep the producer's encoding;
+            // the current operands selected this instruction's K above.
+            nativeTy = carriedTy;
+          } else if (!nativeAcc.getDefiningOp<musa::SquadDotWaitOp>()) {
+            // A completed wait result is no longer in-flight and may
+            // redistribute C via ConvertLayoutOp before the next SQMMA.
             dot.emitOpError("requires compatible C register layouts for async "
                             "accumulator reuse");
             return signalPassFailure();
           }
-          // C ownership is independent of K. Keep the producer's encoding;
-          // the current operands selected this instruction's K above.
-          nativeTy = carriedTy;
         }
         if (failed(prepareAsyncLoopAccumulators(dot.getD(), nativeTy,
                                                 nativeAccumulators)))
