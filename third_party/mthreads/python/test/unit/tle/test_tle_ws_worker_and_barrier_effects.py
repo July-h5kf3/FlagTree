@@ -6,6 +6,7 @@ import triton
 import triton.experimental.tle.language as tle
 import triton.language as tl
 from test_tle_utils import compile_musa, require_mthreads_libtriton
+from triton.experimental.tle.language.gpu.mthreads.types import MusaSqmmaEncoding
 
 require_mthreads_libtriton()
 
@@ -99,3 +100,81 @@ def test_mthreads_tle_barrier_blocks_smem_load_hoisting():
     smem_loads = [match.start() for match in re.finditer(r"load i32, ptr addrspace\(3\)", llir)]
     assert wait_positions and smem_loads
     assert any(load_pos > wait_positions[0] for load_pos in smem_loads)
+
+
+@triton.jit
+def waited_sqmma_chain_kernel(a_ptr, b_ptr, out_ptr):
+    m = tl.arange(0, 64)[:, None]
+    k = tl.arange(0, 128)[None, :]
+    n = tl.arange(0, 128)[None, :]
+    a_smem = tle.gpu.alloc(
+        (64, 128),
+        dtype=tl.float8e4nv,
+        init_value=tl.load(a_ptr + m * 128 + k),
+        nv_mma_shared_layout=True,
+    )
+    b_smem = tle.gpu.alloc(
+        (128, 128),
+        dtype=tl.float8e4nv,
+        init_value=tl.load(b_ptr + tl.arange(0, 128)[:, None] * 128 + n),
+        nv_mma_shared_layout=True,
+    )
+    acc = tl.zeros((64, 128), dtype=tl.float32)
+    acc = tle.gpu.wgmma(a_smem, b_smem, acc)
+    acc = tle.gpu.wgmma_wait(0, acc)
+    acc = tle.gpu.wgmma(a_smem, b_smem, acc)
+    acc = tle.gpu.wgmma_wait(0, acc)
+    tl.store(out_ptr + m * 128 + n, acc)
+
+
+EXPLICIT_LOOP_SQMMA = tl.constexpr(MusaSqmmaEncoding([3, 1], [4, 4], [64, 128, 128]))
+
+
+@triton.jit
+def loop_sqmma_explicit_layout_kernel(a_ptr, b_ptr, out_ptr, steps):
+    m = tl.arange(0, 64)[:, None]
+    k = tl.arange(0, 128)[None, :]
+    n = tl.arange(0, 512)[None, :]
+    a_smem = tle.gpu.alloc(
+        (64, 128),
+        dtype=tl.float8e4nv,
+        init_value=tl.load(a_ptr + m * 128 + k),
+        nv_mma_shared_layout=True,
+    )
+    b_smem = tle.gpu.alloc(
+        (128, 512),
+        dtype=tl.float8e4nv,
+        init_value=tl.load(b_ptr + tl.arange(0, 128)[:, None] * 512 + n),
+        nv_mma_shared_layout=True,
+    )
+    acc = tle.gpu.set_layout(tl.zeros((64, 512), dtype=tl.float32), EXPLICIT_LOOP_SQMMA)
+    for _ in range(0, steps):
+        acc = tle.gpu.wgmma(a_smem, b_smem, acc)
+    acc = tle.gpu.wgmma_wait(0, acc)
+    acc = tle.gpu.set_layout(acc, EXPLICIT_LOOP_SQMMA)
+    tl.store(out_ptr + m * 512 + n, acc)
+
+
+def test_mthreads_tle_waited_sqmma_chain_preserves_warp_split():
+    compiled = compile_musa(
+        waited_sqmma_chain_kernel,
+        signature={"a_ptr": "*fp8e4nv", "b_ptr": "*fp8e4nv", "out_ptr": "*fp32"},
+        options={"num_warps": 16, "num_stages": 1},
+    )
+    ttgir = compiled.asm["ttgir"]
+    sqmma_encodings = re.findall(r"#ttg\.musa_sqmma<[^>]+>", ttgir)
+    assert len(sqmma_encodings) == 1
+    assert "warpsPerCTA = [16, 1]" in sqmma_encodings[0]
+    assert compiled.asm["llir"]
+
+
+def test_mthreads_tle_loop_sqmma_explicit_layout_unpack():
+    compiled = compile_musa(
+        loop_sqmma_explicit_layout_kernel,
+        signature={"a_ptr": "*fp8e4nv", "b_ptr": "*fp8e4nv", "out_ptr": "*fp32", "steps": "i32"},
+        options={"num_warps": 16, "num_stages": 1},
+    )
+    ttgir = compiled.asm["ttgir"]
+    assert "mtgpu.sqmma_wait" in ttgir
+    assert "mtgpu.unpack_sqmma_accumulator" in ttgir
+    assert compiled.asm["llir"]

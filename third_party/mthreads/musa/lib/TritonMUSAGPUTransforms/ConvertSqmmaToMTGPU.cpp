@@ -7,6 +7,9 @@
 #include "triton/Conversion/MLIRTypes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#ifdef __TLE__
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#endif // __TLE__
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -256,6 +259,16 @@ getCandidateForIterArg(scf::ForOp forOp, unsigned iterArgIdx,
       directYield};
 }
 
+static void copyPreservedAttrs(Operation *dst, Operation *src) {
+  dst->setAttrs(src->getAttrs());
+#ifdef __TLE__
+  for (unsigned idx = 0; idx < dst->getNumResults(); ++idx) {
+    if (isa<triton::mtgpu::SqmmaAccumulatorType>(dst->getResult(idx).getType()))
+      dst->removeAttr(getTleExplicitEncodingAttrName(idx));
+  }
+#endif // __TLE__
+}
+
 static Value materializeTensorAccumulatorForUse(
     Value original, Location loc, IRMapping &mapping,
     TensorMaterializationMap &tensorMaterializations, RewriterBase &rewriter) {
@@ -278,6 +291,10 @@ static Value materializeTensorAccumulatorForUse(
 
   Value unpacked = triton::mtgpu::UnpackSqmmaAccumulatorOp::create(
       rewriter, loc, originalTensorTy, mapped);
+#ifdef __TLE__
+  if (Attribute explicitEncoding = getTleExplicitValueEncoding(original))
+    setTleExplicitResultEncoding(unpacked.getDefiningOp(), 0, explicitEncoding);
+#endif // __TLE__
   byBlock[insertionBlock] = unpacked;
   return unpacked;
 }
@@ -372,7 +389,7 @@ static Operation *cloneSqmmaOp(triton::musa::SquadDotOp op, IRMapping &mapping,
         convertLayout(op.getLayoutA()), convertLayout(op.getLayoutB()),
         op.getIsAsync(), convertAccumulationMode(op.getAccMode()),
         op.getInputPrecision(), op.getMaxNumImpreciseAcc());
-    newOp->setAttrs(op->getAttrs());
+    copyPreservedAttrs(newOp, op);
     return newOp;
   }
 
@@ -382,7 +399,7 @@ static Operation *cloneSqmmaOp(triton::musa::SquadDotOp op, IRMapping &mapping,
       op.getEltTypeA(), op.getEltTypeB(), op.getLayoutA(), op.getLayoutB(),
       op.getIsAsync(), op.getAccMode(), op.getInputPrecision(),
       op.getMaxNumImpreciseAcc());
-  newOp->setAttrs(op->getAttrs());
+  copyPreservedAttrs(newOp, op);
   return newOp;
 }
 
@@ -394,7 +411,7 @@ static Operation *cloneSqmmaWaitOp(triton::musa::SquadDotWaitOp op,
     newInputs.push_back(mapping.lookupOrDefault(input));
   auto newOp =
       triton::mtgpu::SqmmaWaitOp::create(rewriter, op.getLoc(), newInputs);
-  newOp->setAttrs(op->getAttrs());
+  copyPreservedAttrs(newOp, op);
   return newOp;
 }
 
@@ -479,7 +496,7 @@ cloneNestedSqmmaOperation(Operation &op, IRMapping &mapping,
           scf::IfOp::create(rewriter, ifOp.getLoc(), resultTypes, cond,
                             /*withElseRegion=*/ifOp.elseBlock() != nullptr,
                             /*skipRegionBuilder=*/true);
-      newIf->setAttrs(ifOp->getAttrs());
+      copyPreservedAttrs(newIf, ifOp);
       if (newIf.getThenRegion().empty())
         newIf.getThenRegion().push_back(new Block);
       if (ifOp.elseBlock() && newIf.getElseRegion().empty())
@@ -642,7 +659,7 @@ static bool convertLoopCarriedSqmmaAccumulator(scf::ForOp forOp,
     auto newWait =
         triton::mtgpu::SqmmaWaitOp::create(rewriter, waitLoc, newInputs);
     if (externalFinalWait)
-      newWait->setAttrs(oldWait->getAttrs());
+      copyPreservedAttrs(newWait, oldWait);
 
     for (const Candidate &candidate : candidates)
       if (candidate.directYield)
@@ -661,6 +678,12 @@ static bool convertLoopCarriedSqmmaAccumulator(scf::ForOp forOp,
             if (it == externalWaitUnpacks.end()) {
               replacement = triton::mtgpu::UnpackSqmmaAccumulatorOp::create(
                   rewriter, oldWait.getLoc(), oldResult.getType(), newResult);
+#ifdef __TLE__
+              if (Attribute explicitEncoding =
+                      getTleExplicitResultEncoding(oldWait, idx))
+                setTleExplicitResultEncoding(replacement.getDefiningOp(), 0,
+                                             explicitEncoding);
+#endif // __TLE__
               externalWaitUnpacks[newResult] = replacement;
             } else {
               replacement = it->second;
@@ -686,6 +709,11 @@ static bool convertLoopCarriedSqmmaAccumulator(scf::ForOp forOp,
       auto tensorTy = cast<RankedTensorType>(forOp.getResult(idx).getType());
       result = triton::mtgpu::UnpackSqmmaAccumulatorOp::create(
           rewriter, loc, tensorTy, result);
+#ifdef __TLE__
+      if (Attribute explicitEncoding = getTleExplicitResultEncoding(forOp, idx))
+        setTleExplicitResultEncoding(result.getDefiningOp(), 0,
+                                     explicitEncoding);
+#endif // __TLE__
     }
     replacements.push_back(result);
   }
