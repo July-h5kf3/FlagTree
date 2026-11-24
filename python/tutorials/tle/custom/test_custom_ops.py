@@ -24,6 +24,7 @@ import triton
 import triton.experimental.tle as tle
 import triton.experimental.tle.language.raw as tle_raw
 import triton.language as tl
+import triton.language.extra.cann.extension as al
 from triton.experimental.tle.language.dsa.ascend.custom_ops import (
     SORT_IMPL_BASE,
     SORT_IMPL_S4096_K1_128_K2048,
@@ -105,7 +106,10 @@ def gather_gm_to_l1_dot_kernel(
         order=(1, 0),
     )
     tile_q = tl.load(query_2d)
-    result = tl.dot(tile_q, tl.trans(tile_k))
+    if DTYPE == tl.int8:
+        result = tl.dot(tile_q, tl.trans(tile_k), out_dtype=tl.int32).to(tl.float32)
+    else:
+        result = tl.dot(tile_q, tl.trans(tile_k))
 
     output_2d = tl.make_block_ptr(
         base=output,
@@ -356,13 +360,18 @@ D = 16
 L1_INDEX = [3, 4, 9, 10, 2, 7, 0, 1, 12, 13, 5, 8, 11, 6, 15, 14]
 UB_INDEX = [20, 21, 19, 30, 31, 25, 24, 18, 27, 28, 22, 29, 26, 23, 17, 16]
 
-_TL_DTYPE = {torch.float16: tl.float16, torch.bfloat16: tl.bfloat16}
+_TL_DTYPE = {torch.float16: tl.float16, torch.bfloat16: tl.bfloat16, torch.int8: tl.int8}
 
 
 def test_gather_gm_to_l1(torch_dtype, tol):
     torch.manual_seed(0)
-    src = torch.randn((NUM_ROWS, D), dtype=torch_dtype, device=DEVICE)
-    query = torch.randn((TILE_SIZE, D), dtype=torch_dtype, device=DEVICE)
+    width = 2 * D if torch_dtype == torch.int8 else D
+    if torch_dtype == torch.int8:
+        src = torch.randint(-127, 128, (NUM_ROWS, width), dtype=torch.int8, device=DEVICE)
+        query = torch.randint(-127, 128, (TILE_SIZE, width), dtype=torch.int8, device=DEVICE)
+    else:
+        src = torch.randn((NUM_ROWS, width), dtype=torch_dtype, device=DEVICE)
+        query = torch.randn((TILE_SIZE, width), dtype=torch_dtype, device=DEVICE)
     output = torch.empty((TILE_SIZE, TILE_SIZE), dtype=torch.float32, device=DEVICE)
     src_index = torch.tensor(L1_INDEX, dtype=torch.int32, device=DEVICE)
 
@@ -373,7 +382,7 @@ def test_gather_gm_to_l1(torch_dtype, tol):
         output,
         NUM_ROWS=NUM_ROWS,
         TILE_SIZE=TILE_SIZE,
-        D=D,
+        D=width,
         DTYPE=_TL_DTYPE[torch_dtype],
         enable_legacy_insert_load_store_for_mix_cv=True,
     )
@@ -678,13 +687,618 @@ def test_duplicate():
     print("[PASS] duplicate correctness")
 
 
+@triton.jit
+def paged_int8_qk_pv_kernel(
+    Q,
+    QR,
+    K,
+    KR,
+    Table,
+    P,
+    C,
+    R,
+    PV,
+    M: tl.constexpr,
+):
+    with al.scope(core_mode="cube"):
+        tle.dsa.ascend.raw(
+            "paged_int8_qk",
+            M,
+            Q.to(tl.uint64),
+            QR.to(tl.uint64),
+            K.to(tl.uint64),
+            KR.to(tl.uint64),
+            Table.to(tl.uint64),
+            C.to(tl.uint64),
+            R.to(tl.uint64),
+            6,
+            1,
+            0,
+            M // 4,
+        )
+        al.sync_block_set("cube", "vector", 0, al.PIPE.PIPE_FIX, al.PIPE.PIPE_MTE2)
+        al.sync_block_wait("vector", "cube", 1, al.PIPE.PIPE_MTE3, al.PIPE.PIPE_MTE2)
+        tle.dsa.ascend.raw(
+            "paged_int8_pv",
+            M,
+            P.to(tl.uint64),
+            PV.to(tl.uint64),
+            K.to(tl.uint64),
+            KR.to(tl.uint64),
+            Table.to(tl.uint64),
+            0,
+            0,
+            1,
+        )
+    with al.scope(core_mode="vector"):
+        al.sync_block_wait("cube", "vector", 0, al.PIPE.PIPE_FIX, al.PIPE.PIPE_MTE2)
+        if al.sub_vec_id() == 0:
+            cols = tl.arange(0, 64)
+            r_head = tl.load(R + cols)
+            tl.store(R + cols, r_head)
+        al.sync_block_set("vector", "cube", 1, al.PIPE.PIPE_MTE3, al.PIPE.PIPE_MTE2)
+
+
+@triton.jit
+def triton_paged_int8_qk_pv_bench_kernel(Q, QR, K, KR, Table, P, C, R, PV, M: tl.constexpr, GROUPS: tl.constexpr):
+    pid = tl.program_id(0)
+    rows = tl.arange(0, M)
+    cols512 = tl.arange(0, 512)
+    cols64 = tl.arange(0, 64)
+    q = tl.load(Q + rows[:, None] * 512 + cols512[None, :])
+    qr = tl.load(QR + rows[:, None] * 64 + cols64[None, :])
+    c_base = C + pid * M * 384
+    r_base = R + pid * M * 384
+    pv_base = PV + pid * 2 * M * 512
+    for group in range(0, GROUPS):
+        for p_idx in range(6):
+            page = tl.load(Table + (group % 2) * 6 + p_idx)
+            tok = page * 64 + cols64
+            k_page = tl.load(K + tok[:, None] * 512 + cols512[None, :])
+            kr_page = tl.load(KR + tok[:, None] * 64 + cols64[None, :])
+            c_tile = tl.dot(q, tl.trans(k_page), out_dtype=tl.int32)
+            r_tile = tl.dot(qr, tl.trans(kr_page), out_dtype=tl.float32)
+            tl.store(c_base + rows[:, None] * 384 + (p_idx * 64 + cols64)[None, :], c_tile)
+            tl.store(r_base + rows[:, None] * 384 + (p_idx * 64 + cols64)[None, :], r_tile)
+        for c_blk in range(4):
+            cols128 = c_blk * 128 + tl.arange(0, 128)
+            acc_hi = tl.zeros((M, 128), dtype=tl.int32)
+            acc_lo = tl.zeros((M, 128), dtype=tl.int32)
+            for p_idx in range(6):
+                page = tl.load(Table + (group % 2) * 6 + p_idx)
+                tok = page * 64 + cols64
+                v_slice = tl.load(K + tok[:, None] * 512 + cols128[None, :])
+                p_hi = tl.load(P + rows[:, None] * 384 + (p_idx * 64 + cols64)[None, :])
+                p_lo = tl.load(P + (M + rows)[:, None] * 384 + (p_idx * 64 + cols64)[None, :])
+                acc_hi += tl.dot(p_hi, v_slice, out_dtype=tl.int32)
+                acc_lo += tl.dot(p_lo, v_slice, out_dtype=tl.int32)
+            tl.store(pv_base + rows[:, None] * 512 + cols128[None, :], acc_hi)
+            tl.store(pv_base + (M + rows)[:, None] * 512 + cols128[None, :], acc_lo)
+
+
+@triton.jit
+def custom_paged_int8_qk_pv_bench_kernel(Q, QR, K, KR, Table, P, C, R, PV, M: tl.constexpr, GROUPS: tl.constexpr):
+    pid = tl.program_id(0)
+    pages = GROUPS * 6
+    with al.scope(core_mode="cube"):
+        tle.dsa.ascend.raw(
+            "paged_int8_qk",
+            M,
+            Q.to(tl.uint64),
+            QR.to(tl.uint64),
+            K.to(tl.uint64),
+            KR.to(tl.uint64),
+            Table.to(tl.uint64),
+            C.to(tl.uint64) + pid * M * 384 * 4,
+            R.to(tl.uint64) + pid * M * 384 * 4,
+            pages,
+            1,
+            0,
+            M // 4,
+        )
+        for group in tl.range(0, GROUPS, disable_licm=True):
+            slot = (group % 2).to(tl.uint32)
+            if group + 1 < GROUPS:
+                tle.dsa.ascend.raw(
+                    "paged_int8_qk",
+                    M,
+                    Q.to(tl.uint64),
+                    QR.to(tl.uint64),
+                    K.to(tl.uint64),
+                    KR.to(tl.uint64),
+                    (Table + ((group + 1) % 2) * 6).to(tl.uint64),
+                    C.to(tl.uint64) + pid * M * 384 * 4,
+                    R.to(tl.uint64) + pid * M * 384 * 4,
+                    (pages - (group + 1) * 6).to(tl.uint32),
+                    0,
+                    1 - slot,
+                    M // 4,
+                )
+            rem_pv = tl.maximum(0, pages - (group + 2) * 6).to(tl.uint32)
+            is_last = tl.cast(group + 1 == GROUPS, tl.uint32)
+            tle.dsa.ascend.raw(
+                "paged_int8_pv",
+                M,
+                P.to(tl.uint64),
+                PV.to(tl.uint64) + pid * 2 * M * 512 * 4,
+                K.to(tl.uint64),
+                KR.to(tl.uint64),
+                (Table + ((group + 2) % 2) * 6).to(tl.uint64),
+                slot,
+                rem_pv,
+                is_last,
+            )
+    with al.scope(core_mode="vector"):
+        if al.sub_vec_id() == 0 and pid == 0:
+            cols = tl.arange(0, 64)
+            tl.store(R + cols, tl.load(R + cols))
+
+
+def test_paged_int8_qk_pv():
+    torch.manual_seed(0)
+    k = torch.randint(-64, 64, (8, 64, 512), dtype=torch.int8, device=DEVICE)
+    kr = torch.randn((8, 64, 64), dtype=torch.bfloat16, device=DEVICE)
+    table = torch.tensor([5, 1, 7, 0, 3, 2], dtype=torch.int32, device=DEVICE)
+    k_win = k[table.long()].reshape(384, 512)
+    kr_win = kr[table.long()].reshape(384, 64)
+    for m in (16, 32, 64):
+        q = torch.randint(-64, 64, (m, 512), dtype=torch.int8, device=DEVICE)
+        qr = torch.randn((m, 64), dtype=torch.bfloat16, device=DEVICE)
+        p = torch.randint(-64, 64, (2 * m, 384), dtype=torch.int8, device=DEVICE)
+        c = torch.empty((m, 384), dtype=torch.int32, device=DEVICE)
+        r = torch.empty((m, 384), dtype=torch.float32, device=DEVICE)
+        pv = torch.empty((2 * m, 512), dtype=torch.int32, device=DEVICE)
+        paged_int8_qk_pv_kernel[(1, )](
+            q,
+            qr,
+            k,
+            kr,
+            table,
+            p,
+            c,
+            r,
+            pv,
+            M=m,
+            enable_auto_bind_sub_block=False,
+            disable_auto_inject_block_sync=True,
+            multibuffer=False,
+        )
+        torch_npu.npu.synchronize()
+        ref_c = (q.cpu().int() @ k_win.cpu().int().T).to(torch.int32)
+        ref_r = qr.cpu().float() @ kr_win.cpu().float().T
+        ref_pv = (p.cpu().int() @ k_win.cpu().int()).to(torch.int32)
+        torch.testing.assert_close(c.cpu(), ref_c, rtol=0, atol=0)
+        torch.testing.assert_close(r.cpu(), ref_r, rtol=1e-2, atol=1e-1)
+        torch.testing.assert_close(pv.cpu(), ref_pv, rtol=0, atol=0)
+        print(f"[PASS] paged_int8_qk + paged_int8_pv exact INT32/FP32 match (M={m})")
+
+    # Minimal benchmark comparing L1-resident paged_int8_qk/pv vs ordinary Triton tl.dot.
+    m, groups, tiles = 64, 8, 160
+    q = torch.randint(-64, 64, (m, 512), dtype=torch.int8, device=DEVICE)
+    qr = torch.randn((m, 64), dtype=torch.bfloat16, device=DEVICE)
+    table12 = torch.tensor([5, 1, 7, 0, 3, 2, 4, 6, 2, 1, 0, 7], dtype=torch.int32, device=DEVICE)
+    p = torch.randint(-64, 64, (2 * m, 384), dtype=torch.int8, device=DEVICE)
+    c = torch.empty((20, m, 384), dtype=torch.int32, device=DEVICE)
+    r = torch.empty((20, m, 384), dtype=torch.float32, device=DEVICE)
+    pv = torch.empty((20, 2 * m, 512), dtype=torch.int32, device=DEVICE)
+    custom_ms = triton.testing.do_bench(
+        lambda: custom_paged_int8_qk_pv_bench_kernel[(20, )]
+        (q, qr, k, kr, table12, p, c, r, pv, M=m, GROUPS=groups, enable_auto_bind_sub_block=False,
+         disable_auto_inject_block_sync=True, multibuffer=False),
+        return_mode="median",
+    )
+    triton_ms = triton.testing.do_bench(
+        lambda: triton_paged_int8_qk_pv_bench_kernel[(20, )](q, qr, k, kr, table12, p, c, r, pv, M=m, GROUPS=groups),
+        return_mode="median",
+    )
+    print(f"[BENCH] paged_int8_qk+pv (M={m}, tiles={tiles}): "
+          f"custom {custom_ms * 1000:.1f} us, triton {triton_ms * 1000:.1f} us, "
+          f"triton/custom {triton_ms / custom_ms:.2f}x")
+
+
+@triton.jit
+def window_stage_sync(slot, stage: tl.constexpr, wait: tl.constexpr):
+    base: tl.constexpr = stage * 2
+    if wait:
+        if stage == 1:
+            if slot == 0:
+                al.sync_block_wait("vector", "cube", base, al.PIPE.PIPE_MTE3, al.PIPE.PIPE_MTE2)
+            else:
+                al.sync_block_wait("vector", "cube", base + 1, al.PIPE.PIPE_MTE3, al.PIPE.PIPE_MTE2)
+        else:
+            if slot == 0:
+                al.sync_block_wait("cube", "vector", base, al.PIPE.PIPE_FIX, al.PIPE.PIPE_MTE2)
+            else:
+                al.sync_block_wait("cube", "vector", base + 1, al.PIPE.PIPE_FIX, al.PIPE.PIPE_MTE2)
+    else:
+        if stage == 1:
+            if slot == 0:
+                al.sync_block_set("vector", "cube", base, al.PIPE.PIPE_MTE3, al.PIPE.PIPE_MTE2)
+            else:
+                al.sync_block_set("vector", "cube", base + 1, al.PIPE.PIPE_MTE3, al.PIPE.PIPE_MTE2)
+        else:
+            if slot == 0:
+                al.sync_block_set("cube", "vector", base, al.PIPE.PIPE_FIX, al.PIPE.PIPE_MTE2)
+            else:
+                al.sync_block_set("cube", "vector", base + 1, al.PIPE.PIPE_FIX, al.PIPE.PIPE_MTE2)
+
+
+@triton.jit
+def paged_int8_full_window_kernel(
+    Q,
+    QR,
+    K,
+    KR,
+    QS,
+    KS,
+    Table,
+    C,
+    R,
+    P,
+    PV,
+    Out,
+    Lse,
+    N,
+    SCALE: tl.constexpr,
+    M: tl.constexpr,
+):
+    pages = tl.cdiv(N, 64)
+    groups = tl.cdiv(N, 384)
+    stride: tl.constexpr = 8 if M == 16 else M // 4
+    table = Table.to(tl.uint64)
+    with al.scope(core_mode="cube"):
+        tle.dsa.ascend.raw(
+            "paged_int8_qk",
+            M,
+            Q.to(tl.uint64),
+            QR.to(tl.uint64),
+            K.to(tl.uint64),
+            KR.to(tl.uint64),
+            table,
+            C.to(tl.uint64),
+            R.to(tl.uint64),
+            pages,
+            1,
+            0,
+            stride,
+        )
+        window_stage_sync(0, 0, False)
+        for group in tl.range(0, groups, disable_licm=True):
+            slot = group % 2
+            if group + 1 < groups:
+                byte = ((1 - slot) * M * 384 * 4).to(tl.uint64)
+                tle.dsa.ascend.raw(
+                    "paged_int8_qk",
+                    M,
+                    Q.to(tl.uint64),
+                    QR.to(tl.uint64),
+                    K.to(tl.uint64),
+                    KR.to(tl.uint64),
+                    table + (group + 1) * 24,
+                    C.to(tl.uint64) + byte,
+                    R.to(tl.uint64) + byte,
+                    pages - (group + 1) * 6,
+                    0,
+                    1 - slot,
+                    stride,
+                )
+                window_stage_sync(1 - slot, 0, False)
+            window_stage_sync(slot, 1, True)
+            tle.dsa.ascend.raw(
+                "paged_int8_pv",
+                M,
+                P.to(tl.uint64) + slot.to(tl.uint64) * (2 * M * 384),
+                PV.to(tl.uint64) + slot.to(tl.uint64) * (2 * M * 2048),
+                K.to(tl.uint64),
+                KR.to(tl.uint64),
+                table + (group + 2) * 24,
+                slot,
+                tl.maximum(0, pages - (group + 2) * 6),
+                tl.cast(group + 1 == groups, tl.uint32),
+            )
+            window_stage_sync(slot, 2, False)
+    with al.scope(core_mode="vector"):
+        sub = al.sub_vec_id().to(tl.uint64) * (M // 2)
+        dst = Out.to(tl.uint64) + sub * 1024
+        lse = Lse.to(tl.uint64) + sub * 4
+        for group in tl.range(0, groups, disable_licm=True):
+            slot = group % 2
+            buf = slot.to(tl.uint64) * M + sub
+            p_sub = slot.to(tl.uint64) * (2 * M * 384) + sub * 384
+            window_stage_sync(slot, 0, True)
+            prior_pv = PV.to(tl.uint64) + (1 - slot).to(tl.uint64) * (2 * M * 2048) + sub * 2048
+            for phase in tl.static_range(2):
+                if phase == 1 and group > 0:
+                    window_stage_sync(1 - slot, 2, True)
+                tle.dsa.ascend.raw(
+                    "paged_int8_prob",
+                    M,
+                    phase,
+                    C.to(tl.uint64) + buf * 1536,
+                    R.to(tl.uint64) + buf * 1536,
+                    P.to(tl.uint64) + p_sub,
+                    QS.to(tl.uint64) + sub * 4,
+                    KS.to(tl.uint64),
+                    table + group * 24,
+                    prior_pv,
+                    N - group * 384,
+                    tl.cast(group == 0, tl.uint32),
+                    slot,
+                    SCALE,
+                    stride,
+                    0,
+                )
+            window_stage_sync(slot, 1, False)
+            if group > 0:
+                tle.dsa.ascend.raw(
+                    "paged_int8_update",
+                    M,
+                    prior_pv,
+                    dst,
+                    lse,
+                    1 - slot,
+                    tl.cast(group == 1, tl.uint32),
+                    0,
+                    0,
+                    stride,
+                    0,
+                )
+        last = (groups - 1) % 2
+        window_stage_sync(last, 2, True)
+        tle.dsa.ascend.raw(
+            "paged_int8_update",
+            M,
+            PV.to(tl.uint64) + last.to(tl.uint64) * (2 * M * 2048) + sub * 2048,
+            dst,
+            lse,
+            last,
+            tl.cast(groups == 1, tl.uint32),
+            1,
+            0,
+            stride,
+            0,
+        )
+
+
+@triton.jit
+def custom_paged_int8_vec_bench_kernel(
+    C,
+    R,
+    P,
+    QS,
+    KS,
+    Table,
+    PV,
+    Out,
+    Lse,
+    M: tl.constexpr,
+    GROUPS: tl.constexpr,
+):
+    pid = tl.program_id(0).to(tl.uint64)
+    with al.scope(core_mode="vector"):
+        sub = al.sub_vec_id().to(tl.uint64) * (M // 2)
+        stride: tl.constexpr = 8 if M == 16 else M // 4
+        c_base = C.to(tl.uint64) + (pid * M + sub) * 1536
+        r_base = R.to(tl.uint64) + (pid * M + sub) * 1536
+        p_base = P.to(tl.uint64) + (pid * 2 * M + sub) * 384
+        pv_base = PV.to(tl.uint64) + (pid * 2 * M + sub) * 2048
+        dst = Out.to(tl.uint64) + (pid * M + sub) * 1024
+        lse = Lse.to(tl.uint64) + (pid * M + sub) * 4
+        for group in tl.range(0, GROUPS, disable_licm=True):
+            slot = (group % 2).to(tl.uint32)
+            for phase in tl.static_range(2):
+                tle.dsa.ascend.raw(
+                    "paged_int8_prob",
+                    M,
+                    phase,
+                    c_base,
+                    r_base,
+                    p_base,
+                    QS.to(tl.uint64) + sub * 4,
+                    KS.to(tl.uint64),
+                    Table.to(tl.uint64) + (group % 2) * 24,
+                    pv_base,
+                    384,
+                    tl.cast(group == 0, tl.uint32),
+                    slot,
+                    0.0416666679,
+                    stride,
+                    0,
+                )
+            if group > 0:
+                tle.dsa.ascend.raw(
+                    "paged_int8_update",
+                    M,
+                    pv_base,
+                    dst,
+                    lse,
+                    1 - slot,
+                    tl.cast(group == 1, tl.uint32),
+                    0,
+                    0,
+                    stride,
+                    0,
+                )
+        tle.dsa.ascend.raw(
+            "paged_int8_update",
+            M,
+            pv_base,
+            dst,
+            lse,
+            (GROUPS - 1) % 2,
+            0,
+            1,
+            0,
+            stride,
+            0,
+        )
+
+
+@triton.jit
+def triton_store_prob_chunk(rk, inv_step, P, pid, rows, cols128, M: tl.constexpr, CHUNK: tl.constexpr):
+    hi = tl.maximum(-127.0, tl.minimum(127.0, tl.floor(rk * inv_step[:, None] + 0.5))).to(tl.int8)
+    lo = tl.maximum(-127.0,
+                    tl.minimum(127.0, tl.floor((rk * inv_step[:, None] - hi.to(tl.float32)) * 127.0 + 0.5))).to(tl.int8)
+    tl.store(P + (pid * 2 * M + rows)[:, None] * 384 + (CHUNK * 128 + cols128)[None, :], hi)
+    tl.store(P + (pid * 2 * M + M + rows)[:, None] * 384 + (CHUNK * 128 + cols128)[None, :], lo)
+
+
+@triton.jit
+def triton_paged_int8_vec_bench_kernel(
+    C,
+    R,
+    P,
+    QS,
+    KS,
+    Table,
+    PV,
+    Out,
+    Lse,
+    M: tl.constexpr,
+    GROUPS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    rows = tl.arange(0, M)
+    cols128 = tl.arange(0, 128)
+    cols256 = tl.arange(0, 256)
+    qs = tl.load(QS + rows) * 0.0416666679
+    anchor = tl.full((M, ), -float("inf"), tl.float32)
+    norm = tl.zeros((M, ), tl.float32)
+    acc0 = tl.zeros((M, 256), tl.float32)
+    acc1 = tl.zeros((M, 256), tl.float32)
+    for group in range(0, GROUPS):
+        row_base = (pid * M + rows)[:, None] * 384
+        p0 = tl.load(Table + (group % 2) * 6 + 0)
+        p1 = tl.load(Table + (group % 2) * 6 + 1)
+        ks0 = tl.load(KS + tl.where(cols128 < 64, p0 * 64 + cols128, p1 * 64 + cols128 - 64))
+        s0 = (tl.load(C + row_base + cols128[None, :]).to(tl.float32) +
+              tl.load(R + row_base + cols128[None, :])) * qs[:, None] * ks0[None, :]
+        p2 = tl.load(Table + (group % 2) * 6 + 2)
+        p3 = tl.load(Table + (group % 2) * 6 + 3)
+        ks1 = tl.load(KS + tl.where(cols128 < 64, p2 * 64 + cols128, p3 * 64 + cols128 - 64))
+        s1 = (tl.load(C + row_base + (128 + cols128)[None, :]).to(tl.float32) +
+              tl.load(R + row_base + (128 + cols128)[None, :])) * qs[:, None] * ks1[None, :]
+        p4 = tl.load(Table + (group % 2) * 6 + 4)
+        p5 = tl.load(Table + (group % 2) * 6 + 5)
+        ks2 = tl.load(KS + tl.where(cols128 < 64, p4 * 64 + cols128, p5 * 64 + cols128 - 64))
+        s2 = (tl.load(C + row_base + (256 + cols128)[None, :]).to(tl.float32) +
+              tl.load(R + row_base + (256 + cols128)[None, :])) * qs[:, None] * ks2[None, :]
+
+        next_anchor = tl.maximum(anchor, tl.maximum(tl.maximum(tl.max(s0, 1), tl.max(s1, 1)), tl.max(s2, 1)))
+        corr = tl.exp(anchor - next_anchor)
+        w0 = tl.exp(s0 - next_anchor[:, None])
+        w1 = tl.exp(s1 - next_anchor[:, None])
+        w2 = tl.exp(s2 - next_anchor[:, None])
+        norm = norm * corr + tl.sum(w0, 1) + tl.sum(w1, 1) + tl.sum(w2, 1)
+        anchor = next_anchor
+        rk0 = w0 * ks0[None, :]
+        rk1 = w1 * ks1[None, :]
+        rk2 = w2 * ks2[None, :]
+        peak = tl.maximum(tl.maximum(tl.max(tl.abs(rk0), 1), tl.max(tl.abs(rk1), 1)), tl.max(tl.abs(rk2), 1))
+        step = peak * (1.0 / 127.0)
+        inv_step = 127.0 / tl.maximum(peak, 1e-30)
+        triton_store_prob_chunk(rk0, inv_step, P, pid, rows, cols128, M, 0)
+        triton_store_prob_chunk(rk1, inv_step, P, pid, rows, cols128, M, 1)
+        triton_store_prob_chunk(rk2, inv_step, P, pid, rows, cols128, M, 2)
+        pv_hi0 = tl.load(PV + (pid * 2 * M + rows)[:, None] * 512 + cols256[None, :]).to(tl.float32)
+        pv_lo0 = tl.load(PV + (pid * 2 * M + M + rows)[:, None] * 512 + cols256[None, :]).to(tl.float32)
+        acc0 = acc0 * corr[:, None] + (pv_hi0 + pv_lo0 * (1.0 / 127.0)) * step[:, None]
+        pv_hi1 = tl.load(PV + (pid * 2 * M + rows)[:, None] * 512 + (256 + cols256)[None, :]).to(tl.float32)
+        pv_lo1 = tl.load(PV + (pid * 2 * M + M + rows)[:, None] * 512 + (256 + cols256)[None, :]).to(tl.float32)
+        acc1 = acc1 * corr[:, None] + (pv_hi1 + pv_lo1 * (1.0 / 127.0)) * step[:, None]
+    tl.store(Out + (pid * M + rows)[:, None] * 512 + cols256[None, :], (acc0 / norm[:, None]).to(tl.bfloat16))
+    tl.store(Out + (pid * M + rows)[:, None] * 512 + (256 + cols256)[None, :], (acc1 / norm[:, None]).to(tl.bfloat16))
+    tl.store(Lse + pid * M + rows, anchor + tl.log(norm))
+
+
+def test_paged_int8_prob_update():
+    torch.manual_seed(7)
+    scale = 576**-0.5
+    k = torch.randint(-64, 64, (16, 64, 512), dtype=torch.int8, device=DEVICE)
+    kr = (torch.randn((16, 64, 64), dtype=torch.bfloat16, device=DEVICE) * 0.2).bfloat16()
+    ks = (torch.rand((16, 64), dtype=torch.float32, device=DEVICE) * 0.03 + 0.01)
+    table = torch.tensor([5, 1, 7, 0, 3, 2, 11, 4, 9, 6, 13, 8], dtype=torch.int32, device=DEVICE)
+    n = 700
+    pages = table[:(n + 63) // 64].long()
+    ks_flat = ks[pages].reshape(-1, 1)[:n].cpu().float()
+    k_deq = k[pages].reshape(-1, 512)[:n].cpu().float() * ks_flat
+    kr_deq = kr[pages].reshape(-1, 64)[:n].cpu().float() * ks_flat
+
+    for m in (16, 32, 64):
+        q = torch.randint(-64, 64, (m, 512), dtype=torch.int8, device=DEVICE)
+        qr = (torch.randn((m, 64), dtype=torch.bfloat16, device=DEVICE) * 0.2).bfloat16()
+        qs = torch.rand((m, ), dtype=torch.float32, device=DEVICE) * 0.03 + 0.01
+        c = torch.empty((2, m, 384), dtype=torch.int32, device=DEVICE)
+        r = torch.empty((2, m, 384), dtype=torch.float32, device=DEVICE)
+        p = torch.empty((2, 2 * m, 384), dtype=torch.int8, device=DEVICE)
+        pv = torch.empty((2, 2 * m, 512), dtype=torch.int32, device=DEVICE)
+        out = torch.empty((m, 512), dtype=torch.bfloat16, device=DEVICE)
+        lse = torch.empty((m, ), dtype=torch.float32, device=DEVICE)
+        paged_int8_full_window_kernel[(1, )](
+            q,
+            qr,
+            k,
+            kr,
+            qs,
+            ks,
+            table,
+            c,
+            r,
+            p,
+            pv,
+            out,
+            lse,
+            n,
+            SCALE=scale,
+            M=m,
+            enable_auto_bind_sub_block=False,
+            disable_auto_inject_block_sync=True,
+            multibuffer=False,
+        )
+        torch_npu.npu.synchronize()
+        q_cpu = q.cpu().float() * qs.cpu().unsqueeze(1)
+        qr_cpu = qr.cpu().float() * qs.cpu().unsqueeze(1)
+        scores = (q_cpu @ k_deq.T + qr_cpu @ kr_deq.T) * scale
+        ref_out = (scores.softmax(-1) @ k_deq).bfloat16()
+        ref_lse = scores.logsumexp(-1)
+        torch.testing.assert_close(out.cpu(), ref_out, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(lse.cpu(), ref_lse, rtol=1e-3, atol=2e-3)
+        print(f"[PASS] paged_int8_prob + paged_int8_update window pipeline match (M={m})")
+
+    m_b, groups_b = 16, 8
+    c_b = torch.randint(-2000, 2000, (20, m_b, 384), dtype=torch.int32, device=DEVICE)
+    r_b = torch.randn((20, m_b, 384), dtype=torch.float32, device=DEVICE)
+    p_b = torch.empty((20, 2 * m_b, 384), dtype=torch.int8, device=DEVICE)
+    qs_b = torch.rand((m_b, ), dtype=torch.float32, device=DEVICE) * 0.02 + 0.01
+    pv_b = torch.randint(-5000, 5000, (20, 2 * m_b, 512), dtype=torch.int32, device=DEVICE)
+    out_b = torch.empty((20, m_b, 512), dtype=torch.bfloat16, device=DEVICE)
+    lse_b = torch.empty((20, m_b), dtype=torch.float32, device=DEVICE)
+    custom_vec_ms = triton.testing.do_bench(
+        lambda: custom_paged_int8_vec_bench_kernel[(20, )]
+        (c_b, r_b, p_b, qs_b, ks, table, pv_b, out_b, lse_b, M=m_b, GROUPS=groups_b, enable_auto_bind_sub_block=False,
+         disable_auto_inject_block_sync=True, multibuffer=False),
+        return_mode="median",
+    )
+    triton_vec_ms = triton.testing.do_bench(
+        lambda: triton_paged_int8_vec_bench_kernel[(20, )]
+        (c_b, r_b, p_b, qs_b, ks, table, pv_b, out_b, lse_b, M=m_b, GROUPS=groups_b),
+        return_mode="median",
+    )
+    print(f"[BENCH] paged_int8_prob+update (M={m_b}, tiles={20 * groups_b}): "
+          f"custom {custom_vec_ms * 1000:.1f} us, triton {triton_vec_ms * 1000:.1f} us, "
+          f"triton/custom {triton_vec_ms / custom_vec_ms:.2f}x")
+
+
 def main():
     from test_cast_ops import main as test_cast_ops
     from test_compare_scalar import main as test_compare_scalar
 
-    for torch_dtype, tol in ((torch.float16, 1e-3), (torch.bfloat16, 1e-2)):
+    for torch_dtype, tol in ((torch.float16, 1e-3), (torch.bfloat16, 1e-2), (torch.int8, 0)):
         test_gather_gm_to_l1(torch_dtype, tol)
-        test_gather_gm_to_ub(torch_dtype)
+        if torch_dtype != torch.int8:
+            test_gather_gm_to_ub(torch_dtype)
+    test_paged_int8_qk_pv()
+    test_paged_int8_prob_update()
     test_sort_1d_pack()
     test_merge_exhaust_sort4()
     test_unpack_sort()
