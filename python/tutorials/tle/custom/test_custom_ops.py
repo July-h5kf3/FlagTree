@@ -728,6 +728,8 @@ def paged_int8_qk_pv_kernel(
             Table.to(tl.uint64),
             0,
             0,
+            0,
+            0,
             1,
         )
     with al.scope(core_mode="vector"):
@@ -824,6 +826,8 @@ def custom_paged_int8_qk_pv_bench_kernel(Q, QR, K, KR, Table, P, C, R, PV, M: tl
                 K.to(tl.uint64),
                 KR.to(tl.uint64),
                 (Table + ((group + 2) % 2) * 6).to(tl.uint64),
+                0,
+                0,
                 slot,
                 rem_pv,
                 is_last,
@@ -841,13 +845,16 @@ def test_paged_int8_qk_pv():
     table = torch.tensor([5, 1, 7, 0, 3, 2], dtype=torch.int32, device=DEVICE)
     k_win = k[table.long()].reshape(384, 512)
     kr_win = kr[table.long()].reshape(384, 64)
-    for m in (16, 32, 64):
+    for m in (16, 32, 64, 128):
         q = torch.randint(-64, 64, (m, 512), dtype=torch.int8, device=DEVICE)
         qr = torch.randn((m, 64), dtype=torch.bfloat16, device=DEVICE)
-        p = torch.randint(-64, 64, (2 * m, 384), dtype=torch.int8, device=DEVICE)
+        p_hi = torch.randint(-64, 64, (m, 384), dtype=torch.int8, device=DEVICE)
+        p_lo = torch.randint(-64, 64, (m, 384), dtype=torch.int8, device=DEVICE)
+        p = torch.cat((p_hi, p_lo), dim=0).contiguous()
         c = torch.empty((m, 384), dtype=torch.int32, device=DEVICE)
         r = torch.empty((m, 384), dtype=torch.float32, device=DEVICE)
-        pv = torch.empty((2 * m, 512), dtype=torch.int32, device=DEVICE)
+        pv_dtype = torch.float16 if m >= 64 else torch.int32
+        pv = torch.empty((2 * m, 512), dtype=pv_dtype, device=DEVICE)
         paged_int8_qk_pv_kernel[(1, )](
             q,
             qr,
@@ -866,11 +873,16 @@ def test_paged_int8_qk_pv():
         torch_npu.npu.synchronize()
         ref_c = (q.cpu().int() @ k_win.cpu().int().T).to(torch.int32)
         ref_r = qr.cpu().float() @ kr_win.cpu().float().T
-        ref_pv = (p.cpu().int() @ k_win.cpu().int()).to(torch.int32)
+        ref_pv_hi = (p_hi.cpu().int() @ k_win.cpu().int()).to(torch.int32)
+        ref_pv_lo = (p_lo.cpu().int() @ k_win.cpu().int()).to(torch.int32)
+        ref_pv = torch.cat((ref_pv_hi, ref_pv_lo), dim=0)
         torch.testing.assert_close(c.cpu(), ref_c, rtol=0, atol=0)
         torch.testing.assert_close(r.cpu(), ref_r, rtol=1e-2, atol=1e-1)
-        torch.testing.assert_close(pv.cpu(), ref_pv, rtol=0, atol=0)
-        print(f"[PASS] paged_int8_qk + paged_int8_pv exact INT32/FP32 match (M={m})")
+        if m >= 64:
+            torch.testing.assert_close(pv.cpu().float(), ref_pv.float() / 16384.0, rtol=1e-2, atol=2e-2)
+        else:
+            torch.testing.assert_close(pv.cpu(), ref_pv, rtol=0, atol=0)
+        print(f"[PASS] paged_int8_qk + paged_int8_pv match (M={m})")
 
     # Minimal benchmark comparing L1-resident paged_int8_qk/pv vs ordinary Triton tl.dot.
     m, groups, tiles = 64, 8, 160
@@ -992,6 +1004,8 @@ def paged_int8_full_window_kernel(
                 K.to(tl.uint64),
                 KR.to(tl.uint64),
                 table + (group + 2) * 24,
+                0,
+                0,
                 slot,
                 tl.maximum(0, pages - (group + 2) * 6),
                 tl.cast(group + 1 == groups, tl.uint32),
@@ -1001,12 +1015,13 @@ def paged_int8_full_window_kernel(
         sub = al.sub_vec_id().to(tl.uint64) * (M // 2)
         dst = Out.to(tl.uint64) + sub * 1024
         lse = Lse.to(tl.uint64) + sub * 4
+        pv_row_bytes: tl.constexpr = 1024 if M >= 64 else 2048
         for group in tl.range(0, groups, disable_licm=True):
             slot = group % 2
             buf = slot.to(tl.uint64) * M + sub
             p_sub = slot.to(tl.uint64) * (2 * M * 384) + sub * 384
             window_stage_sync(slot, 0, True)
-            prior_pv = PV.to(tl.uint64) + (1 - slot).to(tl.uint64) * (2 * M * 2048) + sub * 2048
+            prior_pv = PV.to(tl.uint64) + (1 - slot).to(tl.uint64) * (2 * M * 2048) + sub * pv_row_bytes
             for phase in tl.static_range(2):
                 if phase == 1 and group > 0:
                     window_stage_sync(1 - slot, 2, True)
@@ -1021,6 +1036,7 @@ def paged_int8_full_window_kernel(
                     KS.to(tl.uint64),
                     table + group * 24,
                     prior_pv,
+                    0,
                     N - group * 384,
                     tl.cast(group == 0, tl.uint32),
                     slot,
@@ -1034,6 +1050,7 @@ def paged_int8_full_window_kernel(
                     "paged_int8_update",
                     M,
                     prior_pv,
+                    0,
                     dst,
                     lse,
                     1 - slot,
@@ -1048,7 +1065,8 @@ def paged_int8_full_window_kernel(
         tle.dsa.ascend.raw(
             "paged_int8_update",
             M,
-            PV.to(tl.uint64) + last.to(tl.uint64) * (2 * M * 2048) + sub * 2048,
+            PV.to(tl.uint64) + last.to(tl.uint64) * (2 * M * 2048) + sub * pv_row_bytes,
+            0,
             dst,
             lse,
             last,
@@ -1098,6 +1116,7 @@ def custom_paged_int8_vec_bench_kernel(
                     KS.to(tl.uint64),
                     Table.to(tl.uint64) + (group % 2) * 24,
                     pv_base,
+                    0,
                     384,
                     tl.cast(group == 0, tl.uint32),
                     slot,
@@ -1110,6 +1129,7 @@ def custom_paged_int8_vec_bench_kernel(
                     "paged_int8_update",
                     M,
                     pv_base,
+                    0,
                     dst,
                     lse,
                     1 - slot,
@@ -1123,6 +1143,7 @@ def custom_paged_int8_vec_bench_kernel(
             "paged_int8_update",
             M,
             pv_base,
+            0,
             dst,
             lse,
             (GROUPS - 1) % 2,
@@ -1224,7 +1245,7 @@ def test_paged_int8_prob_update():
     k_deq = k[pages].reshape(-1, 512)[:n].cpu().float() * ks_flat
     kr_deq = kr[pages].reshape(-1, 64)[:n].cpu().float() * ks_flat
 
-    for m in (16, 32, 64):
+    for m in (16, 32, 64, 128):
         q = torch.randint(-64, 64, (m, 512), dtype=torch.int8, device=DEVICE)
         qr = (torch.randn((m, 64), dtype=torch.bfloat16, device=DEVICE) * 0.2).bfloat16()
         qs = torch.rand((m, ), dtype=torch.float32, device=DEVICE) * 0.03 + 0.01

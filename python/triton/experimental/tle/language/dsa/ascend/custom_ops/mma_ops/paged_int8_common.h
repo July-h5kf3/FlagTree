@@ -15,11 +15,24 @@
 
 namespace {
 constexpr ArchType kArch = ArchType::ASCEND_V220;
+
+// Double-buffered 6-page (384-token) KV layout in 512 KiB L1 (`M` in {16, 32,
+// 64}).
 constexpr uint32_t kQueryBase = 0;
 constexpr uint32_t kQrBase = 32768;
 constexpr uint32_t kKeyBase = 40960;
 constexpr uint32_t kKrBase = kKeyBase + 6 * 65536;
 constexpr uint32_t kProbBase = kKrBase + 3 * 16384;
+
+// Double-buffered 6-page (384-token) KV layout in 512 KiB L1 for `M == 128`.
+// `kProbBase128` aliases `kKrBase128` (48 KiB) once `paged_int8_qk` finishes
+// consuming `KR`; `refill_page_pair` reclaims each 16 KiB pair slot in lockstep
+// with the final column of `paged_int8_pv`.
+constexpr uint32_t kQueryBase128 = 0;
+constexpr uint32_t kQrBase128 = 65536;
+constexpr uint32_t kKeyBase128 = 81920;
+constexpr uint32_t kKrBase128 = kKeyBase128 + 6 * 65536;
+constexpr uint32_t kProbBase128 = kKrBase128;
 
 template <typename T>
 __aicore__ __attribute__((always_inline)) __cbuf__ T *l1_ptr(uint32_t bytes) {
@@ -94,15 +107,31 @@ load_l0b_value_s8(__cb__ int8_t *dst, __cbuf__ int8_t *src, uint32_t n,
       dst, src, n, sub_k, sub_k / 16, 1, 1, n / 32);
 }
 
-template <typename A, typename C>
+template <typename A, typename B, typename C>
 __aicore__ __attribute__((always_inline)) void
-mma_step(__cc__ C *dst, __ca__ A *a, __cb__ A *b, uint32_t m, uint32_t n,
+mma_step(__cc__ C *dst, __ca__ A *a, __cb__ B *b, uint32_t m, uint32_t n,
          uint32_t k, bool init) {
   set_flag(PIPE_MTE1, PIPE_M, EVENT_ID3);
   wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID3);
   if ((m / 16) * (n / 16) < 10)
     pipe_barrier(PIPE_M);
-  mmad<kArch, A, A, C, false> run(dst, a, b, m, n, k, init);
+  mmad<kArch, A, B, C, false> run(dst, a, b, m, n, k, init);
+}
+
+__aicore__ __attribute__((always_inline)) void
+mma_pair_s8(__cc__ int32_t *dst_hi, __ca__ int8_t *a_hi, __cc__ int32_t *dst_lo,
+            __ca__ int8_t *a_lo, __cb__ int8_t *b, uint32_t m, uint32_t n,
+            uint32_t k, bool init) {
+  set_flag(PIPE_MTE1, PIPE_M, EVENT_ID3);
+  wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID3);
+  if ((m / 16) * (n / 16) < 10)
+    pipe_barrier(PIPE_M);
+  mmad<kArch, int8_t, int8_t, int32_t, false> run0(dst_hi, a_hi, b, m, n, k,
+                                                   init);
+  if ((m / 16) * (n / 16) < 10)
+    pipe_barrier(PIPE_M);
+  mmad<kArch, int8_t, int8_t, int32_t, false> run1(dst_lo, a_lo, b, m, n, k,
+                                                   init);
 }
 
 template <typename T>
@@ -115,12 +144,25 @@ store_l0c(uint64_t dst, __cc__ T *src, uint32_t rows, uint32_t cols,
                        stride, rows, 0, NoQuant, 0, false, true);
 }
 
+// Dequantizes INT32 L0C accumulators by a fixed FP32 scale (raw IEEE-754 bits
+// in `deq_scale`) to FP16 in Fixpipe hardware.
+__aicore__ __attribute__((always_inline)) void
+store_l0c_deqf16(uint64_t dst, __cc__ int32_t *src, uint32_t rows,
+                 uint32_t cols, uint32_t stride, uint64_t deq_scale) {
+  set_flag(PIPE_M, PIPE_FIX, EVENT_ID3);
+  wait_flag(PIPE_M, PIPE_FIX, EVENT_ID3);
+  set_quant_pre(deq_scale);
+  copy_matrix_cc_to_gm(reinterpret_cast<__gm__ half *>(dst), src, 0, cols, rows,
+                       stride, rows, 0, DEQF16, 0, false, true);
+}
+
 __aicore__ __attribute__((always_inline)) void
 prefetch_page_pair(uint64_t k, uint64_t kr, uint64_t table, uint32_t remaining,
-                   uint32_t slot, uint32_t pair) {
+                   uint32_t slot, uint32_t pair, uint32_t key_base = kKeyBase,
+                   uint32_t kr_base = kKrBase) {
   auto ids = reinterpret_cast<__gm__ const int32_t *>(table);
-  auto kv1 = l1_ptr<int8_t>(kKeyBase + (slot * 3 + pair) * 65536);
-  auto rope1 = l1_ptr<bfloat16_t>(kKrBase + pair * 16384);
+  auto kv1 = l1_ptr<int8_t>(key_base + (slot * 3 + pair) * 65536);
+  auto rope1 = l1_ptr<bfloat16_t>(kr_base + pair * 16384);
   for (uint32_t page = 0; page < 2; ++page) {
     uint32_t p = pair * 2 + page;
     uint64_t id = ids[p < remaining ? p : remaining - 1];
@@ -132,11 +174,12 @@ prefetch_page_pair(uint64_t k, uint64_t kr, uint64_t table, uint32_t remaining,
 
 __aicore__ __attribute__((always_inline)) void
 refill_page_pair(uint64_t k, uint64_t kr, uint64_t table, uint32_t remaining,
-                 uint32_t slot, uint32_t pair) {
+                 uint32_t slot, uint32_t pair, uint32_t key_base = kKeyBase,
+                 uint32_t kr_base = kKrBase) {
   auto ev = pair_event(pair);
   set_flag(PIPE_MTE1, PIPE_MTE2, ev);
   wait_flag(PIPE_MTE1, PIPE_MTE2, ev);
-  prefetch_page_pair(k, kr, table, remaining, slot, pair);
+  prefetch_page_pair(k, kr, table, remaining, slot, pair, key_base, kr_base);
 }
 } // namespace
 

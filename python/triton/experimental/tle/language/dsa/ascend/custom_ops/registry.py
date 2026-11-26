@@ -753,10 +753,9 @@ class paged_int8_qk:
 
 @al.register_custom_op
 class paged_int8_pv:
-    """Dual-digit INT8 PV MMA (`P_hi @ V` and `P_lo @ V` -> INT32) against the
-    384x512 NZ value tiles left resident in L1 slot `slot` by `paged_int8_qk`,
-    reusing the transposed L0B value slice across both digits and prefetching
-    the next window's page pairs as each L1 slot retires.
+    """Adaptive shifted-8-bit (`P_hi @ V + 128 * sum(V)`) or two-digit
+    (`P_hi @ V + 128 * sum(V) + P_lo @ V / 127`) PV MMA against the 384x512 NZ
+    value tiles left resident in L1 slot `slot` by `paged_int8_qk`.
     """
 
     core = al.CORE.CUBE
@@ -771,6 +770,8 @@ class paged_int8_pv:
         k: tl.uint64,
         kr: tl.uint64,
         table: tl.uint64,
+        flag_gm: tl.uint64,
+        ones_gm: tl.uint64,
         slot: tl.uint32,
         remaining: tl.uint32,
         last: tl.uint32,
@@ -781,9 +782,9 @@ class paged_int8_pv:
 
 @al.register_custom_op
 class paged_int8_prob:
-    """Online softmax and two-digit INT8 probability quantization (`P_hi`, `P_lo`)
-    over a 384-token paged KV window on Ascend Vector cores (`M` in {16, 32, 64}),
-    overlapping prior-window PV DMA prefetch across the two sub-tiles.
+    """Online softmax and adaptive shifted-8-bit (`P_hi`) / residual INT8
+    (`P_lo`) probability quantization over a 384-token paged KV window on
+    Ascend Vector cores (`M` in {16, 32, 64, 128}).
     """
 
     core = al.CORE.VECTOR
@@ -801,6 +802,7 @@ class paged_int8_prob:
         ks: tl.uint64,
         table: tl.uint64,
         pv: tl.uint64,
+        flag_gm: tl.uint64,
         visible: tl.uint32,
         first: tl.uint32,
         slot: tl.uint32,
@@ -814,8 +816,9 @@ class paged_int8_prob:
 
 @al.register_custom_op
 class paged_int8_update:
-    """Dual-digit INT32 PV rescaling, online FP32 accumulator update, and final
-    BF16 output + FP32 logsumexp writeback on Ascend Vector cores (`M` in {16, 32, 64}).
+    """Adaptive shifted-8-bit / residual INT8 PV rescaling, online FP32
+    accumulator update, and final BF16 output + FP32 logsumexp writeback on
+    Ascend Vector cores (`M` in {16, 32, 64, 128}).
     """
 
     core = al.CORE.VECTOR
@@ -826,6 +829,7 @@ class paged_int8_update:
         self,
         m: tl.uint32,
         pv: tl.uint64,
+        vsum_gm: tl.uint64,
         out: tl.uint64,
         lse: tl.uint64,
         slot: tl.uint32,
