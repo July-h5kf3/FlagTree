@@ -29,7 +29,8 @@ custom_ops/
 │   ├── gather_gm_to_ub.cpp         # GM → UB 按索引行 gather
 │   └── gather_mask.cpp             # 以内置固定模式对应的二进制或用户自定义输入的 Tensor 数值对应的二进制为 gather mask, 从源操作数中选取元素写入目的操作数中
 ├── cast_ops/
-│   └── cast_int4_to_fp16.cpp       # packed signed INT4 → FP16
+│   ├── cast_int4_to_fp16.cpp       # packed signed INT4 → FP16
+│   └── cast_fp16_to_int8_rint.cpp  # FP16 → INT8 饱和四舍六入五成双转换
 ├── mask_ops/
 │   └── compare_scalar.cpp          # FP16/FP32 EQ/GT/GE → uint16 位掩码
 ├── vec_ops/
@@ -86,7 +87,7 @@ custom op 入口，与旧写法 `tle.dsa.ascend.raw("<op_name>", ...)` 生成的
 | 算子 | Core / Pipe | 功能 | `out=` 含义 | C++ 实现 |
 | --- | --- | --- | --- | --- |
 | `duplicate_bitwise_mask` | VECTOR / V | 将一个变量或立即数复制多次并填充到向量中 | 需要填充数据的向量，对应 Ascend C `const LocalTensor<T>& dst` | `mem_ops/ duplicate.cpp` |
-| `gather_gm_to_l1` | CUBE / MTE2 | 按索引将 GM 连续张量中的 half/bf16 数据行收集到 L1/CBUF，并完成 ND2NZ 搬运 | L1/CBUF half/bf16 目标张量，对应 C++ `dst` | `mem_ops/gather_gm_to_l1.cpp` |
+| `gather_gm_to_l1` | CUBE / MTE2 | 按索引将 GM 连续张量中的 half/bf16/int8 数据行收集到 L1/CBUF，并完成 ND2NZ 搬运 | L1/CBUF half/bf16/int8 目标张量，对应 C++ `dst` | `mem_ops/gather_gm_to_l1.cpp` |
 | `gather_gm_to_ub` | VECTOR / MTE2 | 按索引将 GM 连续张量中的 half/bf16 数据行收集到 UB | UB half/bf16 目标张量，对应 C++ `dst` | `mem_ops/gather_gm_to_ub.cpp` |
 | `gather_mask_builtin_pattern` | VECTOR / V | 以内置固定模式对应的二进制对应的二进制为 gather mask, 从源操作数中选取元素写入目的操作数中 | 目的操作数，`out[0]` 对应 Ascend C `const LocalTensor<T>& dst`, `out[1]` 对应 Ascend C `uint64_t& rsvdCnt` | `mem_ops/gather_mask.cpp` |
 | `gather_mask_custom_pattern` | VECTOR / V | 以用户自定义输入的 Tensor 数值对应的二进制为 gather mask, 从源操作数中选取元素写入目的操作数中 | 目的操作数，`out[0]`对应 Ascend C `const LocalTensor<T>& dst`, `out[1]`对应 Ascend C `uint64_t& rsvdCnt` | `mem_ops/gather_mask.cpp` |
@@ -140,7 +141,7 @@ tile_k = tle_raw.call(
 - `src_index`：GM 二维 int32 索引张量（形状 `(N, 1)`、stride `(1, 1)`），输出第 i 行的数据取自源张量第 `index[i]` 行（0-based 行号）；索引起始偏移通过 block ptr 的 `offsets` 表达；
 - `tile_size`：本次收集的行数；
 - `D`：每行元素数；
-- `out`：四维 L1/CBUF half/bf16 输出。
+- `out`：四维 L1/CBUF half/bf16/int8 输出（`int8` 走 `copy_gm_to_cbuf_multi_nd2nz_b8`）。
 
 相邻索引（`index[i + 1] == index[i] + 1`）会合并为一次两行搬运。
 
@@ -489,6 +490,25 @@ values = tle_raw.call("ascend_cast_int4_to_fp16", packed, 0, 2 * N, out=values) 
 `python python/tutorials/tle/custom/test_cast_ops.py`，也已接入
 `test_custom_ops.py`。测试包含全部字节编码、不同块大小和参数校验，以及
 4096 字节 tile 与 Triton `tl.interleave` 拆 nibble 再 `.to(tl.float16)` 的耗时对比。
+
+## cast_fp16_to_int8_rint
+
+`cast_fp16_to_int8_rint(src, count, out=dst)` 将 UB 中的 1D FP16 向量按
+round-to-nearest-even 饱和转换为 INT8（范围 `[-128, 127]`），直接封装
+`vconv_f162s8r`（count mask 模式，repeat stride 4/8）。不在 op 内插入
+pipeline barrier；前后序由调用方保证。
+
+- `src`：1D UB `float16[N]`，32 字节对齐且与 `out` 互不重叠
+- `count`：元素个数（编译期或运行期整数，`uint32`）
+- `out`：1D UB `int8[N]`
+
+```python
+dst = tl.full((N,), 0, tl.int8)
+dst = tle_raw.call("ascend_cast_fp16_to_int8_rint", x_f16, N, out=dst)
+```
+
+测试入口见 `python/tutorials/tle/custom/test_cast_ops.py` 与
+`python/tutorials/tle/custom/test_custom_ops.py`。
 
 ## flip
 

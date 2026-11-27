@@ -8,7 +8,10 @@ import torch_npu  # noqa: F401
 import triton
 import triton.experimental.tle as tle
 import triton.language as tl
-from triton.experimental.tle.language.dsa.ascend.custom_ops import cast_int4_to_fp16
+from triton.experimental.tle.language.dsa.ascend.custom_ops import (
+    cast_fp16_to_int8_rint,
+    cast_int4_to_fp16,
+)
 
 CAST_NONE = tl.constexpr(0)
 
@@ -138,10 +141,83 @@ def test_validation():
     print(f"[PASS] cast registration: nine valid and {len(invalid)} rejected signatures")
 
 
+def _reference_fp16_to_int8_rint(values_f16):
+    # Hardware vconv_f162s8r rounds ties to nearest even and saturates to [-128, 127].
+    rounded = np.rint(values_f16.astype(np.float32))
+    return np.clip(rounded, -128.0, 127.0).astype(np.int8)
+
+
+@triton.jit
+def cast_f16_to_s8_kernel(X, Out, N: tl.constexpr):
+    vals = tl.load(X + tl.arange(0, N))
+    out_buf = tl.full((N, ), 0, tl.int8)
+    out_buf = tle.dsa.ascend.raw("cast_fp16_to_int8_rint", vals, N, out=out_buf)
+    tl.store(Out + tl.arange(0, N), out_buf)
+
+
+@triton.jit
+def cast_f16_to_s8_bench_kernel(X, Y, ELEMS: tl.constexpr, TILES: tl.constexpr, CUSTOM: tl.constexpr):
+    for tile in range(tl.program_id(0), TILES, tl.num_programs(0)):
+        vals = tl.load(X + tile * ELEMS + tl.arange(0, ELEMS))
+        if CUSTOM:
+            out_vals = tle.dsa.ascend.raw("cast_fp16_to_int8_rint", vals, ELEMS, out=tl.full((ELEMS, ), 0, tl.int8))
+        else:
+            fp32 = vals.to(tl.float32)
+            clamped = tl.maximum(-128.0, tl.minimum(127.0, tl.floor(fp32 + 0.5)))
+            out_vals = clamped.to(tl.int8)
+        tl.store(Y + tile * ELEMS + tl.arange(0, ELEMS), out_vals)
+
+
+def test_cast_fp16_to_int8_rint():
+    rng = np.random.default_rng(42)
+    for n in (32, 64, 128, 256, 512, 1024, 4096, 8192, 16384):
+        raw = rng.uniform(-160.0, 160.0, size=n).astype(np.float16)
+        # Exercise exact half-way ties (-2.5, -1.5, -0.5, 0.5, 1.5, 2.5) and saturation bounds.
+        special = np.array([-300.0, -128.5, -128.0, -2.5, -1.5, -0.5, 0.0, 0.5, 1.5, 2.5, 127.0, 127.5, 300.0],
+                           dtype=np.float16)
+        raw[:len(special)] = special
+        x = torch.from_numpy(raw).to("npu")
+        out = torch.empty(n, dtype=torch.int8, device="npu")
+        cast_f16_to_s8_kernel[(1, )](x, out, N=n)
+        np.testing.assert_array_equal(out.cpu().numpy(), _reference_fp16_to_int8_rint(raw))
+    op = cast_fp16_to_int8_rint.__new__(cast_fp16_to_int8_rint)
+    op.arg_type = {}
+    op.__init__(_tensor(tl.float16, [1024]), 1024, out=_tensor(tl.int8, [1024]))
+    assert op.symbol == "custom_cast_fp16_to_int8_rint"
+    print("[PASS] cast_fp16_to_int8_rint: rounding, tie-to-even, and saturation verified")
+
+
+def bench_cast_fp16_to_int8_rint():
+    elems, tiles = 8192, 2560
+    raw = np.linspace(-140.0, 140.0, elems * tiles, dtype=np.float16)
+    x = torch.from_numpy(raw).to("npu")
+    y = torch.empty(raw.size, dtype=torch.int8, device="npu")
+
+    def launch(custom):
+        return cast_f16_to_s8_bench_kernel[(40, )](x, y, elems, tiles, custom, num_warps=1, multibuffer=False,
+                                                   enable_fp_fusion=False)
+
+    for custom in (True, False):
+        launch(custom)
+        torch.npu.synchronize()
+    measured = {"custom": [], "triton": []}
+    for custom_first in (False, True):
+        order = (("custom", True), ("triton", False)) if custom_first else (("triton", False), ("custom", True))
+        for name, custom in order:
+            measured[name].append(triton.testing.do_bench(lambda custom=custom: launch(custom), return_mode="median"))
+    custom_us = sum(measured["custom"]) / len(measured["custom"]) * 1000
+    triton_us = sum(measured["triton"]) / len(measured["triton"]) * 1000
+    print(f"[BENCH] cast_fp16_to_int8_rint {elems} elems x {tiles} tiles: "
+          f"custom {custom_us:.3f} us, triton {triton_us:.3f} us, "
+          f"triton/custom {triton_us / custom_us:.2f}x")
+
+
 def main():
     test_validation()
     test_cast_int4_to_fp16()
     bench_cast_int4_to_fp16()
+    test_cast_fp16_to_int8_rint()
+    bench_cast_fp16_to_int8_rint()
     print("All cast custom op tests passed.")
 
 

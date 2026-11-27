@@ -105,7 +105,10 @@ def gather_gm_to_l1_dot_kernel(
         order=(1, 0),
     )
     tile_q = tl.load(query_2d)
-    result = tl.dot(tile_q, tl.trans(tile_k))
+    if DTYPE == tl.int8:
+        result = tl.dot(tile_q, tl.trans(tile_k), out_dtype=tl.int32).to(tl.float32)
+    else:
+        result = tl.dot(tile_q, tl.trans(tile_k))
 
     output_2d = tl.make_block_ptr(
         base=output,
@@ -356,13 +359,18 @@ D = 16
 L1_INDEX = [3, 4, 9, 10, 2, 7, 0, 1, 12, 13, 5, 8, 11, 6, 15, 14]
 UB_INDEX = [20, 21, 19, 30, 31, 25, 24, 18, 27, 28, 22, 29, 26, 23, 17, 16]
 
-_TL_DTYPE = {torch.float16: tl.float16, torch.bfloat16: tl.bfloat16}
+_TL_DTYPE = {torch.float16: tl.float16, torch.bfloat16: tl.bfloat16, torch.int8: tl.int8}
 
 
 def test_gather_gm_to_l1(torch_dtype, tol):
     torch.manual_seed(0)
-    src = torch.randn((NUM_ROWS, D), dtype=torch_dtype, device=DEVICE)
-    query = torch.randn((TILE_SIZE, D), dtype=torch_dtype, device=DEVICE)
+    width = 2 * D if torch_dtype == torch.int8 else D
+    if torch_dtype == torch.int8:
+        src = torch.randint(-127, 128, (NUM_ROWS, width), dtype=torch.int8, device=DEVICE)
+        query = torch.randint(-127, 128, (TILE_SIZE, width), dtype=torch.int8, device=DEVICE)
+    else:
+        src = torch.randn((NUM_ROWS, width), dtype=torch_dtype, device=DEVICE)
+        query = torch.randn((TILE_SIZE, width), dtype=torch_dtype, device=DEVICE)
     output = torch.empty((TILE_SIZE, TILE_SIZE), dtype=torch.float32, device=DEVICE)
     src_index = torch.tensor(L1_INDEX, dtype=torch.int32, device=DEVICE)
 
@@ -373,7 +381,7 @@ def test_gather_gm_to_l1(torch_dtype, tol):
         output,
         NUM_ROWS=NUM_ROWS,
         TILE_SIZE=TILE_SIZE,
-        D=D,
+        D=width,
         DTYPE=_TL_DTYPE[torch_dtype],
         enable_legacy_insert_load_store_for_mix_cv=True,
     )
@@ -682,9 +690,10 @@ def main():
     from test_cast_ops import main as test_cast_ops
     from test_compare_scalar import main as test_compare_scalar
 
-    for torch_dtype, tol in ((torch.float16, 1e-3), (torch.bfloat16, 1e-2)):
+    for torch_dtype, tol in ((torch.float16, 1e-3), (torch.bfloat16, 1e-2), (torch.int8, 0)):
         test_gather_gm_to_l1(torch_dtype, tol)
-        test_gather_gm_to_ub(torch_dtype)
+        if torch_dtype != torch.int8:
+            test_gather_gm_to_ub(torch_dtype)
     test_sort_1d_pack()
     test_merge_exhaust_sort4()
     test_unpack_sort()
