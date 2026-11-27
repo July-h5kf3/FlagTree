@@ -21,6 +21,11 @@ from .registry import (
     unpack_sort,
     compare_scalar,
     cast_int4_to_fp16,
+    cast_fp16_to_int8_rint,
+    paged_int8_qk,
+    paged_int8_pv,
+    paged_int8_prob,
+    paged_int8_update,
     flip,
 )
 
@@ -41,5 +46,10 @@ __all__ = [
     "unpack_sort",
     "compare_scalar",
     "cast_int4_to_fp16",
+    "cast_fp16_to_int8_rint",
+    "paged_int8_qk",
+    "paged_int8_pv",
+    "paged_int8_prob",
+    "paged_int8_update",
     "flip",
 ]

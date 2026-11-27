@@ -25,7 +25,12 @@ template <typename T> struct nd2nz_intrin_args {
 template <typename T>
 __aicore__ __attribute__((always_inline)) void
 copy_gm_to_cbuf_intrin_core(nd2nz_intrin_args<T> args) {
-  if constexpr (sizeof(T) == 2) {
+  if constexpr (sizeof(T) == 1) {
+    INTRINSIC(copy_gm_to_cbuf_multi_nd2nz_b8, args.dst_ptr, args.src_ptr,
+              args.sid, args.ndNum, args.nValue, args.dValue,
+              args.srcNdMatrixStride, args.srcDValue, args.dstNzC0Stride,
+              args.dstNzNStride, args.dstNzMatrixStride);
+  } else if constexpr (sizeof(T) == 2) {
     INTRINSIC(copy_gm_to_cbuf_multi_nd2nz_b16, args.dst_ptr, args.src_ptr,
               args.sid, args.ndNum, args.nValue, args.dValue,
               args.srcNdMatrixStride, args.srcDValue, args.dstNzC0Stride,
@@ -95,5 +100,13 @@ _mlir_ciface_custom_gather_gm_to_l1_bf16(
     memref_t<__gm__ bfloat16_t, 2> *src, memref_t<__gm__ int32_t, 2> *index,
     int64_t tile_size, int64_t cols, memref_t<__cbuf__ bfloat16_t, 4> *dst) {
   gather_gm_to_l1_impl<bfloat16_t>(src, index, tile_size, cols, dst);
+}
+
+__aicore__ __attribute__((always_inline)) void
+_mlir_ciface_custom_gather_gm_to_l1_s8(memref_t<__gm__ int8_t, 2> *src,
+                                       memref_t<__gm__ int32_t, 2> *index,
+                                       int64_t tile_size, int64_t cols,
+                                       memref_t<__cbuf__ int8_t, 4> *dst) {
+  gather_gm_to_l1_impl<int8_t>(src, index, tile_size, cols, dst);
 }
 }

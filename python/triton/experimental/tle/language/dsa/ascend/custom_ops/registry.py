@@ -7,6 +7,7 @@ import triton.language.extra.cann.extension as al
 CUSTOM_OPS_BITCODE = str(Path(__file__).with_name("custom_ops.bc").resolve())
 
 _GATHER_SUFFIX_BY_DTYPE = {tl.float16: "half", tl.bfloat16: "bf16"}
+_GATHER_L1_SUFFIX_BY_DTYPE = {**_GATHER_SUFFIX_BY_DTYPE, tl.int8: "s8"}
 
 
 def _element_dtype(value):
@@ -18,10 +19,12 @@ def _element_dtype(value):
     return dtype
 
 
-def _gather_dtype_suffix(value, op_name):
+def _gather_dtype_suffix(value, op_name, table=None):
+    table = table if table is not None else _GATHER_SUFFIX_BY_DTYPE
     dtype = _element_dtype(value)
-    suffix = _GATHER_SUFFIX_BY_DTYPE.get(dtype)
-    assert suffix is not None, (f"{op_name} only supports fp16/bf16, got {dtype}")
+    suffix = table.get(dtype)
+    assert suffix is not None, (f"{op_name} only supports "
+                                f"{'/'.join(str(d) for d in table)}, got {dtype}")
     return suffix
 
 
@@ -105,7 +108,8 @@ class gather_gm_to_l1:
             f"to match src dtype ({_element_dtype(src)})")
         assert _element_dtype(index) == tl.int32, (f"gather_gm_to_l1 requires int32 index, "
                                                    f"got {_element_dtype(index)}")
-        self.symbol = ("custom_gather_gm_to_l1_" + _gather_dtype_suffix(src, "gather_gm_to_l1"))
+        self.symbol = ("custom_gather_gm_to_l1_" +
+                       _gather_dtype_suffix(src, "gather_gm_to_l1", _GATHER_L1_SUFFIX_BY_DTYPE))
         self.bitcode = CUSTOM_OPS_BITCODE
 
 
@@ -684,4 +688,250 @@ class cast_int4_to_fp16:
         self.arg_type["roundMode"] = tl.int32
         self.arg_type["count"] = tl.int32
         self.symbol = "custom_cast_int4_to_fp16"
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
+@al.register_custom_op
+class cast_fp16_to_int8_rint:
+    """Round-to-nearest-even saturating FP16 -> INT8 conversion on a 1D UB tensor.
+
+    Wraps `vconv_f162s8r` in element-count mask mode (dst/src repeat strides
+    4/8). src: float16[N] in UB, N a multiple of 32 in [32, 32640]. Required
+    out: int8[N] in UB. Inputs and outputs must be contiguous, 32-byte aligned
+    and disjoint. Pipeline barriers remain the caller's responsibility.
+    """
+
+    core = al.CORE.VECTOR
+    pipe = al.PIPE.PIPE_V
+    mode = al.MODE.SIMD
+
+    def __init__(self, src, count, out=None):
+        assert out is not None, "cast_fp16_to_int8_rint requires an output buffer"
+        assert src.dtype == tl.float16 and len(
+            src.shape) == 1, ("cast_fp16_to_int8_rint requires a 1D float16 UB source")
+        size = src.numel.value
+        assert size % 32 == 0 and 32 <= size <= 32640, (
+            f"cast_fp16_to_int8_rint requires a 32-element-aligned count in [32, 32640], got {size}")
+        assert isinstance(count,
+                          int) and count == size, (f"cast_fp16_to_int8_rint count must equal the source size ({size})")
+        assert out.dtype == tl.int8 and len(out.shape) == 1 and out.numel.value == count, (
+            "cast_fp16_to_int8_rint requires a 1D int8 output matching count")
+        self.arg_type["count"] = tl.uint32
+        self.symbol = "custom_cast_fp16_to_int8_rint"
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
+_PAGED_INT8_VALID_M = (16, 32, 64, 128)
+
+
+def _validate_paged_int8_m(m, op_name):
+    assert isinstance(
+        m, int) and m in _PAGED_INT8_VALID_M, (f"{op_name} requires compile-time m in {_PAGED_INT8_VALID_M}, got {m}")
+
+
+def _validate_paged_int8_flag(value, name, op_name):
+    if isinstance(value, int):
+        assert value in (0, 1), f"{op_name} requires {name} in (0, 1), got {value}"
+
+
+def _validate_paged_int8_head_stride(m, head_stride, op_name):
+    if isinstance(head_stride, int):
+        min_stride = 8 if m == 16 else m // 4
+        assert head_stride >= min_stride, (
+            f"{op_name} requires head_stride >= {min_stride} for m={m}, got {head_stride}")
+
+
+@al.register_custom_op
+class paged_int8_qk:
+    """Paged 6-page (384-token) QK MMA over INT8 content (D=512 -> INT32) and
+    BF16 RoPE (D=64 -> FP32), keeping the gathered 128x512 NZ content tiles
+    resident in L1 slot `slot` for the paired `paged_int8_pv` call.
+
+    On-chip resource and state contract (Ascend910B / dav-c220):
+      - Exclusive Cube L1 ownership (512 KiB): M <= 64 uses Q [0..32K),
+        QR [32K..40K), 2x3 KV pairs [40K..424K), KR [424K..472K), P [472K..496K);
+        M == 128 uses Q [0..64K), QR [64K..80K), 2x3 KV pairs [80K..464K),
+        and KR/P aliased at [464K..512K). Callers must not mix other TLE L1/L0
+        allocations on the Cube core while a window pipeline is active.
+      - Cross-call Event state: `first == 1` initializes L0/L1 pipeline flags
+        (`EVENT_ID0/1` MTE1<->M & FIX<->M, `EVENT_ID3/4/5` page-pair ready,
+        `EVENT_ID0` MTE1->MTE2 KR/P handoff) and prefetches slot 0; subsequent
+        windows (`first == 0`) consume pairs prefetched by `paged_int8_pv` on
+        the paired slot. Every `paged_int8_qk` must pair with `paged_int8_pv`
+        and terminate a request with `last == 1` on `paged_int8_pv`.
+      - Side effects: lowers to `hivm.hir.custom` without `no_side_effect`,
+        carrying both Read and Write on `DefaultResource` so DCE/CSE/LICM and
+        instruction scheduling preserve cross-call ordering.
+    """
+
+    core = al.CORE.CUBE
+    pipe = al.PIPE.PIPE_FIX
+    mode = al.MODE.SIMD
+
+    def __init__(
+        self,
+        m: tl.uint32,
+        q: tl.uint64,
+        qr: tl.uint64,
+        k: tl.uint64,
+        kr: tl.uint64,
+        table: tl.uint64,
+        c: tl.uint64,
+        r: tl.uint64,
+        remaining: tl.uint32,
+        first: tl.uint32,
+        slot: tl.uint32,
+        head_stride: tl.uint32,
+    ):
+        _validate_paged_int8_m(m, "paged_int8_qk")
+        _validate_paged_int8_flag(first, "first", "paged_int8_qk")
+        _validate_paged_int8_flag(slot, "slot", "paged_int8_qk")
+        _validate_paged_int8_head_stride(m, head_stride, "paged_int8_qk")
+        self.symbol = "custom_paged_int8_qk"
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
+@al.register_custom_op
+class paged_int8_pv:
+    """Adaptive shifted-8-bit (`P_hi @ V + 128 * sum(V)`) or two-digit
+    (`P_hi @ V + 128 * sum(V) + P_lo @ V / 127`) PV MMA against the 384x512 NZ
+    value tiles left resident in L1 slot `slot` by `paged_int8_qk`.
+
+    On-chip resource and state contract (Ascend910B / dav-c220):
+      - Consumes the resident L1 KV tiles in `slot` written by `paged_int8_qk`
+        and waits on `EVENT_ID0` (MTE1->MTE2) before loading `P_hi`/`P_lo` or
+        `ones_gm` into `kProbBase`/`kProbBase128`.
+      - When `remaining > 0`, refills the 3 page pairs for window `group + 2`
+        into `slot` during the final PV column and signals `EVENT_ID3/4/5`
+        (MTE2->MTE1) for the next `paged_int8_qk`; when `last == 1`, drains
+        all Cube pipelines (`pipe_barrier(PIPE_ALL)`) before returning.
+      - For `M >= 64`, Fixpipe `DEQF16` uses a single fixed scale (`1/16384`)
+        across `vsum`, `PV_hi`, and `PV_lo` to avoid mid-flight `QUANT_PRE`
+        hazards.
+      - Side effects: lowers to `hivm.hir.custom` with Read+Write on
+        `DefaultResource`.
+    """
+
+    core = al.CORE.CUBE
+    pipe = al.PIPE.PIPE_FIX
+    mode = al.MODE.SIMD
+
+    def __init__(
+        self,
+        m: tl.uint32,
+        p: tl.uint64,
+        dst: tl.uint64,
+        k: tl.uint64,
+        kr: tl.uint64,
+        table: tl.uint64,
+        flag_gm: tl.uint64,
+        ones_gm: tl.uint64,
+        slot: tl.uint32,
+        remaining: tl.uint32,
+        last: tl.uint32,
+    ):
+        _validate_paged_int8_m(m, "paged_int8_pv")
+        _validate_paged_int8_flag(slot, "slot", "paged_int8_pv")
+        _validate_paged_int8_flag(last, "last", "paged_int8_pv")
+        self.symbol = "custom_paged_int8_pv"
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
+@al.register_custom_op
+class paged_int8_prob:
+    """Online softmax and adaptive shifted-8-bit (`P_hi`) / residual INT8
+    (`P_lo`) probability quantization over a 384-token paged KV window on
+    Ascend Vector cores (`M` in {16, 32, 64, 128}).
+
+    On-chip resource and state contract (Ascend910B / dav-c220):
+      - Exclusive Vector UB ownership (192 KiB): holds persistent running
+        accumulator (`kAccum`), ping-pong `sum`/`max`/`alpha`/`step` vectors,
+        and `need_lo_mask` across windows for the paired `paged_int8_update`.
+        Callers must not interleave other TLE UB tensor allocations on the
+        Vector core between `first == 1` and `paged_int8_update(..., last=1)`.
+      - Must be invoked in order `phase = 0` then `phase = 1` per window. On
+        `first == 0`, prefetches tile 0 of `prior_pv` and signals `EVENT_ID5`
+        (MTE2->V) to be consumed by the immediately following
+        `paged_int8_update`.
+      - Side effects: lowers to `hivm.hir.custom` with Read+Write on
+        `DefaultResource`.
+    """
+
+    core = al.CORE.VECTOR
+    pipe = al.PIPE.PIPE_V
+    mode = al.MODE.SIMD
+
+    def __init__(
+        self,
+        m: tl.uint32,
+        phase: tl.uint32,
+        c: tl.uint64,
+        r: tl.uint64,
+        prob: tl.uint64,
+        qs: tl.uint64,
+        ks: tl.uint64,
+        table: tl.uint64,
+        pv: tl.uint64,
+        flag_gm: tl.uint64,
+        visible: tl.uint32,
+        first: tl.uint32,
+        slot: tl.uint32,
+        atten_scale: tl.float32,
+        head_stride: tl.uint32,
+        causal_pair: tl.uint32,
+    ):
+        _validate_paged_int8_m(m, "paged_int8_prob")
+        _validate_paged_int8_flag(phase, "phase", "paged_int8_prob")
+        _validate_paged_int8_flag(first, "first", "paged_int8_prob")
+        _validate_paged_int8_flag(slot, "slot", "paged_int8_prob")
+        _validate_paged_int8_flag(causal_pair, "causal_pair", "paged_int8_prob")
+        _validate_paged_int8_head_stride(m, head_stride, "paged_int8_prob")
+        self.symbol = "custom_paged_int8_prob"
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
+@al.register_custom_op
+class paged_int8_update:
+    """Adaptive shifted-8-bit / residual INT8 PV rescaling, online accumulator
+    update (FP32 for `M <= 32`, running-normalized FP16 for `M >= 64`), and
+    final BF16 output + FP32 logsumexp writeback on Ascend Vector cores
+    (`M` in {16, 32, 64, 128}).
+
+    On-chip resource and state contract (Ascend910B / dav-c220):
+      - Consumes the persistent UB state (`kAccum`, `kSumBase`, `kMaxBase`,
+        `kAlphaBase`, `kStepBase`, `kNeedLoBase`) written by `paged_int8_prob`
+        for `slot`. When `last == 0` and `empty == 0`, waits on `EVENT_ID5`
+        (MTE2->V) for the tile-0 `pv` prefetch issued by `paged_int8_prob`.
+      - When `last == 1` or `empty == 1`, writes final BF16 `out` and FP32
+        `lse` to GM and drains Vector pipelines (`pipe_barrier(PIPE_ALL)`).
+      - Side effects: lowers to `hivm.hir.custom` with Read+Write on
+        `DefaultResource`.
+    """
+
+    core = al.CORE.VECTOR
+    pipe = al.PIPE.PIPE_V
+    mode = al.MODE.SIMD
+
+    def __init__(
+        self,
+        m: tl.uint32,
+        pv: tl.uint64,
+        vsum_gm: tl.uint64,
+        out: tl.uint64,
+        lse: tl.uint64,
+        slot: tl.uint32,
+        first: tl.uint32,
+        last: tl.uint32,
+        empty: tl.uint32,
+        head_stride: tl.uint32,
+        first_empty: tl.uint32,
+    ):
+        _validate_paged_int8_m(m, "paged_int8_update")
+        _validate_paged_int8_flag(slot, "slot", "paged_int8_update")
+        _validate_paged_int8_flag(first, "first", "paged_int8_update")
+        _validate_paged_int8_flag(last, "last", "paged_int8_update")
+        _validate_paged_int8_flag(empty, "empty", "paged_int8_update")
+        _validate_paged_int8_flag(first_empty, "first_empty", "paged_int8_update")
+        _validate_paged_int8_head_stride(m, head_stride, "paged_int8_update")
+        self.symbol = "custom_paged_int8_update"
         self.bitcode = CUSTOM_OPS_BITCODE

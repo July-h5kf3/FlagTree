@@ -45,6 +45,11 @@ CUSTOM_OPS=(
   "sort_ops/unpack_sort.cpp:dav-c220-vec"
   "mask_ops/compare_scalar.cpp:dav-c220-vec"
   "cast_ops/cast_int4_to_fp16.cpp:dav-c220-vec"
+  "cast_ops/cast_fp16_to_int8_rint.cpp:dav-c220-vec"
+  "mma_ops/paged_int8_qk.cpp:dav-c220-cube"
+  "mma_ops/paged_int8_pv.cpp:dav-c220-cube"
+  "vec_ops/paged_int8_prob.cpp:dav-c220-vec"
+  "vec_ops/paged_int8_update.cpp:dav-c220-vec"
   "vec_ops/flip.cpp:dav-c220-vec"
 )
 
