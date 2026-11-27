@@ -2134,6 +2134,113 @@ static bool producerTreeReadsRoot(Operation *rootOp, Value rootAlloc,
 // Sink to_buffer(scf.if) + hivm.copy -> #ub into each branch of scf.if so
 // branch-local splat fills and in-place UB elementwise updates can fold
 // directly into dst without allocating an scf.if result buffer.
+
+/// Fold self-copies where a DPS op (e.g. `hivm.hir.custom`) already takes
+/// `bufferization.to_tensor %dst` as its DPS init operand and the caller
+/// writes its tensor result back to `%dst` via `tle.dsa.to_buffer`:
+///   %t   = bufferization.to_tensor %dst restrict writable : memref<...,
+///   #space> %res = dps_op ins(...) outs(%t) -> tensor<...> %buf =
+///   bufferization.to_buffer %res : tensor<...> to memref<...> hivm.hir.copy
+///   ins(%buf) outs(%dst)
+/// Rewrite the trailing `to_buffer + hivm.hir.copy` to
+/// `bufferization.materialize_in_destination %res in writable %dst {restrict}`
+/// so downstream one-shot bufferization updates `%dst` in-place with zero
+/// buffer cloning and zero illegal on-chip self-copy (e.g. cbuf->cbuf).
+
+/// Fix `memref.extract_aligned_pointer_as_index` on `memref.reinterpret_cast`
+/// with a non-zero element offset. `memref.extract_aligned_pointer_as_index`
+/// extracts only the memref descriptor's `aligned_ptr` and drops the descriptor
+/// `offset` field, causing `tt.ptr_to_int(tt.addptr(ptr, off))` lowered via
+/// `memref.reinterpret_cast` to silently lose the pointer offset.
+struct FixOffsetExtractAlignedPointerPattern
+    : public OpRewritePattern<memref::ExtractAlignedPointerAsIndexOp> {
+  using OpRewritePattern<
+      memref::ExtractAlignedPointerAsIndexOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(memref::ExtractAlignedPointerAsIndexOp op,
+                                PatternRewriter &rewriter) const override {
+    auto rcOp = op.getSource().getDefiningOp<memref::ReinterpretCastOp>();
+    if (!rcOp)
+      return failure();
+
+    auto dstTy = dyn_cast<MemRefType>(rcOp.getType());
+    if (!dstTy || !dstTy.getElementType().isIntOrFloat())
+      return failure();
+
+    unsigned bitWidth = dstTy.getElementTypeBitWidth();
+    if (bitWidth < 8 || (bitWidth % 8) != 0)
+      return failure();
+    int64_t elemBytes = static_cast<int64_t>(bitWidth / 8);
+
+    Location loc = op.getLoc();
+    Value offIdx;
+    if (rcOp.isDynamicOffset(0)) {
+      offIdx = rcOp.getOffsets()[0];
+    } else {
+      int64_t staticOff = rcOp.getStaticOffsets()[0];
+      if (staticOff == 0)
+        return failure();
+      offIdx = rewriter.create<arith::ConstantIndexOp>(loc, staticOff);
+    }
+
+    Value basePtr = rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(
+        loc, rcOp.getSource());
+    Value byteOff = offIdx;
+    if (elemBytes != 1) {
+      Value stride = rewriter.create<arith::ConstantIndexOp>(loc, elemBytes);
+      byteOff = rewriter.create<arith::MulIOp>(loc, offIdx, stride);
+    }
+    Value adjusted = rewriter.create<arith::AddIOp>(loc, basePtr, byteOff);
+    rewriter.replaceOp(op, adjusted);
+    return success();
+  }
+};
+
+struct FoldInPlaceSelfCopyPattern : public OpRewritePattern<hivm::CopyOp> {
+  using OpRewritePattern<hivm::CopyOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(hivm::CopyOp copyOp,
+                                PatternRewriter &rewriter) const override {
+    Value dst = copyOp.getDst();
+    auto dstMemRefTy = dyn_cast<MemRefType>(dst.getType());
+    if (!dstMemRefTy || !isOnChipMemSpace(dstMemRefTy.getMemorySpace()))
+      return failure();
+
+    auto toBufferOp =
+        copyOp.getSrc().getDefiningOp<bufferization::ToBufferOp>();
+    if (!toBufferOp)
+      return failure();
+
+    Value res = toBufferOp.getTensor();
+    auto dpsOp = res.getDefiningOp<DestinationStyleOpInterface>();
+    if (!dpsOp)
+      return failure();
+
+    unsigned resIdx = cast<OpResult>(res).getResultNumber();
+    if (resIdx >= dpsOp.getNumDpsInits())
+      return failure();
+
+    auto toTensorOp = dpsOp.getDpsInitOperand(resIdx)
+                          ->get()
+                          .getDefiningOp<bufferization::ToTensorOp>();
+    if (!toTensorOp ||
+        !areEquivalentMemRefs(getToTensorBuffer(toTensorOp), dst))
+      return failure();
+
+    rewriter.modifyOpInPlace(toTensorOp, [&]() {
+      toTensorOp.setRestrict(true);
+      toTensorOp.setWritable(true);
+    });
+    rewriter.create<bufferization::MaterializeInDestinationOp>(
+        copyOp.getLoc(), Type{}, res, dst, /*restrict=*/true,
+        /*writable=*/true);
+    rewriter.eraseOp(copyOp);
+    if (toBufferOp->use_empty())
+      rewriter.eraseOp(toBufferOp);
+    return success();
+  }
+};
+
 struct SinkUBStoreIntoIfPattern : public OpRewritePattern<hivm::CopyOp> {
   using OpRewritePattern::OpRewritePattern;
 
@@ -2698,8 +2805,54 @@ void CommonIRToHIVMPass::runOnOperation() {
                         FoldBroadcastOfOnChipMemRef);
   APPLY_REWRITE_PATTERN(DecomposeCube3DReshapePattern,
                         DecomposeCube3DCollapsePattern);
+  APPLY_REWRITE_PATTERN(FixOffsetExtractAlignedPointerPattern,
+                        FoldInPlaceSelfCopyPattern);
   APPLY_REWRITE_PATTERN(SinkUBStoreIntoIfPattern, FoldSplatStoreToUBPattern,
                         FoldInPlaceUBStorePattern);
+  // Fix mix_mode when TritonToLinalg defaulted to "aiv" (e.g. kernels using
+  // explicit CUBE scopes or CUBE custom ops without tt.dot).
+  module.walk([](func::FuncOp funcOp) {
+    auto mixMode = funcOp->getAttrOfType<StringAttr>("mix_mode");
+    if (!mixMode || mixMode.getValue() != "aiv")
+      return;
+    bool hasCube = false;
+    bool hasVector = false;
+    funcOp.walk([&](Operation *op) {
+      if (auto scopeOp = dyn_cast<scope::ScopeOp>(op)) {
+        if (auto ct = scopeOp->getAttrOfType<hivm::TCoreTypeAttr>(
+                "hivm.tcore_type")) {
+          if (ct.getTcoretype() == hivm::TCoreType::CUBE)
+            hasCube = true;
+          else if (ct.getTcoretype() == hivm::TCoreType::VECTOR)
+            hasVector = true;
+        }
+      } else if (auto customOp = dyn_cast<hivm::CustomOp>(op)) {
+        if (auto ct = customOp->getAttrOfType<hivm::TCoreTypeAttr>(
+                "hivm.tcore_type")) {
+          if (ct.getTcoretype() == hivm::TCoreType::CUBE)
+            hasCube = true;
+          else if (ct.getTcoretype() == hivm::TCoreType::VECTOR)
+            hasVector = true;
+        }
+      } else if (auto allocOp = dyn_cast<memref::AllocOp>(op)) {
+        if (auto space = dyn_cast_or_null<hivm::AddressSpaceAttr>(
+                allocOp.getType().getMemorySpace())) {
+          if (space.getAddressSpace() == hivm::AddressSpace::L1)
+            hasCube = true;
+          else if (space.getAddressSpace() == hivm::AddressSpace::UB)
+            hasVector = true;
+        }
+      } else if (isa<linalg::LinalgOp>(op) && !isa<linalg::MatmulOp>(op)) {
+        if (!isInCubeScope(op))
+          hasVector = true;
+      }
+    });
+    if (hasCube) {
+      funcOp->setAttr("mix_mode", StringAttr::get(funcOp.getContext(),
+                                                  hasVector ? "mix" : "aic"));
+    }
+  });
+
   APPLY_REWRITE_PATTERN(IsolateSmallStrided1DStorePattern);
 }
 

@@ -171,4 +171,91 @@ module {
     } {hivm.tcore_type = #hivm.tcore_type<VECTOR>}
     return
   }
+
+  // CHECK-LABEL: func.func @test_infer_cube_mix_mode_from_custom
+  // CHECK-SAME: mix_mode = "aic"
+  func.func @test_infer_cube_mix_mode_from_custom(%src: i64) attributes {mix_mode = "aiv"} {
+    %buf = memref.alloc() : memref<16x64xi8, #hivm.address_space<cbuf>>
+    %t = bufferization.to_tensor %buf restrict writable : memref<16x64xi8, #hivm.address_space<cbuf>> to tensor<16x64xi8>
+    %c16 = arith.constant 16 : i32
+    %c64 = arith.constant 64 : i32
+    %res = hivm.hir.custom {
+      arg_attrs = [{}, {}, {}, {}, {}],
+      bitcode = "/tmp/dummy.bc",
+      hivm.pipe = #hivm.pipe<PIPE_MTE1>,
+      hivm.tcore_type = #hivm.tcore_type<CUBE>,
+      hivm.vf_mode = #hivm.vf_mode<SIMD>,
+      symbol = "custom_nd2nz_gm_to_l1_s8"
+    } "nd2nz_gm_to_l1" ins(%src, %c16, %c64, %c64 : i64, i32, i32, i32) outs(%t : tensor<16x64xi8>) -> tensor<16x64xi8>
+    %res_buf = bufferization.to_buffer %res : tensor<16x64xi8> to memref<16x64xi8>
+    hivm.hir.copy ins(%res_buf : memref<16x64xi8>) outs(%buf : memref<16x64xi8, #hivm.address_space<cbuf>>)
+    return
+  }
+
+  // CHECK-LABEL: func.func @test_infer_mix_mode_from_cube_and_ub
+  // CHECK-SAME: mix_mode = "mix"
+  func.func @test_infer_mix_mode_from_cube_and_ub(%src: i64, %val: tensor<16xf32>) attributes {mix_mode = "aiv"} {
+    %l1 = memref.alloc() : memref<16x64xi8, #hivm.address_space<cbuf>>
+    %t = bufferization.to_tensor %l1 restrict writable : memref<16x64xi8, #hivm.address_space<cbuf>> to tensor<16x64xi8>
+    %c16 = arith.constant 16 : i32
+    %c64 = arith.constant 64 : i32
+    %res = hivm.hir.custom {
+      arg_attrs = [{}, {}, {}, {}, {}],
+      bitcode = "/tmp/dummy.bc",
+      hivm.pipe = #hivm.pipe<PIPE_MTE1>,
+      hivm.tcore_type = #hivm.tcore_type<CUBE>,
+      hivm.vf_mode = #hivm.vf_mode<SIMD>,
+      symbol = "custom_nd2nz_gm_to_l1_s8"
+    } "nd2nz_gm_to_l1" ins(%src, %c16, %c64, %c64 : i64, i32, i32, i32) outs(%t : tensor<16x64xi8>) -> tensor<16x64xi8>
+    bufferization.materialize_in_destination %res in restrict writable %l1 : (tensor<16x64xi8>, memref<16x64xi8, #hivm.address_space<cbuf>>) -> ()
+    %ub = memref.alloc() : memref<16xf32, #hivm.address_space<ub>>
+    bufferization.materialize_in_destination %val in restrict writable %ub : (tensor<16xf32>, memref<16xf32, #hivm.address_space<ub>>) -> ()
+    return
+  }
+
+  // CHECK-LABEL: func.func @test_fold_inplace_self_copy_cbuf
+  // CHECK: %[[BUF:.*]] = memref.alloc() : memref<16x64xi8, #hivm.address_space<cbuf>>
+  // CHECK: %[[RES:.*]] = hivm.hir.custom
+  // CHECK: bufferization.materialize_in_destination %[[RES]] in restrict writable %[[BUF]]
+  // CHECK-NOT: hivm.hir.copy
+  func.func @test_fold_inplace_self_copy_cbuf(%src: i64) attributes {mix_mode = "mix"} {
+    %buf = memref.alloc() : memref<16x64xi8, #hivm.address_space<cbuf>>
+    %t = bufferization.to_tensor %buf restrict writable : memref<16x64xi8, #hivm.address_space<cbuf>> to tensor<16x64xi8>
+    %c16 = arith.constant 16 : i32
+    %c64 = arith.constant 64 : i32
+    %res = hivm.hir.custom {
+      arg_attrs = [{}, {}, {}, {}, {}],
+      bitcode = "/tmp/dummy.bc",
+      hivm.pipe = #hivm.pipe<PIPE_MTE1>,
+      hivm.tcore_type = #hivm.tcore_type<CUBE>,
+      hivm.vf_mode = #hivm.vf_mode<SIMD>,
+      symbol = "custom_nd2nz_gm_to_l1_s8"
+    } "nd2nz_gm_to_l1" ins(%src, %c16, %c64, %c64 : i64, i32, i32, i32) outs(%t : tensor<16x64xi8>) -> tensor<16x64xi8>
+    %res_buf = bufferization.to_buffer %res : tensor<16x64xi8> to memref<16x64xi8>
+    hivm.hir.copy ins(%res_buf : memref<16x64xi8>) outs(%buf : memref<16x64xi8, #hivm.address_space<cbuf>>)
+    return
+  }
+
+  // CHECK-LABEL: func.func @test_fix_offset_extract_aligned_pointer
+  // CHECK-DAG: %[[C4:.*]] = arith.constant 4 : index
+  // CHECK: %[[BASE:.*]] = memref.extract_aligned_pointer_as_index %arg0 : memref<?xi32> -> index
+  // CHECK: %[[BYTES:.*]] = arith.muli %arg1, %[[C4]] : index
+  // CHECK: %[[ADDR:.*]] = arith.addi %[[BASE]], %[[BYTES]] : index
+  // CHECK: return %[[ADDR]]
+  func.func @test_fix_offset_extract_aligned_pointer(%gm: memref<?xi32>, %off: index) -> index {
+    %view = memref.reinterpret_cast %gm to offset: [%off], sizes: [1], strides: [1] : memref<?xi32> to memref<1xi32, strided<[1], offset: ?>>
+    %ptr = memref.extract_aligned_pointer_as_index %view : memref<1xi32, strided<[1], offset: ?>> -> index
+    return %ptr : index
+  }
+
+  // CHECK-LABEL: func.func @test_fix_offset_extract_aligned_pointer_i8
+  // CHECK: %[[BASE:.*]] = memref.extract_aligned_pointer_as_index %arg0 : memref<?xi8> -> index
+  // CHECK: %[[ADDR:.*]] = arith.addi %[[BASE]], %arg1 : index
+  // CHECK-NOT: arith.muli
+  // CHECK: return %[[ADDR]]
+  func.func @test_fix_offset_extract_aligned_pointer_i8(%gm: memref<?xi8>, %off: index) -> index {
+    %view = memref.reinterpret_cast %gm to offset: [%off], sizes: [1], strides: [1] : memref<?xi8> to memref<1xi8, strided<[1], offset: ?>>
+    %ptr = memref.extract_aligned_pointer_as_index %view : memref<1xi8, strided<[1], offset: ?>> -> index
+    return %ptr : index
+  }
 }
