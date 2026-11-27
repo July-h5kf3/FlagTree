@@ -962,43 +962,11 @@ def copysign(arg0: core.tensor, arg1: core.tensor, _semantic=None):
         return _semantic.where(is_negative, neg_magnitude, magnitude)
 
 
-if get_ascend_arch_from_env() == "Ascend910_9589":
-    # if we have hardware support
-    @core.extern
-    def rint(arg0, _semantic=None):
-        return core.extern_elementwise(
-            "", "", [arg0], {
-                (core.dtype("fp32"), ): ("__hmf_rint", core.dtype("fp32")),
-                (core.dtype("fp16"), ): ("__hmf_rint", core.dtype("fp16")),
-                (core.dtype("bf16"), ): ("__hmf_rint", core.dtype("bf16")),
-            }, is_pure=True, _semantic=_semantic)
-else:
-
-    @core.builtin
-    @math._check_dtype(dtypes=["fp16", "fp32", "bf16"])
-    @math._add_math_1arg_docstr("rint")
-    def rint(arg0: core.tensor, _semantic=None):
-        arg0 = _semantic.to_tensor(arg0)
-
-        floor_x = math.floor(arg0, _semantic=_semantic)
-        fractional = _semantic.sub(arg0, floor_x, True)
-
-        half = _semantic.full(arg0.shape, 0.5, arg0.type.scalar)
-        eps = _semantic.full(arg0.shape, 1e-8, arg0.type.scalar)
-        is_half = _semantic.less_than(math.abs(_semantic.sub(fractional, half, True), _semantic=_semantic), eps)
-
-        floor_int = floor_x.to(core.int32, _semantic=_semantic) if hasattr(floor_x, "to") else _semantic.cast(
-            floor_x, core.int32)
-        two_i32 = _semantic.full(arg0.shape, 2, core.int32)
-        is_even = _semantic.equal(_semantic.mod(floor_int, two_i32), _semantic.full(arg0.shape, 0, core.int32))
-
-        zero = _semantic.full(arg0.shape, 0.0, arg0.type.scalar)
-        is_pos = _semantic.greater_equal(arg0, zero)
-
-        round_pos = math.floor(_semantic.add(arg0, half, True), _semantic=_semantic)
-        round_neg = math.ceil(_semantic.sub(arg0, half, True), _semantic=_semantic)
-        normal_round = _semantic.where(is_pos, round_pos, round_neg)
-
-        half_round = _semantic.where(is_even, floor_x, _semantic.add(floor_x, 1.0, True))
-
-        return _semantic.where(is_half, half_round, normal_round)
+@core.extern
+def rint(arg0, _semantic=None):
+    return core.extern_elementwise(
+        "", "", [arg0], {
+            (core.dtype("fp32"), ): ("__hmf_rint", core.dtype("fp32")),
+            (core.dtype("fp16"), ): ("__hmf_rint", core.dtype("fp16")),
+            (core.dtype("bf16"), ): ("__hmf_rint", core.dtype("bf16")),
+        }, is_pure=True, _semantic=_semantic)

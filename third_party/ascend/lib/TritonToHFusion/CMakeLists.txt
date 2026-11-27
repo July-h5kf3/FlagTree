@@ -6,6 +6,8 @@ add_triton_library(TritonToHFusion
 
   LINK_LIBS
     BiShengIRHFusionDialect
+    MLIRArithDialect
+    MLIRMathDialect
     MLIRIR
     MLIRPass
     MLIRTransforms

@@ -11,7 +11,9 @@ add_triton_library(CommonIRToHIVM
   LINK_LIBS
   CommonIRIR
   TensorViewIR
+  BiShengIRHFusionDialect
   BiShengIRHIVMDialect
+  BiShengIRScopeDialect
   MLIRIR
   MLIRPass
   MLIRTransforms
@@ -22,4 +24,6 @@ add_triton_library(CommonIRToHIVM
   MLIRBufferizationDialect
   MLIRLinalgDialect
   MLIRArithDialect
+  MLIRMathDialect
+  MLIRSCFDialect
 )

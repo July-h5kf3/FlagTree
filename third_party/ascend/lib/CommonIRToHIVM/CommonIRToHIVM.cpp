@@ -43,15 +43,20 @@
 #include "ascend/include/CommonIRToHIVM/TensorViewLowering.h"
 #include "ascend/include/CommonIRToHIVM/Utils.h"
 
+#include "bishengir/Dialect/HFusion/IR/HFusion.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
+#include "bishengir/Dialect/Scope/IR/Scope.h"
 #include "mlir-ext/Dialect/CommonIR/IR/CommonIRDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LogicalResult.h"
@@ -64,6 +69,7 @@
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -1184,135 +1190,1270 @@ struct FoldRoundtripCast : public OpRewritePattern<UnrealizedConversionCastOp> {
 };
 
 //===----------------------------------------------------------------------===//
-// Rewrite pattern: fold staging alloc + copy1 + to_tensor + copy2
+// Helpers for LLVM 21 / LLVM 22 bufferization compatibility & Ascend scoping
 //===----------------------------------------------------------------------===//
-struct FoldStagingCopyPattern : public OpRewritePattern<memref::CopyOp> {
-  using OpRewritePattern::OpRewritePattern;
 
-  LogicalResult matchAndRewrite(memref::CopyOp copyOp,
-                                PatternRewriter &rewriter) const override {
-    Value stage = copyOp.getSource();
-    auto stageCast = stage.getDefiningOp<memref::MemorySpaceCastOp>();
-    if (stageCast)
-      stage = stageCast.getSource();
-    Value dst = copyOp.getTarget();
+static Value getToTensorBuffer(bufferization::ToTensorOp op) {
+#ifndef __LLVM_MAJOR_VERSION_22_COMPATIBLE__
+  return op.getMemref();
+#else
+  return op.getBuffer();
+#endif
+}
 
-    // ① Destination must have an explicit memory space (on-chip buffer).
-    auto dstType = dyn_cast<MemRefType>(dst.getType());
-    if (!dstType || !dstType.getMemorySpace())
-      return failure();
+static Value getToBufferSourceTensor(Operation *op) {
+  if (!op)
+    return Value();
+#ifndef __LLVM_MAJOR_VERSION_22_COMPATIBLE__
+  if (auto toMemref = dyn_cast<bufferization::ToMemrefOp>(op))
+    return toMemref.getTensor();
+#else
+  if (auto toBuffer = dyn_cast<bufferization::ToBufferOp>(op))
+    return toBuffer.getTensor();
+#endif
+  return Value();
+}
 
-    // ② Source must be a staging memref.alloc in default/GM address space.
-    auto stageAlloc = stage.getDefiningOp<memref::AllocOp>();
-    if (!stageAlloc)
-      return failure();
-    auto stageType = stageAlloc.getType();
-    if (auto stageSpace = stageType.getMemorySpace()) {
-      auto stageAddr = dyn_cast<hivm::AddressSpaceAttr>(stageSpace);
-      if (!stageAddr || stageAddr.getAddressSpace() != hivm::AddressSpace::GM)
-        return failure();
+static bool isOnChipMemSpace(Attribute space) {
+  auto addr = dyn_cast_or_null<hivm::AddressSpaceAttr>(space);
+  return addr && addr.getAddressSpace() != hivm::AddressSpace::GM;
+}
+
+static bool isUBMemSpace(Attribute space) {
+  auto addr = dyn_cast_or_null<hivm::AddressSpaceAttr>(space);
+  return addr && addr.getAddressSpace() == hivm::AddressSpace::UB;
+}
+
+static bool isDefaultOrGMMemSpace(Attribute space) {
+  if (!space)
+    return true;
+  auto addr = dyn_cast<hivm::AddressSpaceAttr>(space);
+  return addr && addr.getAddressSpace() == hivm::AddressSpace::GM;
+}
+
+static bool isInCubeScope(Operation *op) {
+  if (auto scopeOp = op->getParentOfType<scope::ScopeOp>()) {
+    if (auto coreType =
+            scopeOp->getAttrOfType<hivm::TCoreTypeAttr>("hivm.tcore_type"))
+      return coreType.getTcoretype() == hivm::TCoreType::CUBE;
+  }
+  return false;
+}
+
+// Scalarized 1D GM stores (scf.for + tensor.extract + memref.store) are safe
+// inside explicit VECTOR scopes or pure-AIV kernels, but must not be emitted
+// outside an explicit VECTOR scope in auto-split mix CV kernels because
+// BiShengIR's hivm-split-mix-kernel duplicates scalar loops onto AIC.
+static bool isSafeForScalarizedVectorGMStore(Operation *op) {
+  if (auto scopeOp = op->getParentOfType<scope::ScopeOp>()) {
+    if (auto coreType =
+            scopeOp->getAttrOfType<hivm::TCoreTypeAttr>("hivm.tcore_type"))
+      return coreType.getTcoretype() == hivm::TCoreType::VECTOR;
+    return false;
+  }
+  auto funcOp = op->getParentOfType<func::FuncOp>();
+  if (!funcOp)
+    return false;
+  if (auto mixMode = funcOp->getAttrOfType<StringAttr>("mix_mode")) {
+    if (mixMode.getValue() != "aiv")
+      return false;
+  }
+  bool hasCubeOp = false;
+  funcOp.walk([&](Operation *nested) {
+    if (isa<linalg::MatmulOp, linalg::BatchMatmulOp>(nested)) {
+      hasCubeOp = true;
+      return WalkResult::interrupt();
     }
+    return WalkResult::advance();
+  });
+  return !hasCubeOp;
+}
 
-    // ③ Enumerate the source copy: memref.copy %src, %stage.
-    //    Collect all users of %stage to verify the expected pattern.
-    memref::CopyOp srcCopy;
-    Operation *stageMark = nullptr;
-    bufferization::ToTensorOp toTensor;
-    Operation *tensorMark = nullptr;
-    SmallVector<Operation *> otherUses;
+static Value getRootMemRef(Value v) {
+  while (v) {
+    if (auto sv = v.getDefiningOp<memref::SubViewOp>()) {
+      v = sv.getSource();
+    } else if (auto cast = v.getDefiningOp<memref::CastOp>()) {
+      v = cast.getSource();
+    } else if (auto cast = v.getDefiningOp<memref::MemorySpaceCastOp>()) {
+      v = cast.getSource();
+    } else if (auto exp = v.getDefiningOp<memref::ExpandShapeOp>()) {
+      v = exp.getSrc();
+    } else if (auto col = v.getDefiningOp<memref::CollapseShapeOp>()) {
+      v = col.getSrc();
+    } else {
+      break;
+    }
+  }
+  return v;
+}
 
-    for (Operation *user : stage.getUsers()) {
-      if (auto c = dyn_cast<memref::CopyOp>(user)) {
-        if (c.getTarget() == stage) {
-          if (srcCopy)
-            return failure(); // multiple incoming copies — ambiguous
-          srcCopy = c;
-        } else if (c == copyOp.getOperation()) {
-          continue; // the outgoing copy we are folding
-        } else {
-          otherUses.push_back(user);
-        }
-      } else if (isAnnotationMark(user)) {
-        if (stageMark)
-          otherUses.push_back(user);
-        else
-          stageMark = user;
-      } else if (stageCast && user == stageCast.getOperation()) {
+static bool areEquivalentMemRefs(Value a, Value b) {
+  if (a == b)
+    return true;
+  auto svA = a.getDefiningOp<memref::SubViewOp>();
+  auto svB = b.getDefiningOp<memref::SubViewOp>();
+  if (!svA || !svB)
+    return false;
+  if (!areEquivalentMemRefs(svA.getSource(), svB.getSource()))
+    return false;
+  return svA.getMixedOffsets() == svB.getMixedOffsets() &&
+         svA.getMixedSizes() == svB.getMixedSizes() &&
+         svA.getMixedStrides() == svB.getMixedStrides();
+}
+
+//===----------------------------------------------------------------------===//
+// Rewrite pattern: fold staging alloc + copy1 (+ to_tensor/to_buffer) + copy2
+// Supports both memref.copy and hivm.hir.copy into any on-chip memory space
+// (#cbuf / #ub / #ca / #cb / #cc), enabling direct GM->L1/UB DMA and L1
+// residency across CV syncs without staging allocs or cbuf->cbuf copies.
+//===----------------------------------------------------------------------===//
+static LogicalResult foldStagingCopyToOnChip(Operation *copyOp, Value srcVal,
+                                             Value dstVal,
+                                             PatternRewriter &rewriter) {
+  auto dstType = dyn_cast<MemRefType>(dstVal.getType());
+  if (!dstType || !isOnChipMemSpace(dstType.getMemorySpace()))
+    return failure();
+
+  // Trace through optional memory_space_cast and to_buffer(to_tensor(%stage)).
+  Value stage = srcVal;
+  memref::MemorySpaceCastOp stageCast;
+  Operation *toBufferOp = nullptr;
+  bufferization::ToTensorOp bridgedToTensor;
+
+  if (auto cast = stage.getDefiningOp<memref::MemorySpaceCastOp>()) {
+    stageCast = cast;
+    stage = cast.getSource();
+  }
+  if (Value srcTensor = getToBufferSourceTensor(stage.getDefiningOp())) {
+    toBufferOp = stage.getDefiningOp();
+    if (auto tt = srcTensor.getDefiningOp<bufferization::ToTensorOp>()) {
+      bridgedToTensor = tt;
+      stage = getToTensorBuffer(tt);
+    }
+  }
+
+  auto stageAlloc = stage.getDefiningOp<memref::AllocOp>();
+  if (!stageAlloc)
+    return failure();
+  if (!isDefaultOrGMMemSpace(stageAlloc.getType().getMemorySpace()))
+    return failure();
+
+  // Enumerate all users of %stage to ensure we only fold a clean GM staging
+  // copy (memref.copy %gm, %stage). Masked loads that also fill %stage with
+  // linalg.fill are intentionally excluded here.
+  memref::CopyOp srcCopy;
+  Operation *stageMark = nullptr;
+  bufferization::ToTensorOp toTensor;
+  Operation *tensorMark = nullptr;
+  SmallVector<Operation *> otherUses;
+
+  for (Operation *user : stage.getUsers()) {
+    if (auto c = dyn_cast<memref::CopyOp>(user)) {
+      if (c.getTarget() == stage) {
+        if (srcCopy)
+          return failure();
+        srcCopy = c;
+      } else if (c.getOperation() == copyOp) {
         continue;
-      } else if (auto tt = dyn_cast<bufferization::ToTensorOp>(user)) {
-        if (toTensor)
-          otherUses.push_back(user);
-        else
-          toTensor = tt;
       } else {
         otherUses.push_back(user);
       }
+    } else if (user == copyOp) {
+      continue;
+    } else if (isAnnotationMark(user)) {
+      if (stageMark)
+        otherUses.push_back(user);
+      else
+        stageMark = user;
+    } else if (stageCast && user == stageCast.getOperation()) {
+      continue;
+    } else if (auto tt = dyn_cast<bufferization::ToTensorOp>(user)) {
+      if (toTensor)
+        otherUses.push_back(user);
+      else
+        toTensor = tt;
+    } else {
+      otherUses.push_back(user);
     }
+  }
 
-    // srcCopy is mandatory; toTensor is optional (Flavour A has it, B doesn't).
-    if (!srcCopy || !otherUses.empty())
-      return failure();
+  if (!srcCopy || !otherUses.empty())
+    return failure();
 
-    // Collect annotation.mark users of the tensor value (only if toTensor
-    // exists — Flavour A path).
-    if (toTensor) {
-      Value tensorVal = toTensor.getResult();
-      for (Operation *user : tensorVal.getUsers()) {
-        if (isAnnotationMark(user) && !tensorMark)
-          tensorMark = user;
+  if (toBufferOp && (!toBufferOp->hasOneUse() || toTensor != bridgedToTensor))
+    return failure();
+
+  // Determine if toTensor has any tensor consumers besides toBufferOp / mark.
+  bool hasRemainingTensorUses = false;
+  if (toTensor) {
+    Value tensorVal = toTensor.getResult();
+    for (Operation *user : tensorVal.getUsers()) {
+      if (user == toBufferOp)
+        continue;
+      if (isAnnotationMark(user) && !tensorMark) {
+        tensorMark = user;
+        continue;
       }
+      hasRemainingTensorUses = true;
     }
+  }
 
-    Location loc = copyOp.getLoc();
-    Value src = castDefaultMemrefToGM(srcCopy.getSource(), loc, rewriter);
-    Value dstCbuf = dst;
+  Location loc = copyOp->getLoc();
+  Value gmSrc = castDefaultMemrefToGM(srcCopy.getSource(), loc, rewriter);
+  rewriter.create<memref::CopyOp>(loc, gmSrc, dstVal);
 
-    // ④ Create the merged copy: memref.copy %src, %dst(#space)
-    rewriter.create<memref::CopyOp>(loc, src, dstCbuf);
+  if (stageMark) {
+    OperationState state(loc, "annotation.mark");
+    state.addOperands(dstVal);
+    for (auto &namedAttr : stageMark->getAttrs())
+      state.addAttribute(namedAttr.getName(), namedAttr.getValue());
+    rewriter.create(state);
+  }
 
-    // ⑤ If there was an annotation.mark on %stage, move it to %dst.
-    if (stageMark) {
+  if (toTensor && hasRemainingTensorUses) {
+    // Re-point remaining tensor consumers directly to the on-chip buffer,
+    // preserving layout (including strided subviews) and address space.
+    Value tensor = rewriter.create<bufferization::ToTensorOp>(
+        toTensor.getLoc(), toTensor.getType(), dstVal, toTensor.getRestrict(),
+        /*writable=*/false);
+
+    if (tensorMark) {
       OperationState state(loc, "annotation.mark");
-      state.addOperands(dstCbuf);
-      for (auto &namedAttr : stageMark->getAttrs())
+      state.addOperands(tensor);
+      for (auto &namedAttr : tensorMark->getAttrs())
         state.addAttribute(namedAttr.getName(), namedAttr.getValue());
       rewriter.create(state);
     }
 
-    // ⑥ For Flavour A: drop the address space via memory_space_cast and
-    //    re-create the to_tensor pointing at the cbuf alloc.
-    //    For Flavour B: nothing to do — the tensor path never existed.
-    if (toTensor) {
-      auto genericType =
-          MemRefType::get(dstType.getShape(), dstType.getElementType());
-      Value cast =
-          rewriter.create<memref::MemorySpaceCastOp>(loc, genericType, dstCbuf);
-      Value tensor = rewriter.create<bufferization::ToTensorOp>(
-          toTensor.getLoc(), toTensor.getType(), cast, toTensor.getRestrict(),
-          toTensor.getWritable());
+    rewriter.replaceOp(toTensor, tensor);
+  }
 
-      // ⑦ If there was an annotation.mark on the tensor value, re-create it.
-      if (tensorMark) {
-        OperationState state(loc, "annotation.mark");
-        state.addOperands(tensor);
-        for (auto &namedAttr : tensorMark->getAttrs())
-          state.addAttribute(namedAttr.getName(), namedAttr.getValue());
-        rewriter.create(state);
-      }
-
-      rewriter.replaceOp(toTensor, tensor);
-    }
-
-    // ⑧ Erase the dead ops.
-    rewriter.eraseOp(copyOp);
-    rewriter.eraseOp(srcCopy);
-    if (stageCast)
-      rewriter.eraseOp(stageCast);
-    if (stageMark)
-      rewriter.eraseOp(stageMark);
+  rewriter.eraseOp(copyOp);
+  if (toBufferOp && toBufferOp->use_empty())
+    rewriter.eraseOp(toBufferOp);
+  if (toTensor && !hasRemainingTensorUses) {
     if (tensorMark)
       rewriter.eraseOp(tensorMark);
+    if (toTensor->use_empty())
+      rewriter.eraseOp(toTensor);
+  } else if (tensorMark) {
+    rewriter.eraseOp(tensorMark);
+  }
+  if (stageCast && stageCast->use_empty())
+    rewriter.eraseOp(stageCast);
+  if (stageMark)
+    rewriter.eraseOp(stageMark);
+  rewriter.eraseOp(srcCopy);
+  if (stageAlloc->use_empty())
+    rewriter.eraseOp(stageAlloc);
 
+  return success();
+}
+
+struct FoldStagingMemrefCopyPattern : public OpRewritePattern<memref::CopyOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(memref::CopyOp copyOp,
+                                PatternRewriter &rewriter) const override {
+    return foldStagingCopyToOnChip(copyOp, copyOp.getSource(),
+                                   copyOp.getTarget(), rewriter);
+  }
+};
+
+struct FoldStagingHivmCopyPattern : public OpRewritePattern<hivm::CopyOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(hivm::CopyOp copyOp,
+                                PatternRewriter &rewriter) const override {
+    return foldStagingCopyToOnChip(copyOp, copyOp.getSrc(), copyOp.getDst(),
+                                   rewriter);
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Rewrite patterns: preserve on-chip address space across tensor.expand_shape,
+// tensor.collapse_shape, and linalg.broadcast on bufferization.to_tensor(#ub).
+//
+// BiShengIR bufferization drops #hivm.address_space<ub> when synthesizing
+// memref.expand_shape for 1D UB tensors (both directly from tensor.expand_shape
+// and internally when lowering linalg.broadcast), failing verification.
+//===----------------------------------------------------------------------===//
+static Value buildExpandedOnChipMemRef(Location loc, Value srcMem,
+                                       ArrayRef<int64_t> expandedShape,
+                                       ArrayRef<ReassociationIndices> reassoc,
+                                       PatternRewriter &rewriter) {
+  auto srcMemTy = cast<MemRefType>(srcMem.getType());
+  // Trace through optional memref.cast and cancel an inverse collapse_shape
+  // or rank-reducing subview whose source already has expandedShape.
+  Value unwrapped = srcMem;
+  if (auto castOp = unwrapped.getDefiningOp<memref::CastOp>())
+    unwrapped = castOp.getSource();
+  if (auto colOp = unwrapped.getDefiningOp<memref::CollapseShapeOp>()) {
+    auto colSrcTy = colOp.getSrcType();
+    if (colSrcTy.hasStaticShape() && colSrcTy.getShape() == expandedShape)
+      return colOp.getSrc();
+  }
+  if (auto sv = unwrapped.getDefiningOp<memref::SubViewOp>()) {
+    auto parentTy = sv.getSourceType();
+    if (parentTy.getRank() == static_cast<int64_t>(expandedShape.size()) &&
+        sv.getStaticSizes() == expandedShape) {
+      auto fullTy = cast<MemRefType>(memref::SubViewOp::inferResultType(
+          parentTy, sv.getMixedOffsets(), sv.getMixedSizes(),
+          sv.getMixedStrides()));
+      return rewriter.create<memref::SubViewOp>(
+          loc, fullTy, sv.getSource(), sv.getMixedOffsets(), sv.getMixedSizes(),
+          sv.getMixedStrides());
+    }
+  }
+
+  auto expandedMemTy = memref::ExpandShapeOp::computeExpandedType(
+      srcMemTy, expandedShape, reassoc);
+  if (failed(expandedMemTy))
+    return Value();
+  SmallVector<OpFoldResult> outShape;
+  for (int64_t d : expandedShape)
+    outShape.push_back(rewriter.getIndexAttr(d));
+  return rewriter.create<memref::ExpandShapeOp>(loc, *expandedMemTy, srcMem,
+                                                reassoc, outShape);
+}
+
+struct FoldTensorExpandOfOnChipMemRef
+    : public OpRewritePattern<tensor::ExpandShapeOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tensor::ExpandShapeOp op,
+                                PatternRewriter &rewriter) const override {
+    auto toTensor = op.getSrc().getDefiningOp<bufferization::ToTensorOp>();
+    if (!toTensor)
+      return failure();
+    Value srcMem = getToTensorBuffer(toTensor);
+    auto srcMemTy = dyn_cast<MemRefType>(srcMem.getType());
+    if (!srcMemTy || !isOnChipMemSpace(srcMemTy.getMemorySpace()))
+      return failure();
+
+    auto dstTensorTy = dyn_cast<RankedTensorType>(op.getResult().getType());
+    if (!dstTensorTy || !dstTensorTy.hasStaticShape())
+      return failure();
+
+    Value expandedMem =
+        buildExpandedOnChipMemRef(op.getLoc(), srcMem, dstTensorTy.getShape(),
+                                  op.getReassociationIndices(), rewriter);
+    if (!expandedMem)
+      return failure();
+
+    rewriter.replaceOpWithNewOp<bufferization::ToTensorOp>(
+        op, dstTensorTy, expandedMem, toTensor.getRestrict(),
+        toTensor.getWritable());
+    return success();
+  }
+};
+
+struct FoldTensorCollapseOfOnChipMemRef
+    : public OpRewritePattern<tensor::CollapseShapeOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tensor::CollapseShapeOp op,
+                                PatternRewriter &rewriter) const override {
+    auto toTensor = op.getSrc().getDefiningOp<bufferization::ToTensorOp>();
+    if (!toTensor)
+      return failure();
+    Value srcMem = getToTensorBuffer(toTensor);
+    auto srcMemTy = dyn_cast<MemRefType>(srcMem.getType());
+    if (!srcMemTy || !isOnChipMemSpace(srcMemTy.getMemorySpace()))
+      return failure();
+
+    auto dstTensorTy = dyn_cast<RankedTensorType>(op.getResult().getType());
+    if (!dstTensorTy || !dstTensorTy.hasStaticShape())
+      return failure();
+
+    if (!memref::CollapseShapeOp::isGuaranteedCollapsible(
+            srcMemTy, op.getReassociationIndices()))
+      return failure();
+
+    Value collapsedMem = rewriter.create<memref::CollapseShapeOp>(
+        op.getLoc(), srcMem, op.getReassociationIndices());
+    rewriter.replaceOpWithNewOp<bufferization::ToTensorOp>(
+        op, dstTensorTy, collapsedMem, toTensor.getRestrict(),
+        toTensor.getWritable());
+    return success();
+  }
+};
+
+struct FoldBroadcastOfOnChipMemRef
+    : public OpRewritePattern<linalg::BroadcastOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(linalg::BroadcastOp op,
+                                PatternRewriter &rewriter) const override {
+    auto toTensor = op.getInput().getDefiningOp<bufferization::ToTensorOp>();
+    if (!toTensor)
+      return failure();
+    Value srcMem = getToTensorBuffer(toTensor);
+    auto srcMemTy = dyn_cast<MemRefType>(srcMem.getType());
+    if (!srcMemTy || !isUBMemSpace(srcMemTy.getMemorySpace()) ||
+        !srcMemTy.hasStaticShape())
+      return failure();
+
+    auto dstTy = dyn_cast<RankedTensorType>(op.getResult().front().getType());
+    if (!dstTy || !dstTy.hasStaticShape())
+      return failure();
+
+    int64_t srcRank = srcMemTy.getRank();
+    int64_t dstRank = dstTy.getRank();
+    if (srcRank <= 0 || dstRank <= srcRank)
+      return failure();
+
+    ArrayRef<int64_t> bcastDims = op.getDimensions();
+    SmallVector<bool> isBcastDim(dstRank, false);
+    for (int64_t d : bcastDims) {
+      if (d < 0 || d >= dstRank)
+        return failure();
+      isBcastDim[d] = true;
+    }
+
+    // Build expanded shape (size 1 at broadcast dims) and valid reassociation
+    // grouping each broadcast dim with an adjacent source dim.
+    SmallVector<int64_t> expandedShape(dstRank, 1);
+    SmallVector<ReassociationIndices> reassoc(srcRank);
+    int64_t srcIdx = 0;
+    for (int64_t d = 0; d < dstRank; ++d) {
+      if (isBcastDim[d]) {
+        int64_t group = srcIdx > 0 ? (srcIdx - 1) : 0;
+        reassoc[group].push_back(d);
+      } else {
+        if (srcIdx >= srcRank)
+          return failure();
+        expandedShape[d] = srcMemTy.getDimSize(srcIdx);
+        reassoc[srcIdx].push_back(d);
+        ++srcIdx;
+      }
+    }
+    if (srcIdx != srcRank)
+      return failure();
+
+    Location loc = op.getLoc();
+    Value expandedMem = buildExpandedOnChipMemRef(loc, srcMem, expandedShape,
+                                                  reassoc, rewriter);
+    if (!expandedMem)
+      return failure();
+
+    auto expandedTensorTy =
+        RankedTensorType::get(expandedShape, dstTy.getElementType());
+    Value expandedTensor = rewriter.create<bufferization::ToTensorOp>(
+        loc, expandedTensorTy, expandedMem, toTensor.getRestrict(),
+        /*writable=*/false);
+    Value outTensor =
+        rewriter
+            .create<hivm::VBrcOp>(loc, TypeRange{dstTy}, expandedTensor,
+                                  op.getInit(), Value{}, bcastDims)
+            ->getResult(0);
+    rewriter.replaceOp(op, outTensor);
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Rewrite patterns: decompose Cube-scope 3D GM load + reshape/collapse -> 2D
+// feeding linalg.matmul into D0 contiguous 2D slice loads and D0 matmuls.
+//
+// BiShengIR's ND2NZ layout inference on a 3D [D0, D1, K] GM load reshaped to
+// [D0*D1, K] feeding matmul creates a 5D fractal buffer [D0, k1, m1, m0, k0]
+// and collapses [D0, k1] instead of [D0, m1], corrupting rows after slice 0.
+// Splitting at the matmul boundary ensures every slice is a standard contiguous
+// 2D GM->L1 nd2nz load and exact mmadL1 without subview-into-cbuf layout bugs.
+//===----------------------------------------------------------------------===//
+static LogicalResult splitCube3DLoadMatmuls(Operation *reshapeOp, Value src,
+                                            RankedTensorType dstTy,
+                                            PatternRewriter &rewriter) {
+  if (!dstTy || !dstTy.hasStaticShape() || dstTy.getRank() != 2)
+    return failure();
+
+  Value reshapedVal = reshapeOp->getResult(0);
+  if (reshapedVal.use_empty())
+    return failure();
+
+  // Require all users to be linalg.matmul consuming this tensor as LHS (A).
+  SmallVector<linalg::MatmulOp, 4> matmuls;
+  for (OpOperand &use : reshapedVal.getUses()) {
+    auto mm = dyn_cast<linalg::MatmulOp>(use.getOwner());
+    if (!mm || mm.getInputs().size() < 2 || mm.getInputs()[0] != reshapedVal)
+      return failure();
+    matmuls.push_back(mm);
+  }
+  if (matmuls.empty())
+    return failure();
+
+  auto toTensor = src.getDefiningOp<bufferization::ToTensorOp>();
+  if (!toTensor)
+    return failure();
+  Value allocVal = getToTensorBuffer(toTensor);
+  auto allocOp = allocVal.getDefiningOp<memref::AllocOp>();
+  if (!allocOp)
+    return failure();
+
+  auto allocTy = allocOp.getType();
+  if (!allocTy.hasStaticShape() || allocTy.getRank() != 3 ||
+      !isDefaultOrGMMemSpace(allocTy.getMemorySpace()))
+    return failure();
+
+  int64_t d0 = allocTy.getDimSize(0);
+  int64_t d1 = allocTy.getDimSize(1);
+  int64_t kDim = allocTy.getDimSize(2);
+  constexpr int64_t kCubeFractalM0 = 16;
+  constexpr int64_t kMaxSplitOuterSlices = 8;
+  if (d0 < 2 || d0 > kMaxSplitOuterSlices || d1 < kCubeFractalM0 ||
+      (d1 % kCubeFractalM0) != 0)
+    return failure();
+  if (dstTy.getDimSize(0) != d0 * d1 || dstTy.getDimSize(1) != kDim ||
+      dstTy.getElementType() != allocTy.getElementType())
+    return failure();
+
+  memref::CopyOp srcCopy;
+  Operation *allocMark = nullptr;
+  for (Operation *user : allocVal.getUsers()) {
+    if (auto c = dyn_cast<memref::CopyOp>(user)) {
+      if (c.getTarget() != allocVal || srcCopy)
+        return failure();
+      srcCopy = c;
+    } else if (user == toTensor.getOperation()) {
+      continue;
+    } else if (isAnnotationMark(user) && !allocMark) {
+      allocMark = user;
+    } else {
+      return failure();
+    }
+  }
+  if (!srcCopy)
+    return failure();
+
+  Value gmSrc = srcCopy.getSource();
+  auto gmSrcTy = dyn_cast<MemRefType>(gmSrc.getType());
+  if (!gmSrcTy || gmSrcTy.getRank() != 3 ||
+      !isDefaultOrGMMemSpace(gmSrcTy.getMemorySpace()))
+    return failure();
+  SmallVector<int64_t> gmStrides;
+  int64_t gmOffset = 0;
+  if (failed(gmSrcTy.getStridesAndOffset(gmStrides, gmOffset)) ||
+      gmStrides.size() != 3 || gmStrides[2] != 1)
+    return failure();
+
+  // Emit D0 independent contiguous 2D loads at srcCopy (preserving hoisting).
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(srcCopy);
+  Location loadLoc = srcCopy.getLoc();
+  auto sliceAllocTy =
+      MemRefType::get({d1, kDim}, allocTy.getElementType(),
+                      MemRefLayoutAttrInterface{}, allocTy.getMemorySpace());
+  auto sliceTensorTy =
+      RankedTensorType::get({d1, kDim}, allocTy.getElementType());
+
+  SmallVector<Value, 4> sliceTensors;
+  for (int64_t i = 0; i < d0; ++i) {
+    SmallVector<OpFoldResult> gmOffs{rewriter.getIndexAttr(i),
+                                     rewriter.getIndexAttr(0),
+                                     rewriter.getIndexAttr(0)};
+    SmallVector<OpFoldResult> gmSizes{rewriter.getIndexAttr(1),
+                                      rewriter.getIndexAttr(d1),
+                                      rewriter.getIndexAttr(kDim)};
+    SmallVector<OpFoldResult> gmOneStrides{rewriter.getIndexAttr(1),
+                                           rewriter.getIndexAttr(1),
+                                           rewriter.getIndexAttr(1)};
+    auto gmSliceTy =
+        cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
+            {d1, kDim}, gmSrcTy, gmOffs, gmSizes, gmOneStrides));
+    Value gmSlice = rewriter.create<memref::SubViewOp>(
+        loadLoc, gmSliceTy, gmSrc, gmOffs, gmSizes, gmOneStrides);
+    Value sliceAlloc = rewriter.create<memref::AllocOp>(
+        loadLoc, sliceAllocTy, allocOp.getAlignmentAttr());
+    rewriter.create<memref::CopyOp>(loadLoc, gmSlice, sliceAlloc);
+    Value sliceTensor = rewriter.create<bufferization::ToTensorOp>(
+        loadLoc, sliceTensorTy, sliceAlloc, /*restrict=*/true,
+        /*writable=*/true);
+    sliceTensors.push_back(sliceTensor);
+  }
+
+  // Split every consuming linalg.matmul along M into D0 (D1 x N) matmuls.
+  for (linalg::MatmulOp mm : matmuls) {
+    rewriter.setInsertionPoint(mm);
+    Location mmLoc = mm.getLoc();
+    Value rhs = mm.getInputs()[1];
+    Value origInit = mm.getOutputs()[0];
+    auto mmResTy = cast<RankedTensorType>(mm.getResult(0).getType());
+    int64_t nDim = mmResTy.getDimSize(1);
+    auto outSliceTy =
+        RankedTensorType::get({d1, nDim}, mmResTy.getElementType());
+
+    auto makeInitSlice = [&](int64_t i) -> Value {
+      if (auto fill = origInit.getDefiningOp<linalg::FillOp>()) {
+        Value empty = rewriter.create<tensor::EmptyOp>(
+            mmLoc, ArrayRef<int64_t>{d1, nDim}, mmResTy.getElementType());
+        return rewriter
+            .create<linalg::FillOp>(mmLoc, fill.getInputs(), ValueRange{empty})
+            .getResult(0);
+      }
+      SmallVector<OpFoldResult> offs{rewriter.getIndexAttr(i * d1),
+                                     rewriter.getIndexAttr(0)};
+      SmallVector<OpFoldResult> sizes{rewriter.getIndexAttr(d1),
+                                      rewriter.getIndexAttr(nDim)};
+      SmallVector<OpFoldResult> strides{rewriter.getIndexAttr(1),
+                                        rewriter.getIndexAttr(1)};
+      return rewriter.create<tensor::ExtractSliceOp>(
+          mmLoc, outSliceTy, origInit, offs, sizes, strides);
+    };
+
+    // Preserve extra discardable attributes (e.g. input_precision = "ieee").
+    SmallVector<NamedAttribute> extraAttrs;
+    for (NamedAttribute attr : mm->getDiscardableAttrs())
+      extraAttrs.push_back(attr);
+
+    // Fast path: matmul result is stored directly to GM via
+    // bufferization.materialize_in_destination -> split into D0 GM subviews.
+    bufferization::MaterializeInDestinationOp directStore;
+    if (mm.getResult(0).hasOneUse()) {
+      auto mat = dyn_cast<bufferization::MaterializeInDestinationOp>(
+          *mm.getResult(0).getUsers().begin());
+      if (mat && mat->getBlock() == mm->getBlock()) {
+        if (auto destTy = dyn_cast<MemRefType>(mat.getDest().getType())) {
+          if (destTy.getRank() == 2 &&
+              isDefaultOrGMMemSpace(destTy.getMemorySpace()))
+            directStore = mat;
+        }
+      }
+    }
+
+    if (directStore) {
+      rewriter.setInsertionPoint(directStore);
+      auto destTy = cast<MemRefType>(directStore.getDest().getType());
+      for (int64_t i = 0; i < d0; ++i) {
+        Value initSlice = makeInitSlice(i);
+        auto sliceMm = rewriter.create<linalg::MatmulOp>(
+            mmLoc, TypeRange{outSliceTy}, ValueRange{sliceTensors[i], rhs},
+            ValueRange{initSlice}, extraAttrs);
+        SmallVector<OpFoldResult> dstOffs{rewriter.getIndexAttr(i * d1),
+                                          rewriter.getIndexAttr(0)};
+        SmallVector<OpFoldResult> dstSizes{rewriter.getIndexAttr(d1),
+                                           rewriter.getIndexAttr(nDim)};
+        SmallVector<OpFoldResult> dstStrides{rewriter.getIndexAttr(1),
+                                             rewriter.getIndexAttr(1)};
+        auto dstSliceTy = cast<MemRefType>(memref::SubViewOp::inferResultType(
+            destTy, dstOffs, dstSizes, dstStrides));
+        Value dstSlice = rewriter.create<memref::SubViewOp>(
+            directStore.getLoc(), dstSliceTy, directStore.getDest(), dstOffs,
+            dstSizes, dstStrides);
+        rewriter.create<bufferization::MaterializeInDestinationOp>(
+            directStore.getLoc(), Type{}, sliceMm.getResult(0), dstSlice,
+            directStore.getRestrict(), directStore.getWritable());
+      }
+      rewriter.eraseOp(directStore);
+      rewriter.eraseOp(mm);
+    } else {
+      Value combined = origInit;
+      for (int64_t i = 0; i < d0; ++i) {
+        Value initSlice = makeInitSlice(i);
+        auto sliceMm = rewriter.create<linalg::MatmulOp>(
+            mmLoc, TypeRange{outSliceTy}, ValueRange{sliceTensors[i], rhs},
+            ValueRange{initSlice}, extraAttrs);
+        SmallVector<OpFoldResult> offs{rewriter.getIndexAttr(i * d1),
+                                       rewriter.getIndexAttr(0)};
+        SmallVector<OpFoldResult> sizes{rewriter.getIndexAttr(d1),
+                                        rewriter.getIndexAttr(nDim)};
+        SmallVector<OpFoldResult> strides{rewriter.getIndexAttr(1),
+                                          rewriter.getIndexAttr(1)};
+        combined = rewriter.create<tensor::InsertSliceOp>(
+            mmLoc, sliceMm.getResult(0), combined, offs, sizes, strides);
+      }
+      rewriter.replaceOp(mm, combined);
+    }
+  }
+
+  rewriter.eraseOp(reshapeOp);
+  if (toTensor->use_empty()) {
+    rewriter.eraseOp(toTensor);
+    rewriter.eraseOp(srcCopy);
+    if (allocMark)
+      rewriter.eraseOp(allocMark);
+    if (allocOp->use_empty())
+      rewriter.eraseOp(allocOp);
+  }
+  return success();
+}
+
+struct DecomposeCube3DReshapePattern
+    : public OpRewritePattern<tensor::ReshapeOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tensor::ReshapeOp op,
+                                PatternRewriter &rewriter) const override {
+    return splitCube3DLoadMatmuls(
+        op, op.getSource(), dyn_cast<RankedTensorType>(op.getType()), rewriter);
+  }
+};
+
+struct DecomposeCube3DCollapsePattern
+    : public OpRewritePattern<tensor::CollapseShapeOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tensor::CollapseShapeOp op,
+                                PatternRewriter &rewriter) const override {
+    return splitCube3DLoadMatmuls(
+        op, op.getSrc(), dyn_cast<RankedTensorType>(op.getType()), rewriter);
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Rewrite patterns: eliminate redundant UB temporaries and UB->UB hivm.copy
+// emitted by TileStoreTensorToHIVM for constant fills and elementwise updates.
+//===----------------------------------------------------------------------===//
+struct FoldSplatStoreToUBPattern : public OpRewritePattern<hivm::CopyOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(hivm::CopyOp copyOp,
+                                PatternRewriter &rewriter) const override {
+    Value dst = copyOp.getDst();
+    auto dstTy = dyn_cast<MemRefType>(dst.getType());
+    if (!dstTy || !isUBMemSpace(dstTy.getMemorySpace()))
+      return failure();
+
+    Type elemTy = dstTy.getElementType();
+    if (!elemTy.isIntOrFloat() || elemTy.getIntOrFloatBitWidth() < 8)
+      return failure();
+
+    Operation *toBufferOp = copyOp.getSrc().getDefiningOp();
+    Value srcTensor = getToBufferSourceTensor(toBufferOp);
+    if (!srcTensor)
+      return failure();
+
+    Location loc = copyOp.getLoc();
+    Value scalarVal;
+    if (auto cst = srcTensor.getDefiningOp<arith::ConstantOp>()) {
+      auto denseAttr = dyn_cast<DenseElementsAttr>(cst.getValue());
+      if (!denseAttr || !denseAttr.isSplat())
+        return failure();
+      scalarVal = rewriter.create<arith::ConstantOp>(
+          loc, cast<TypedAttr>(denseAttr.getSplatValue<Attribute>()));
+    } else if (auto fill = srcTensor.getDefiningOp<linalg::FillOp>()) {
+      if (fill.getInputs().size() != 1)
+        return failure();
+      scalarVal = fill.getInputs().front();
+    } else if (auto splat = srcTensor.getDefiningOp<tensor::SplatOp>()) {
+      scalarVal = splat.getInput();
+    } else {
+      return failure();
+    }
+
+    if (scalarVal.getType() != elemTy)
+      return failure();
+
+    rewriter.create<hivm::VBrcOp>(loc, TypeRange{}, scalarVal, dst);
+    rewriter.eraseOp(copyOp);
+    if (toBufferOp && toBufferOp->use_empty())
+      rewriter.eraseOp(toBufferOp);
+    return success();
+  }
+};
+
+static bool isSupportedArithOrMathElemwise(Operation *op, RankedTensorType ty) {
+  if (!op || op->getNumResults() != 1 || op->getResult(0).getType() != ty)
+    return false;
+  if (!isa<arith::AddFOp, arith::SubFOp, arith::MulFOp, arith::DivFOp,
+           arith::MaximumFOp, arith::MinimumFOp, arith::MaxNumFOp,
+           arith::MinNumFOp, arith::AddIOp, arith::SubIOp, arith::MulIOp,
+           math::ExpOp, math::LogOp>(op))
+    return false;
+  return llvm::all_of(op->getOperands(),
+                      [&](Value v) { return v.getType() == ty; });
+}
+
+static bool isElementwiseDPSWithEmptyOut(Operation *op, RankedTensorType ty) {
+  if (!op || op->getNumResults() != 1 || op->getResult(0).getType() != ty)
+    return false;
+  auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+  if (!linalgOp)
+    return false;
+  if (isa<linalg::FillOp, linalg::CopyOp, linalg::BroadcastOp,
+          linalg::TransposeOp, linalg::ReduceOp, linalg::MatmulOp>(op))
+    return false;
+  if (!isa<hfusion::CastOp, hfusion::ElemwiseBinaryOp,
+           hfusion::ElemwiseUnaryOp>(op) &&
+      (linalgOp.getNumLoops() != linalgOp.getNumParallelLoops() ||
+       !llvm::all_of(linalgOp.getIndexingMapsArray(),
+                     [](AffineMap m) { return m.isIdentity(); })))
+    return false;
+  auto dpsOp = cast<DestinationStyleOpInterface>(op);
+  if (dpsOp.getNumDpsInits() != 1)
+    return false;
+  if (!linalgOp.getMatchingIndexingMap(dpsOp.getDpsInitOperand(0)).isIdentity())
+    return false;
+  Value initVal = dpsOp.getDpsInitOperand(0)->get();
+  auto emptyOp = initVal.getDefiningOp<tensor::EmptyOp>();
+  return emptyOp && emptyOp->hasOneUse();
+}
+
+static bool isRewritableUBStepOp(Operation *op, RankedTensorType ty) {
+  return isElementwiseDPSWithEmptyOut(op, ty) ||
+         isSupportedArithOrMathElemwise(op, ty);
+}
+
+static Value extractScalarSplatIfConstant(Value v, Location loc,
+                                          PatternRewriter &rewriter) {
+  if (auto cst = v.getDefiningOp<arith::ConstantOp>()) {
+    if (auto dense = dyn_cast<DenseElementsAttr>(cst.getValue())) {
+      if (dense.isSplat())
+        return rewriter.create<arith::ConstantOp>(
+            loc, cast<TypedAttr>(dense.getSplatValue<Attribute>()));
+    }
+  }
+  return Value();
+}
+
+// Convert a tensor-valued arith/math op into a DPS hivm.hir.v* op writing into
+// `outTensor` (enabling zero-copy in-place UB bufferization).
+static Value rewriteArithMathToHIVMDPS(Operation *op, Value outTensor,
+                                       PatternRewriter &rewriter) {
+  Location loc = op->getLoc();
+  Type resTy = op->getResult(0).getType();
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(op);
+
+  auto emitBinary = [&](auto tag, bool commutative) -> Value {
+    using HIVMOpT = decltype(tag);
+    Value lhs = op->getOperand(0);
+    Value rhs = op->getOperand(1);
+    if (Value rhsScalar = extractScalarSplatIfConstant(rhs, loc, rewriter)) {
+      rhs = rhsScalar;
+    } else if (commutative) {
+      if (Value lhsScalar = extractScalarSplatIfConstant(lhs, loc, rewriter)) {
+        lhs = rhs;
+        rhs = lhsScalar;
+      }
+    }
+    auto newOp = rewriter.create<HIVMOpT>(
+        loc, TypeRange{resTy}, ValueRange{lhs, rhs}, ValueRange{outTensor});
+    return newOp->getResult(0);
+  };
+
+  if (isa<arith::AddFOp, arith::AddIOp>(op))
+    return emitBinary(hivm::VAddOp{}, /*commutative=*/true);
+  if (isa<arith::SubFOp, arith::SubIOp>(op))
+    return emitBinary(hivm::VSubOp{}, /*commutative=*/false);
+  if (isa<arith::MulFOp, arith::MulIOp>(op))
+    return emitBinary(hivm::VMulOp{}, /*commutative=*/true);
+  if (isa<arith::DivFOp>(op))
+    return emitBinary(hivm::VDivOp{}, /*commutative=*/false);
+  if (isa<arith::MaximumFOp, arith::MaxNumFOp>(op))
+    return emitBinary(hivm::VMaxOp{}, /*commutative=*/true);
+  if (isa<arith::MinimumFOp, arith::MinNumFOp>(op))
+    return emitBinary(hivm::VMinOp{}, /*commutative=*/true);
+  if (isa<math::ExpOp>(op))
+    return rewriter
+        .create<hivm::VExpOp>(loc, TypeRange{resTy},
+                              ValueRange{op->getOperand(0)},
+                              ValueRange{outTensor})
+        ->getResult(0);
+  if (isa<math::LogOp>(op))
+    return rewriter
+        .create<hivm::VLnOp>(loc, TypeRange{resTy},
+                             ValueRange{op->getOperand(0)},
+                             ValueRange{outTensor})
+        ->getResult(0);
+  return Value();
+}
+
+static bool hasInterveningMemoryOpOnRoot(Operation *fromOp, Operation *toOp,
+                                         Value rootAlloc, bool checkReads) {
+  if (!fromOp || !toOp || fromOp->getBlock() != toOp->getBlock())
+    return true;
+  for (Operation *cur = fromOp->getNextNode(); cur && cur != toOp;
+       cur = cur->getNextNode()) {
+    bool touches = false;
+    cur->walk([&](Operation *nested) {
+      if (auto tt = dyn_cast<bufferization::ToTensorOp>(nested)) {
+        if (checkReads && getRootMemRef(getToTensorBuffer(tt)) == rootAlloc)
+          touches = true;
+      } else if (auto mat = dyn_cast<bufferization::MaterializeInDestinationOp>(
+                     nested)) {
+        if (getRootMemRef(mat.getDest()) == rootAlloc)
+          touches = true;
+      } else if (auto hcopy = dyn_cast<hivm::CopyOp>(nested)) {
+        if (getRootMemRef(hcopy.getDst()) == rootAlloc ||
+            (checkReads && getRootMemRef(hcopy.getSrc()) == rootAlloc))
+          touches = true;
+      } else if (auto vbrc = dyn_cast<hivm::VBrcOp>(nested)) {
+        if (getRootMemRef(vbrc.getDst()) == rootAlloc)
+          touches = true;
+      } else if (auto mcopy = dyn_cast<memref::CopyOp>(nested)) {
+        if (getRootMemRef(mcopy.getTarget()) == rootAlloc ||
+            (checkReads && getRootMemRef(mcopy.getSource()) == rootAlloc))
+          touches = true;
+      } else if (auto mstore = dyn_cast<memref::StoreOp>(nested)) {
+        if (getRootMemRef(mstore.getMemRef()) == rootAlloc)
+          touches = true;
+      } else if (auto mload = dyn_cast<memref::LoadOp>(nested)) {
+        if (checkReads && getRootMemRef(mload.getMemRef()) == rootAlloc)
+          touches = true;
+      } else if (isa<hivm::CustomOp, func::CallOp>(nested)) {
+        for (Value operand : nested->getOperands()) {
+          if (getRootMemRef(operand) == rootAlloc)
+            touches = true;
+        }
+      }
+    });
+    if (touches)
+      return true;
+  }
+  return false;
+}
+
+static bool producerTreeReadsRoot(Operation *rootOp, Value rootAlloc,
+                                  Block *block) {
+  SmallVector<Value, 16> worklist;
+  for (Value operand : rootOp->getOperands())
+    worklist.push_back(operand);
+  llvm::SmallPtrSet<Value, 32> visited;
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    if (!visited.insert(v).second)
+      continue;
+    Operation *def = v.getDefiningOp();
+    if (!def)
+      continue;
+    if (auto tt = dyn_cast<bufferization::ToTensorOp>(def)) {
+      if (getRootMemRef(getToTensorBuffer(tt)) == rootAlloc)
+        return true;
+      continue;
+    }
+    if (def->getBlock() != block)
+      continue;
+    for (Value opnd : def->getOperands())
+      worklist.push_back(opnd);
+  }
+  return false;
+}
+
+// Sink to_buffer(scf.if) + hivm.copy -> #ub into each branch of scf.if so
+// branch-local splat fills and in-place UB elementwise updates can fold
+// directly into dst without allocating an scf.if result buffer.
+struct SinkUBStoreIntoIfPattern : public OpRewritePattern<hivm::CopyOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(hivm::CopyOp copyOp,
+                                PatternRewriter &rewriter) const override {
+    Value dst = copyOp.getDst();
+    auto dstTy = dyn_cast<MemRefType>(dst.getType());
+    if (!dstTy || !dstTy.hasStaticShape() ||
+        !isUBMemSpace(dstTy.getMemorySpace()))
+      return failure();
+
+    Operation *toBufferOp = copyOp.getSrc().getDefiningOp();
+    Value resTensor = getToBufferSourceTensor(toBufferOp);
+    if (!resTensor || !toBufferOp->hasOneUse() || !resTensor.hasOneUse())
+      return failure();
+
+    auto ifOp = resTensor.getDefiningOp<scf::IfOp>();
+    Block *block = copyOp->getBlock();
+    if (!ifOp || ifOp->getBlock() != block || ifOp.getNumResults() != 1 ||
+        ifOp.getElseRegion().empty())
+      return failure();
+
+    Value dstRoot = getRootMemRef(dst);
+    if (!dstRoot.getDefiningOp<memref::AllocOp>())
+      return failure();
+    if (hasInterveningMemoryOpOnRoot(ifOp, copyOp, dstRoot,
+                                     /*checkReads=*/true))
+      return failure();
+
+    DominanceInfo domInfo(copyOp->getParentOfType<FunctionOpInterface>());
+    if (!domInfo.properlyDominates(dst, ifOp)) {
+      auto dstSv = dst.getDefiningOp<memref::SubViewOp>();
+      if (!dstSv || dstSv->getBlock() != block)
+        return failure();
+      if (!llvm::all_of(dstSv->getOperands(), [&](Value v) {
+            return domInfo.properlyDominates(v, ifOp);
+          }))
+        return failure();
+      rewriter.moveOpBefore(dstSv, ifOp);
+    }
+
+    auto makeBranchStore = [&](Block &branchBlock) {
+      auto yieldOp = cast<scf::YieldOp>(branchBlock.getTerminator());
+      Value yielded = yieldOp.getOperand(0);
+      OpBuilder::InsertionGuard g(rewriter);
+      rewriter.setInsertionPoint(yieldOp);
+      Location loc = yieldOp.getLoc();
+      auto memTy = MemRefType::get(dstTy.getShape(), dstTy.getElementType());
+#ifndef __LLVM_MAJOR_VERSION_22_COMPATIBLE__
+      Value buf =
+          rewriter.create<bufferization::ToMemrefOp>(loc, memTy, yielded);
+#else
+      Value buf =
+          rewriter.create<bufferization::ToBufferOp>(loc, memTy, yielded);
+#endif
+      rewriter.create<hivm::CopyOp>(loc, TypeRange{}, buf, dst);
+      rewriter.replaceOpWithNewOp<scf::YieldOp>(yieldOp);
+    };
+
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(ifOp);
+    auto newIf = rewriter.create<scf::IfOp>(ifOp.getLoc(), TypeRange{},
+                                            ifOp.getCondition(),
+                                            /*withElseRegion=*/true);
+    rewriter.inlineRegionBefore(ifOp.getThenRegion(), newIf.getThenRegion(),
+                                newIf.getThenRegion().begin());
+    rewriter.eraseBlock(&newIf.getThenRegion().back());
+    rewriter.inlineRegionBefore(ifOp.getElseRegion(), newIf.getElseRegion(),
+                                newIf.getElseRegion().begin());
+    rewriter.eraseBlock(&newIf.getElseRegion().back());
+
+    makeBranchStore(newIf.getThenRegion().front());
+    makeBranchStore(newIf.getElseRegion().front());
+
+    rewriter.eraseOp(copyOp);
+    rewriter.eraseOp(toBufferOp);
+    rewriter.eraseOp(ifOp);
+    return success();
+  }
+};
+
+struct FoldInPlaceUBStorePattern : public OpRewritePattern<hivm::CopyOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(hivm::CopyOp copyOp,
+                                PatternRewriter &rewriter) const override {
+    Value dst = copyOp.getDst();
+    auto dstTy = dyn_cast<MemRefType>(dst.getType());
+    if (!dstTy || !dstTy.hasStaticShape() ||
+        !isUBMemSpace(dstTy.getMemorySpace()))
+      return failure();
+
+    Operation *toBufferOp = copyOp.getSrc().getDefiningOp();
+    Value resTensor = getToBufferSourceTensor(toBufferOp);
+    if (!resTensor || !toBufferOp->hasOneUse() || !resTensor.hasOneUse())
+      return failure();
+
+    auto resTy = dyn_cast<RankedTensorType>(resTensor.getType());
+    if (!resTy || !resTy.hasStaticShape())
+      return failure();
+
+    Operation *resDefOp = resTensor.getDefiningOp();
+    Block *block = copyOp->getBlock();
+    if (!resDefOp || resDefOp->getBlock() != block ||
+        !isRewritableUBStepOp(resDefOp, resTy))
+      return failure();
+
+    Value dstRoot = getRootMemRef(dst);
+    auto dstAlloc = dstRoot.getDefiningOp<memref::AllocOp>();
+    if (!dstAlloc)
+      return failure();
+
+    auto getStepInputs = [&](Operation *op) -> SmallVector<Value, 4> {
+      SmallVector<Value, 4> ins;
+      if (auto dpsOp = dyn_cast<DestinationStyleOpInterface>(op)) {
+        for (OpOperand *opnd : dpsOp.getDpsInputOperands())
+          ins.push_back(opnd->get());
+      } else {
+        for (Value v : op->getOperands())
+          ins.push_back(v);
+      }
+      return ins;
+    };
+
+    // Case A: In-place read-modify-write chain:
+    //   %t0 = to_tensor %dst -> elemwise_1 -> ... -> elemwise_k -> to_buffer
+    //   -> hivm.copy(..., %dst)
+    SmallVector<Operation *, 8> chain;
+    bufferization::ToTensorOp rootToTensor;
+    constexpr unsigned kMaxChainDepth = 16;
+
+    std::function<bool(Operation *, unsigned)> findInPlaceChain =
+        [&](Operation *op, unsigned depth) -> bool {
+      if (depth >= kMaxChainDepth || !op || op->getBlock() != block ||
+          !isRewritableUBStepOp(op, resTy))
+        return false;
+      for (Value inVal : getStepInputs(op)) {
+        if (!inVal.hasOneUse())
+          continue;
+        if (auto tt = inVal.getDefiningOp<bufferization::ToTensorOp>()) {
+          if (tt->getBlock() == block &&
+              areEquivalentMemRefs(getToTensorBuffer(tt), dst) &&
+              !hasInterveningMemoryOpOnRoot(tt, copyOp, dstRoot,
+                                            /*checkReads=*/false)) {
+            rootToTensor = tt;
+            chain.push_back(op);
+            return true;
+          }
+        } else if (Operation *pred = inVal.getDefiningOp()) {
+          if (findInPlaceChain(pred, depth + 1)) {
+            chain.push_back(op);
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+
+    if (findInPlaceChain(resDefOp, 0)) {
+      rewriter.modifyOpInPlace(rootToTensor, [&]() {
+        rootToTensor.setRestrict(true);
+        rootToTensor.setWritable(true);
+      });
+      Value prevVal = rootToTensor.getResult();
+      for (Operation *stepOp : chain) {
+        if (isElementwiseDPSWithEmptyOut(stepOp, resTy)) {
+          auto dpsOp = cast<DestinationStyleOpInterface>(stepOp);
+          OpOperand *initOpnd = dpsOp.getDpsInitOperand(0);
+          Operation *oldEmpty = initOpnd->get().getDefiningOp();
+          rewriter.modifyOpInPlace(stepOp, [&]() { initOpnd->set(prevVal); });
+          if (oldEmpty && oldEmpty->use_empty())
+            rewriter.eraseOp(oldEmpty);
+          prevVal = stepOp->getResult(0);
+        } else {
+          Value replaced = rewriteArithMathToHIVMDPS(stepOp, prevVal, rewriter);
+          rewriter.replaceOp(stepOp, replaced);
+          prevVal = replaced;
+        }
+      }
+      rewriter.create<bufferization::MaterializeInDestinationOp>(
+          copyOp.getLoc(), Type{}, prevVal, dst, /*restrict=*/true,
+          /*writable=*/true);
+      rewriter.eraseOp(copyOp);
+      rewriter.eraseOp(toBufferOp);
+      return success();
+    }
+
+    // Case B: Non-aliasing direct DPS write into %dst (e.g. computing a fresh
+    // tile and storing directly into a UB buffer/subview without reading it).
+    if (hasInterveningMemoryOpOnRoot(resDefOp, copyOp, dstRoot,
+                                     /*checkReads=*/true) ||
+        producerTreeReadsRoot(resDefOp, dstRoot, block))
+      return failure();
+
+    DominanceInfo domInfo(copyOp->getParentOfType<FunctionOpInterface>());
+    if (!domInfo.properlyDominates(dst, resDefOp)) {
+      auto dstSv = dst.getDefiningOp<memref::SubViewOp>();
+      if (!dstSv || dstSv->getBlock() != block)
+        return failure();
+      if (!llvm::all_of(dstSv->getOperands(), [&](Value v) {
+            return domInfo.properlyDominates(v, resDefOp);
+          }))
+        return failure();
+      rewriter.moveOpBefore(dstSv, resDefOp);
+    }
+
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(resDefOp);
+    Value dstTensor = rewriter.create<bufferization::ToTensorOp>(
+        resDefOp->getLoc(), resTy, dst, /*restrict=*/true, /*writable=*/true);
+    Value finalVal;
+    if (isElementwiseDPSWithEmptyOut(resDefOp, resTy)) {
+      auto dpsOp = cast<DestinationStyleOpInterface>(resDefOp);
+      OpOperand *initOpnd = dpsOp.getDpsInitOperand(0);
+      Operation *oldEmpty = initOpnd->get().getDefiningOp();
+      rewriter.modifyOpInPlace(resDefOp, [&]() { initOpnd->set(dstTensor); });
+      if (oldEmpty && oldEmpty->use_empty())
+        rewriter.eraseOp(oldEmpty);
+      finalVal = resTensor;
+    } else {
+      finalVal = rewriteArithMathToHIVMDPS(resDefOp, dstTensor, rewriter);
+      rewriter.replaceOp(resDefOp, finalVal);
+    }
+
+    rewriter.setInsertionPoint(copyOp);
+    rewriter.create<bufferization::MaterializeInDestinationOp>(
+        copyOp.getLoc(), Type{}, finalVal, dst, /*restrict=*/true,
+        /*writable=*/true);
+    rewriter.eraseOp(copyOp);
+    rewriter.eraseOp(toBufferOp);
+    return success();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Rewrite pattern: isolate small non-unit-stride 1D GM stores into scalar
+// elementwise stores to prevent BiShengIR hivm-enable-stride-align from
+// back-propagating 32B inner-stride padding (e.g., strided<[8, 1]>) across
+// upstream UB reduction buffers.
+//===----------------------------------------------------------------------===//
+struct IsolateSmallStrided1DStorePattern
+    : public OpRewritePattern<bufferization::MaterializeInDestinationOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(bufferization::MaterializeInDestinationOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!isSafeForScalarizedVectorGMStore(op))
+      return failure();
+
+    auto srcTy = dyn_cast<RankedTensorType>(op.getSource().getType());
+    auto dstTy = dyn_cast<MemRefType>(op.getDest().getType());
+    if (!srcTy || !dstTy || srcTy.getRank() != 1 || dstTy.getRank() != 1)
+      return failure();
+    if (!srcTy.hasStaticShape() ||
+        !isDefaultOrGMMemSpace(dstTy.getMemorySpace()))
+      return failure();
+
+    int64_t numElems = srcTy.getDimSize(0);
+    constexpr int64_t kMaxScalarizedStridedStoreElems = 64;
+    if (numElems <= 0 || numElems > kMaxScalarizedStridedStoreElems)
+      return failure();
+
+    Type elemTy = srcTy.getElementType();
+    if (!elemTy.isIntOrFloat() || elemTy.getIntOrFloatBitWidth() < 8)
+      return failure();
+
+    SmallVector<int64_t> strides;
+    int64_t offset = 0;
+    if (failed(dstTy.getStridesAndOffset(strides, offset)) ||
+        strides.size() != 1 || strides[0] == 1)
+      return failure();
+
+    // Extract base memref, base offset, and element stride so each element can
+    // be stored via a unit-stride 1-element MTE3 DMA (copy_ub_to_gm) instead of
+    // a scalar GM store. Using MTE3 avoids non-coherent scalar D-cache false
+    // sharing across AIV sub-cores writing interleaved strided slots (e.g. S=2
+    // LSE), while keeping strides=[1] prevents hivm-enable-stride-align from
+    // propagating strided<[8, *]> padding onto upstream UB reduction buffers.
+    auto rcOp = op.getDest().getDefiningOp<memref::ReinterpretCastOp>();
+    if (!rcOp)
+      return failure();
+    SmallVector<OpFoldResult> mixedOffsets = rcOp.getMixedOffsets();
+    SmallVector<OpFoldResult> mixedStrides = rcOp.getMixedStrides();
+    if (mixedOffsets.size() != 1 || mixedStrides.size() != 1)
+      return failure();
+
+    Location loc = op.getLoc();
+    Value baseOff =
+        getValueOrCreateConstantIndexOp(rewriter, loc, mixedOffsets[0]);
+    Value strideVal =
+        getValueOrCreateConstantIndexOp(rewriter, loc, mixedStrides[0]);
+
+    auto ubSpace = hivm::AddressSpaceAttr::get(rewriter.getContext(),
+                                               hivm::AddressSpace::UB);
+    auto elemUbTy =
+        MemRefType::get({1}, elemTy, MemRefLayoutAttrInterface{}, ubSpace);
+    Value elemUb = rewriter.create<memref::AllocOp>(loc, elemUbTy);
+
+    auto unit1DLayout = StridedLayoutAttr::get(
+        rewriter.getContext(), ShapedType::kDynamic, ArrayRef<int64_t>{1});
+    auto gm1Ty =
+        MemRefType::get({1}, elemTy, unit1DLayout, dstTy.getMemorySpace());
+
+    Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    Value cN = rewriter.create<arith::ConstantIndexOp>(loc, numElems);
+    auto forOp = rewriter.create<scf::ForOp>(loc, c0, cN, c1);
+    rewriter.setInsertionPointToStart(forOp.getBody());
+    Value iv = forOp.getInductionVar();
+    Value val = rewriter.create<tensor::ExtractOp>(loc, op.getSource(), iv);
+    rewriter.create<memref::StoreOp>(loc, val, elemUb, ValueRange{c0});
+    Value delta = rewriter.create<arith::MulIOp>(loc, iv, strideVal);
+    Value elemOff = rewriter.create<arith::AddIOp>(loc, baseOff, delta);
+    Value gm1 = rewriter.create<memref::ReinterpretCastOp>(
+        loc, gm1Ty, rcOp.getSource(), OpFoldResult(elemOff),
+        SmallVector<OpFoldResult>{rewriter.getIndexAttr(1)},
+        SmallVector<OpFoldResult>{rewriter.getIndexAttr(1)});
+    rewriter.create<hivm::StoreOp>(loc, TypeRange{}, elemUb, gm1);
+
+    rewriter.eraseOp(op);
     return success();
   }
 };
@@ -1550,7 +2691,16 @@ void CommonIRToHIVMPass::runOnOperation() {
   module->walk([&](UnrealizedConversionCastOp c) { casts.push_back(c); });
   reconcileUnrealizedCasts(casts);
 
-  APPLY_REWRITE_PATTERN(FoldStagingCopyPattern);
+  APPLY_REWRITE_PATTERN(FoldStagingMemrefCopyPattern,
+                        FoldStagingHivmCopyPattern);
+  APPLY_REWRITE_PATTERN(FoldTensorExpandOfOnChipMemRef,
+                        FoldTensorCollapseOfOnChipMemRef,
+                        FoldBroadcastOfOnChipMemRef);
+  APPLY_REWRITE_PATTERN(DecomposeCube3DReshapePattern,
+                        DecomposeCube3DCollapsePattern);
+  APPLY_REWRITE_PATTERN(SinkUBStoreIntoIfPattern, FoldSplatStoreToUBPattern,
+                        FoldInPlaceUBStorePattern);
+  APPLY_REWRITE_PATTERN(IsolateSmallStrided1DStorePattern);
 }
 
 std::unique_ptr<OperationPass<ModuleOp>>

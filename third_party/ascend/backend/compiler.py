@@ -151,7 +151,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         ascend.passes.ttir.add_triton_to_annotation(pm)
         ascend.passes.ttir.add_triton_to_unstructure(pm, compile_on_910_95, force_simt_template)
         ascend.passes.ttir.add_triton_to_hivm(pm)
-        ascend.passes.ttir.add_triton_to_hfusion(pm)
+        ascend.passes.ttir.add_triton_to_hfusion(pm, compile_on_910_95)
         ascend.passes.ttir.add_triton_to_llvm(pm)
         ascend.passes.ttir.add_bubble_up_operation(pm)
         ascend.passes.ttir.add_triton_to_structure(pm, enable_mask_fallback_conversion, optimize_dynamic_offset)
@@ -373,6 +373,53 @@ def _parse_ttir_metadata(ttir: str, metadata: dict):
     return metadata
 
 
+@functools.lru_cache(maxsize=16)
+def _bishengir_supports_flag_cached(compiler_path: str, flag: str, ld_library_path: str) -> bool:
+    env = os.environ.copy()
+    if ld_library_path:
+        env["LD_LIBRARY_PATH"] = ld_library_path
+    try:
+        res = subprocess.run(
+            [compiler_path, "--help"],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        return flag in (res.stdout or "") or flag in (res.stderr or "")
+    except OSError:
+        return False
+
+
+def _run_bishengir_compile_with_ubuf_fallback(
+    cmd_list,
+    env,
+    npu_compiler_path: str,
+    enable_ubuf_saving,
+    opt,
+    tmpdir: str,
+    metadata_hash: str,
+):
+    try:
+        return subprocess.run(cmd_list, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    except subprocess.CalledProcessError as e:
+        err_text = ((e.stderr or b"") + (e.stdout or b"")).decode("utf-8", errors="ignore").lower()
+        ld_library_path = (env or {}).get("LD_LIBRARY_PATH", "")
+        if (enable_ubuf_saving is None and "ub overflow" in err_text and npu_compiler_path.endswith("bishengir-compile")
+                and _bishengir_supports_flag_cached(npu_compiler_path, "--enable-ubuf-saving", ld_library_path)):
+            retry_cmd = cmd_list + ["--enable-ubuf-saving=true"]
+            try:
+                return subprocess.run(retry_cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            except subprocess.CalledProcessError as retry_err:
+                if opt.debug:
+                    _save_npuir_debug_output(retry_err.stdout, retry_err.stderr, tmpdir, metadata_hash)
+                raise
+        if opt.debug:
+            _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata_hash)
+        raise
+
+
 def get_common_bishengir_compile_options(metadata):
     bishengir_target = metadata['target'].arch
     bishengir_target_opt = f"--target={bishengir_target}"
@@ -432,6 +479,18 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         disable_tightly_coupled_buffer_reuse = metadata["disable_tightly_coupled_buffer_reuse"]
         if disable_tightly_coupled_buffer_reuse:
             _compile_option_list += ["--disable-tightly-coupled-buffer-reuse"]
+
+        enable_ubuf_saving = metadata.get("enable_ubuf_saving")
+        if enable_ubuf_saving is not None:
+            _compile_option_list += [
+                f"--enable-ubuf-saving={enable_ubuf_saving}",
+            ]
+
+        multibuffer_mode = metadata.get("multibuffer_mode")
+        if multibuffer_mode is not None:
+            _compile_option_list += [
+                f"--multibuffer-mode={multibuffer_mode}",
+            ]
 
         _compile_option_list += [
             f"--enable-auto-bind-sub-block={get_auto_bind_sub_block_option(metadata)}",
@@ -589,12 +648,15 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if opt.debug:
             print(f"[DEBUG] cmd_list: {' '.join(cmd_list)}")
 
-        try:
-            ret = subprocess.run(cmd_list, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-        except subprocess.CalledProcessError as e:
-            if opt.debug:
-                _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
-            raise
+        ret = _run_bishengir_compile_with_ubuf_fallback(
+            cmd_list,
+            env,
+            npu_compiler_path,
+            enable_ubuf_saving,
+            opt,
+            tmpdir,
+            metadata["hash"],
+        )
 
         if opt.debug:
             _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
@@ -688,6 +750,12 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
         if enable_ubuf_saving is not None:
             _compile_option_list += [
                 f"--enable-ubuf-saving={enable_ubuf_saving}",
+            ]
+
+        multibuffer_mode = metadata.get("multibuffer_mode")
+        if multibuffer_mode is not None:
+            _compile_option_list += [
+                f"--multibuffer-mode={multibuffer_mode}",
             ]
 
         enable_preload = metadata["enable_preload"]
@@ -832,12 +900,15 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
         import shutil
         shutil.copy2(ttadapter_path, "/tmp/debug_kernel_input.mlir")
 
-        try:
-            ret = subprocess.run(cmd_list, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-        except subprocess.CalledProcessError as e:
-            if opt.debug:
-                _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
-            raise
+        ret = _run_bishengir_compile_with_ubuf_fallback(
+            cmd_list,
+            env,
+            npu_compiler_path,
+            enable_ubuf_saving,
+            opt,
+            tmpdir,
+            metadata["hash"],
+        )
 
         if opt.debug:
             _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
@@ -946,6 +1017,7 @@ class NPUOptions:
     disable_size_align_for_cast: bool = None
     limit_auto_multi_buffer_only_for_local_buffer: bool = None
     limit_auto_multi_buffer_of_local_buffer: str = None
+    multibuffer_mode: str = None
     set_workspace_multibuffer: int = None
     tile_mix_vector_loop: int = None
     tile_mix_cube_loop: int = None

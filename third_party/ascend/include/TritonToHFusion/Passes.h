@@ -31,8 +31,13 @@ class ModuleOp;
 
 namespace triton {
 
+#define GEN_PASS_DECL_TRITONTOHFUSION
+#include "ascend/include/TritonToHFusion/Passes.h.inc"
+
 /// Creates a pass to convert Triton dialect to HFusion dialect.
 std::unique_ptr<OperationPass<ModuleOp>> createTritonToHFusionPass();
+std::unique_ptr<OperationPass<ModuleOp>>
+createTritonToHFusionPass(const TritonToHFusionOptions &options);
 
 #define GEN_PASS_REGISTRATION
 #include "ascend/include/TritonToHFusion/Passes.h.inc"
