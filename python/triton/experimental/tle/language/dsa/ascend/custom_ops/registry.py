@@ -7,6 +7,7 @@ import triton.language.extra.cann.extension as al
 CUSTOM_OPS_BITCODE = str(Path(__file__).with_name("custom_ops.bc").resolve())
 
 _GATHER_SUFFIX_BY_DTYPE = {tl.float16: "half", tl.bfloat16: "bf16"}
+_GATHER_L1_SUFFIX_BY_DTYPE = {**_GATHER_SUFFIX_BY_DTYPE, tl.int8: "s8"}
 
 
 def _element_dtype(value):
@@ -18,10 +19,11 @@ def _element_dtype(value):
     return dtype
 
 
-def _gather_dtype_suffix(value, op_name):
+def _gather_dtype_suffix(value, op_name, table=_GATHER_SUFFIX_BY_DTYPE):
     dtype = _element_dtype(value)
-    suffix = _GATHER_SUFFIX_BY_DTYPE.get(dtype)
-    assert suffix is not None, (f"{op_name} only supports fp16/bf16, got {dtype}")
+    suffix = table.get(dtype)
+    assert suffix is not None, (f"{op_name} only supports "
+                                f"{'/'.join(str(d) for d in table)}, got {dtype}")
     return suffix
 
 
@@ -105,7 +107,8 @@ class gather_gm_to_l1:
             f"to match src dtype ({_element_dtype(src)})")
         assert _element_dtype(index) == tl.int32, (f"gather_gm_to_l1 requires int32 index, "
                                                    f"got {_element_dtype(index)}")
-        self.symbol = ("custom_gather_gm_to_l1_" + _gather_dtype_suffix(src, "gather_gm_to_l1"))
+        self.symbol = ("custom_gather_gm_to_l1_" +
+                       _gather_dtype_suffix(src, "gather_gm_to_l1", _GATHER_L1_SUFFIX_BY_DTYPE))
         self.bitcode = CUSTOM_OPS_BITCODE
 
 
@@ -684,4 +687,34 @@ class cast_int4_to_fp16:
         self.arg_type["roundMode"] = tl.int32
         self.arg_type["count"] = tl.int32
         self.symbol = "custom_cast_int4_to_fp16"
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
+@al.register_custom_op
+class cast_fp16_to_int8_rint:
+    """Round-to-nearest-even saturating FP16 -> INT8 conversion on a 1D UB tensor.
+
+    Wraps `vconv_f162s8r` in element-count mask mode (dst/src repeat strides
+    4/8). src: float16[N] in UB, N a multiple of 32 in [32, 32640]. Required
+    out: int8[N] in UB. Inputs and outputs must be contiguous, 32-byte aligned
+    and disjoint. Pipeline barriers remain the caller's responsibility.
+    """
+
+    core = al.CORE.VECTOR
+    pipe = al.PIPE.PIPE_V
+    mode = al.MODE.SIMD
+
+    def __init__(self, src, count, out=None):
+        assert out is not None, "cast_fp16_to_int8_rint requires an output buffer"
+        assert src.dtype == tl.float16 and len(
+            src.shape) == 1, ("cast_fp16_to_int8_rint requires a 1D float16 UB source")
+        size = src.numel.value
+        assert size % 32 == 0 and 32 <= size <= 32640, (
+            f"cast_fp16_to_int8_rint requires a 32-element-aligned count in [32, 32640], got {size}")
+        assert isinstance(count,
+                          int) and count == size, (f"cast_fp16_to_int8_rint count must equal the source size ({size})")
+        assert out.dtype == tl.int8 and len(out.shape) == 1 and out.numel.value == count, (
+            "cast_fp16_to_int8_rint requires a 1D int8 output matching count")
+        self.arg_type["count"] = tl.uint32
+        self.symbol = "custom_cast_fp16_to_int8_rint"
         self.bitcode = CUSTOM_OPS_BITCODE
