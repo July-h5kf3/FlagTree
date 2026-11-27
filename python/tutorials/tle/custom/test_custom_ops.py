@@ -1310,6 +1310,35 @@ def test_paged_int8_prob_update():
           f"triton/custom {triton_vec_ms / custom_vec_ms:.2f}x")
 
 
+def test_paged_int8_registration():
+    from triton.experimental.tle.language.dsa.ascend.custom_ops import registry as reg
+
+    # Valid configurations succeed.
+    reg.paged_int8_qk(16, 0, 0, 0, 0, 0, 0, 0, 6, 1, 0, 8)
+    reg.paged_int8_qk(128, 0, 0, 0, 0, 0, 0, 0, 6, 1, 0, 32)
+    reg.paged_int8_pv(64, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1)
+    reg.paged_int8_prob(128, 1, 0, 0, 0, 0, 0, 0, 0, 0, 384, 0, 1, 0.04, 32, 0)
+    reg.paged_int8_update(128, 0, 0, 0, 0, 1, 0, 1, 0, 32, 0)
+
+    # Invalid m, flags, phase, or head_stride are rejected at compile time.
+    bad_calls = [
+        lambda: reg.paged_int8_qk(48, 0, 0, 0, 0, 0, 0, 0, 6, 1, 0, 16),
+        lambda: reg.paged_int8_qk(64, 0, 0, 0, 0, 0, 0, 0, 6, 2, 0, 16),
+        lambda: reg.paged_int8_qk(64, 0, 0, 0, 0, 0, 0, 0, 6, 1, 0, 8),
+        lambda: reg.paged_int8_pv(96, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1),
+        lambda: reg.paged_int8_pv(64, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1),
+        lambda: reg.paged_int8_prob(64, 2, 0, 0, 0, 0, 0, 0, 0, 0, 384, 1, 0, 0.04, 16, 0),
+        lambda: reg.paged_int8_update(64, 0, 0, 0, 0, 0, 0, 1, 2, 16, 0),
+    ]
+    for call in bad_calls:
+        try:
+            call()
+        except AssertionError:
+            continue
+        raise AssertionError("Expected paged_int8 registration check to fail")
+    print("[PASS] paged_int8 registration validation (7 invalid configs rejected)")
+
+
 def main():
     from test_cast_ops import main as test_cast_ops
     from test_compare_scalar import main as test_compare_scalar
@@ -1318,6 +1347,7 @@ def main():
         test_gather_gm_to_l1(torch_dtype, tol)
         if torch_dtype != torch.int8:
             test_gather_gm_to_ub(torch_dtype)
+    test_paged_int8_registration()
     test_paged_int8_qk_pv()
     test_paged_int8_prob_update()
     test_sort_1d_pack()

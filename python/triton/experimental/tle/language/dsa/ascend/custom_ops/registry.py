@@ -721,11 +721,47 @@ class cast_fp16_to_int8_rint:
         self.bitcode = CUSTOM_OPS_BITCODE
 
 
+_PAGED_INT8_VALID_M = (16, 32, 64, 128)
+
+
+def _validate_paged_int8_m(m, op_name):
+    assert isinstance(
+        m, int) and m in _PAGED_INT8_VALID_M, (f"{op_name} requires compile-time m in {_PAGED_INT8_VALID_M}, got {m}")
+
+
+def _validate_paged_int8_flag(value, name, op_name):
+    if isinstance(value, int):
+        assert value in (0, 1), f"{op_name} requires {name} in (0, 1), got {value}"
+
+
+def _validate_paged_int8_head_stride(m, head_stride, op_name):
+    if isinstance(head_stride, int):
+        min_stride = 8 if m == 16 else m // 4
+        assert head_stride >= min_stride, (
+            f"{op_name} requires head_stride >= {min_stride} for m={m}, got {head_stride}")
+
+
 @al.register_custom_op
 class paged_int8_qk:
     """Paged 6-page (384-token) QK MMA over INT8 content (D=512 -> INT32) and
     BF16 RoPE (D=64 -> FP32), keeping the gathered 128x512 NZ content tiles
     resident in L1 slot `slot` for the paired `paged_int8_pv` call.
+
+    On-chip resource and state contract (Ascend910B / dav-c220):
+      - Exclusive Cube L1 ownership (512 KiB): M <= 64 uses Q [0..32K),
+        QR [32K..40K), 2x3 KV pairs [40K..424K), KR [424K..472K), P [472K..496K);
+        M == 128 uses Q [0..64K), QR [64K..80K), 2x3 KV pairs [80K..464K),
+        and KR/P aliased at [464K..512K). Callers must not mix other TLE L1/L0
+        allocations on the Cube core while a window pipeline is active.
+      - Cross-call Event state: `first == 1` initializes L0/L1 pipeline flags
+        (`EVENT_ID0/1` MTE1<->M & FIX<->M, `EVENT_ID3/4/5` page-pair ready,
+        `EVENT_ID0` MTE1->MTE2 KR/P handoff) and prefetches slot 0; subsequent
+        windows (`first == 0`) consume pairs prefetched by `paged_int8_pv` on
+        the paired slot. Every `paged_int8_qk` must pair with `paged_int8_pv`
+        and terminate a request with `last == 1` on `paged_int8_pv`.
+      - Side effects: lowers to `hivm.hir.custom` without `no_side_effect`,
+        carrying both Read and Write on `DefaultResource` so DCE/CSE/LICM and
+        instruction scheduling preserve cross-call ordering.
     """
 
     core = al.CORE.CUBE
@@ -747,6 +783,10 @@ class paged_int8_qk:
         slot: tl.uint32,
         head_stride: tl.uint32,
     ):
+        _validate_paged_int8_m(m, "paged_int8_qk")
+        _validate_paged_int8_flag(first, "first", "paged_int8_qk")
+        _validate_paged_int8_flag(slot, "slot", "paged_int8_qk")
+        _validate_paged_int8_head_stride(m, head_stride, "paged_int8_qk")
         self.symbol = "custom_paged_int8_qk"
         self.bitcode = CUSTOM_OPS_BITCODE
 
@@ -756,6 +796,20 @@ class paged_int8_pv:
     """Adaptive shifted-8-bit (`P_hi @ V + 128 * sum(V)`) or two-digit
     (`P_hi @ V + 128 * sum(V) + P_lo @ V / 127`) PV MMA against the 384x512 NZ
     value tiles left resident in L1 slot `slot` by `paged_int8_qk`.
+
+    On-chip resource and state contract (Ascend910B / dav-c220):
+      - Consumes the resident L1 KV tiles in `slot` written by `paged_int8_qk`
+        and waits on `EVENT_ID0` (MTE1->MTE2) before loading `P_hi`/`P_lo` or
+        `ones_gm` into `kProbBase`/`kProbBase128`.
+      - When `remaining > 0`, refills the 3 page pairs for window `group + 2`
+        into `slot` during the final PV column and signals `EVENT_ID3/4/5`
+        (MTE2->MTE1) for the next `paged_int8_qk`; when `last == 1`, drains
+        all Cube pipelines (`pipe_barrier(PIPE_ALL)`) before returning.
+      - For `M >= 64`, Fixpipe `DEQF16` uses a single fixed scale (`1/16384`)
+        across `vsum`, `PV_hi`, and `PV_lo` to avoid mid-flight `QUANT_PRE`
+        hazards.
+      - Side effects: lowers to `hivm.hir.custom` with Read+Write on
+        `DefaultResource`.
     """
 
     core = al.CORE.CUBE
@@ -776,6 +830,9 @@ class paged_int8_pv:
         remaining: tl.uint32,
         last: tl.uint32,
     ):
+        _validate_paged_int8_m(m, "paged_int8_pv")
+        _validate_paged_int8_flag(slot, "slot", "paged_int8_pv")
+        _validate_paged_int8_flag(last, "last", "paged_int8_pv")
         self.symbol = "custom_paged_int8_pv"
         self.bitcode = CUSTOM_OPS_BITCODE
 
@@ -785,6 +842,19 @@ class paged_int8_prob:
     """Online softmax and adaptive shifted-8-bit (`P_hi`) / residual INT8
     (`P_lo`) probability quantization over a 384-token paged KV window on
     Ascend Vector cores (`M` in {16, 32, 64, 128}).
+
+    On-chip resource and state contract (Ascend910B / dav-c220):
+      - Exclusive Vector UB ownership (192 KiB): holds persistent running
+        accumulator (`kAccum`), ping-pong `sum`/`max`/`alpha`/`step` vectors,
+        and `need_lo_mask` across windows for the paired `paged_int8_update`.
+        Callers must not interleave other TLE UB tensor allocations on the
+        Vector core between `first == 1` and `paged_int8_update(..., last=1)`.
+      - Must be invoked in order `phase = 0` then `phase = 1` per window. On
+        `first == 0`, prefetches tile 0 of `prior_pv` and signals `EVENT_ID5`
+        (MTE2->V) to be consumed by the immediately following
+        `paged_int8_update`.
+      - Side effects: lowers to `hivm.hir.custom` with Read+Write on
+        `DefaultResource`.
     """
 
     core = al.CORE.VECTOR
@@ -810,15 +880,32 @@ class paged_int8_prob:
         head_stride: tl.uint32,
         causal_pair: tl.uint32,
     ):
+        _validate_paged_int8_m(m, "paged_int8_prob")
+        _validate_paged_int8_flag(phase, "phase", "paged_int8_prob")
+        _validate_paged_int8_flag(first, "first", "paged_int8_prob")
+        _validate_paged_int8_flag(slot, "slot", "paged_int8_prob")
+        _validate_paged_int8_flag(causal_pair, "causal_pair", "paged_int8_prob")
+        _validate_paged_int8_head_stride(m, head_stride, "paged_int8_prob")
         self.symbol = "custom_paged_int8_prob"
         self.bitcode = CUSTOM_OPS_BITCODE
 
 
 @al.register_custom_op
 class paged_int8_update:
-    """Adaptive shifted-8-bit / residual INT8 PV rescaling, online FP32
-    accumulator update, and final BF16 output + FP32 logsumexp writeback on
-    Ascend Vector cores (`M` in {16, 32, 64, 128}).
+    """Adaptive shifted-8-bit / residual INT8 PV rescaling, online accumulator
+    update (FP32 for `M <= 32`, running-normalized FP16 for `M >= 64`), and
+    final BF16 output + FP32 logsumexp writeback on Ascend Vector cores
+    (`M` in {16, 32, 64, 128}).
+
+    On-chip resource and state contract (Ascend910B / dav-c220):
+      - Consumes the persistent UB state (`kAccum`, `kSumBase`, `kMaxBase`,
+        `kAlphaBase`, `kStepBase`, `kNeedLoBase`) written by `paged_int8_prob`
+        for `slot`. When `last == 0` and `empty == 0`, waits on `EVENT_ID5`
+        (MTE2->V) for the tile-0 `pv` prefetch issued by `paged_int8_prob`.
+      - When `last == 1` or `empty == 1`, writes final BF16 `out` and FP32
+        `lse` to GM and drains Vector pipelines (`pipe_barrier(PIPE_ALL)`).
+      - Side effects: lowers to `hivm.hir.custom` with Read+Write on
+        `DefaultResource`.
     """
 
     core = al.CORE.VECTOR
@@ -839,5 +926,12 @@ class paged_int8_update:
         head_stride: tl.uint32,
         first_empty: tl.uint32,
     ):
+        _validate_paged_int8_m(m, "paged_int8_update")
+        _validate_paged_int8_flag(slot, "slot", "paged_int8_update")
+        _validate_paged_int8_flag(first, "first", "paged_int8_update")
+        _validate_paged_int8_flag(last, "last", "paged_int8_update")
+        _validate_paged_int8_flag(empty, "empty", "paged_int8_update")
+        _validate_paged_int8_flag(first_empty, "first_empty", "paged_int8_update")
+        _validate_paged_int8_head_stride(m, head_stride, "paged_int8_update")
         self.symbol = "custom_paged_int8_update"
         self.bitcode = CUSTOM_OPS_BITCODE

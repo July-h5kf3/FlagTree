@@ -23,6 +23,9 @@ constexpr uint32_t kQrBase = 32768;
 constexpr uint32_t kKeyBase = 40960;
 constexpr uint32_t kKrBase = kKeyBase + 6 * 65536;
 constexpr uint32_t kProbBase = kKrBase + 3 * 16384;
+static_assert(kQueryBase + 64 * 512 == kQrBase);
+static_assert(kQrBase + 64 * 64 * 2 == kKeyBase);
+static_assert(kProbBase + 64 * 384 <= 512 * 1024);
 
 // Double-buffered 6-page (384-token) KV layout in 512 KiB L1 for `M == 128`.
 // `kProbBase128` aliases `kKrBase128` (48 KiB) once `paged_int8_qk` finishes
@@ -33,6 +36,9 @@ constexpr uint32_t kQrBase128 = 65536;
 constexpr uint32_t kKeyBase128 = 81920;
 constexpr uint32_t kKrBase128 = kKeyBase128 + 6 * 65536;
 constexpr uint32_t kProbBase128 = kKrBase128;
+static_assert(kQueryBase128 + 128 * 512 == kQrBase128);
+static_assert(kQrBase128 + 128 * 64 * 2 == kKeyBase128);
+static_assert(kProbBase128 + 128 * 384 <= 512 * 1024);
 
 template <typename T>
 __aicore__ __attribute__((always_inline)) __cbuf__ T *l1_ptr(uint32_t bytes) {
