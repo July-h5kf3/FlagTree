@@ -688,6 +688,7 @@ def test_duplicate():
 
 def main():
     from test_cast_ops import main as test_cast_ops
+    from test_cube_and_softmax_ops import main as test_cube_and_softmax_ops
     from test_compare_scalar import main as test_compare_scalar
 
     for torch_dtype, tol in ((torch.float16, 1e-3), (torch.bfloat16, 1e-2), (torch.int8, 0)):
@@ -699,6 +700,7 @@ def main():
     test_unpack_sort()
     test_compare_scalar()
     test_cast_ops()
+    test_cube_and_softmax_ops()
     test_sort32()
     test_mrgsort()
     test_gather_mask()

@@ -32,6 +32,9 @@ set(ASCEND_CUSTOM_OPS_BC_DIR "${CMAKE_CURRENT_BINARY_DIR}/ascend_custom_ops")
 set(ASCEND_CUSTOM_OPS
   "mem_ops/duplicate.cpp::dav-c220-vec"
   "mem_ops/gather_gm_to_l1.cpp::dav-c220-cube"
+  "mem_ops/nd2nz_gm_to_l1.cpp::dav-c220-cube"
+  "mem_ops/gather_blocks_gm_to_l1.cpp::dav-c220-cube"
+  "mma_ops/matmul_l1_to_gm.cpp::dav-c220-cube"
   "mem_ops/gather_gm_to_ub.cpp::dav-c220-vec"
   "mem_ops/gather_mask.cpp::dav-c220-vec"
   "reduction_ops/pair_reduce_sum.cpp::dav-c220-vec"
@@ -44,6 +47,7 @@ set(ASCEND_CUSTOM_OPS
   "cast_ops/cast_int4_to_fp16.cpp::dav-c220-vec"
   "cast_ops/cast_fp16_to_int8_rint.cpp::dav-c220-vec"
   "vec_ops/flip.cpp::dav-c220-vec"
+  "vec_ops/online_softmax_quant_s8.cpp::dav-c220-vec"
 )
 
 set(SORT_OPS_DIR "${ASCEND_CUSTOM_OPS_DIR}/sort_ops")

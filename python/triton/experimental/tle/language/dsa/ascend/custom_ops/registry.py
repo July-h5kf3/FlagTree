@@ -718,3 +718,268 @@ class cast_fp16_to_int8_rint:
         self.arg_type["count"] = tl.uint32
         self.symbol = "custom_cast_fp16_to_int8_rint"
         self.bitcode = CUSTOM_OPS_BITCODE
+
+
+_L1_DTYPE_ELEM_BYTES = {tl.int8: 1, tl.float16: 2, tl.bfloat16: 2}
+_MATMUL_L1_SUFFIX_BY_DTYPE = {
+    tl.int8: "s8_s32",
+    tl.float16: "f16_f32",
+    tl.bfloat16: "bf16_f32",
+}
+
+
+def _validate_l1_zn_matrix(tensor, op_name, arg_name):
+    dtype = _element_dtype(tensor)
+    elem_bytes = _L1_DTYPE_ELEM_BYTES.get(dtype)
+    assert elem_bytes is not None, (f"{op_name} {arg_name} only supports int8/float16/bfloat16, got {dtype}")
+    assert len(tensor.shape) == 2, (f"{op_name} requires a 2D {arg_name} L1 tensor, got shape {tensor.shape}")
+    rows, cols = tensor.shape[0].value, tensor.shape[1].value
+    c0 = 32 // elem_bytes
+    assert rows > 0 and rows % 16 == 0, (f"{op_name} {arg_name} rows must be a positive multiple of 16, got {rows}")
+    assert cols > 0 and cols % c0 == 0, (f"{op_name} {arg_name} cols must be a positive multiple of {c0}, got {cols}")
+    return dtype, elem_bytes, rows, cols
+
+
+@al.register_custom_op
+class nd2nz_gm_to_l1:
+    """Copy a 2D GM matrix into a compiler-allocated L1/CBUF buffer in ZN layout.
+
+    Supports int8, float16, and bfloat16 with arbitrary row stride `src_stride`.
+    Uses `pipe=PIPE_MTE1` so BiShengIR allocates `out` in L1 (`#cbuf`).
+    """
+
+    core = al.CORE.CUBE
+    pipe = al.PIPE.PIPE_MTE1
+    mode = al.MODE.SIMD
+
+    def __init__(
+        self,
+        src_gm: tl.uint64,
+        rows: tl.uint32,
+        cols: tl.uint32,
+        src_stride: tl.uint32,
+        out=None,
+    ):
+        assert out is not None, "nd2nz_gm_to_l1 requires an L1 output tensor"
+        dtype, _, out_rows, out_cols = _validate_l1_zn_matrix(out, "nd2nz_gm_to_l1", "out")
+        if isinstance(rows, int):
+            assert rows == out_rows, (f"nd2nz_gm_to_l1 rows ({rows}) must match out.shape[0] ({out_rows})")
+        if isinstance(cols, int):
+            assert cols == out_cols, (f"nd2nz_gm_to_l1 cols ({cols}) must match out.shape[1] ({out_cols})")
+        if isinstance(src_stride, int):
+            assert src_stride >= out_cols, (f"nd2nz_gm_to_l1 src_stride ({src_stride}) must be >= cols ({out_cols})")
+        self.symbol = ("custom_nd2nz_gm_to_l1_" +
+                       _gather_dtype_suffix(out, "nd2nz_gm_to_l1", _GATHER_L1_SUFFIX_BY_DTYPE))
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
+@al.register_custom_op
+class gather_blocks_gm_to_l1:
+    """Gather `num_blocks` contiguous `[block_rows, cols]` GM blocks into L1 ZN.
+
+    Block IDs are read from `block_ids_gm` (int32, clamped to `[0, valid_blocks - 1]`),
+    issuing one ND2NZ DMA per block into a canonical `[num_blocks * block_rows, cols]`
+    ZN layout in a compiler-allocated L1 buffer (`#cbuf`).
+    """
+
+    core = al.CORE.CUBE
+    pipe = al.PIPE.PIPE_MTE1
+    mode = al.MODE.SIMD
+
+    def __init__(
+        self,
+        src_gm: tl.uint64,
+        block_ids_gm: tl.uint64,
+        num_blocks: tl.uint32,
+        valid_blocks: tl.uint32,
+        block_rows: tl.uint32,
+        cols: tl.uint32,
+        src_block_stride: tl.uint32,
+        out=None,
+    ):
+        assert out is not None, "gather_blocks_gm_to_l1 requires an L1 output tensor"
+        _, _, out_rows, out_cols = _validate_l1_zn_matrix(out, "gather_blocks_gm_to_l1", "out")
+        if isinstance(block_rows, int):
+            assert block_rows > 0 and block_rows % 16 == 0, (
+                f"gather_blocks_gm_to_l1 block_rows must be a positive multiple of 16, got {block_rows}")
+        if isinstance(num_blocks, int) and isinstance(block_rows, int):
+            assert num_blocks > 0 and num_blocks * block_rows == out_rows, (
+                f"gather_blocks_gm_to_l1 num_blocks * block_rows ({num_blocks * block_rows}) "
+                f"must match out.shape[0] ({out_rows})")
+        if isinstance(cols, int):
+            assert cols == out_cols, (f"gather_blocks_gm_to_l1 cols ({cols}) must match out.shape[1] ({out_cols})")
+        self.symbol = ("custom_gather_blocks_gm_to_l1_" +
+                       _gather_dtype_suffix(out, "gather_blocks_gm_to_l1", _GATHER_L1_SUFFIX_BY_DTYPE))
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
+def _validate_matmul_l1_to_gm_args(op_name, lhs, rhs, m, n, k, dst_stride, trans_b, require_int8=False):
+    lhs_dtype, elem_bytes, lhs_r, lhs_c = _validate_l1_zn_matrix(lhs, op_name, "lhs")
+    rhs_dtype, _, rhs_r, rhs_c = _validate_l1_zn_matrix(rhs, op_name, "rhs")
+    assert lhs_dtype == rhs_dtype, (f"{op_name} requires matching lhs ({lhs_dtype}) and rhs ({rhs_dtype}) dtypes")
+    if require_int8:
+        assert lhs_dtype == tl.int8, (f"{op_name} requires int8 inputs, got {lhs_dtype}")
+    c0 = 32 // elem_bytes
+    if isinstance(m, int):
+        assert m > 0 and m % 16 == 0 and m == lhs_r, (
+            f"{op_name} m ({m}) must be a positive multiple of 16 matching lhs.shape[0] ({lhs_r})")
+    if isinstance(k, int):
+        assert k > 0 and k % c0 == 0 and k == lhs_c, (
+            f"{op_name} k ({k}) must be a positive multiple of {c0} matching lhs.shape[1] ({lhs_c})")
+    if isinstance(n, int):
+        assert n > 0 and n % 16 == 0, (f"{op_name} n ({n}) must be a positive multiple of 16, got {n}")
+    if isinstance(dst_stride, int) and isinstance(n, int):
+        assert dst_stride >= n, (f"{op_name} dst_stride ({dst_stride}) must be >= n ({n})")
+    if isinstance(trans_b, int):
+        assert trans_b in (0, 1), f"{op_name} trans_b must be 0 or 1, got {trans_b}"
+        if trans_b == 1:
+            if isinstance(n, int):
+                assert rhs_r == n, (f"{op_name} trans_b=1 requires rhs.shape[0] ({rhs_r}) == n ({n})")
+            if isinstance(k, int):
+                assert rhs_c == k, (f"{op_name} trans_b=1 requires rhs.shape[1] ({rhs_c}) == k ({k})")
+        else:
+            if isinstance(k, int):
+                assert rhs_r == k, (f"{op_name} trans_b=0 requires rhs.shape[0] ({rhs_r}) == k ({k})")
+            if isinstance(n, int):
+                assert rhs_c == n, (f"{op_name} trans_b=0 requires rhs.shape[1] ({rhs_c}) == n ({n})")
+                if lhs_dtype == tl.int8:
+                    assert n % 32 == 0, (f"{op_name} int8 trans_b=0 requires n to be a multiple of 32, got {n}")
+    return lhs_dtype
+
+
+@al.register_custom_op
+class matmul_l1_to_gm:
+    """General L1-ZN x L1-ZN -> GM matrix multiplication (int8->int32, fp16/bf16->fp32).
+
+    Consumes two compiler-allocated L1 ZN tensors (as produced by `nd2nz_gm_to_l1`
+    or `gather_blocks_gm_to_l1`) and writes the `[m, n]` product directly to GM
+    `out_gm` with row stride `dst_stride`. Supports `trans_b` in `{0, 1}` so the
+    same L1 ZN buffer can be reused across both transposed and non-transposed
+    matmuls without GM reloads.
+    """
+
+    core = al.CORE.CUBE
+    pipe = al.PIPE.PIPE_M
+    mode = al.MODE.SIMD
+
+    def __init__(
+        self,
+        lhs,
+        rhs,
+        out_gm: tl.uint64,
+        m: tl.uint32,
+        n: tl.uint32,
+        k: tl.uint32,
+        dst_stride: tl.uint32,
+        trans_b: tl.uint32,
+    ):
+        lhs_dtype = _validate_matmul_l1_to_gm_args("matmul_l1_to_gm", lhs, rhs, m, n, k, dst_stride, trans_b)
+        self.symbol = ("custom_matmul_l1_to_gm_" + _MATMUL_L1_SUFFIX_BY_DTYPE[lhs_dtype])
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
+@al.register_custom_op
+class matmul_l1_to_gm_deqf16:
+    """General INT8 L1-ZN x L1-ZN -> FP16 GM matmul with Fixpipe DEQF16 scaling.
+
+    Accumulates `int8 x int8 -> int32` in L0C and dequantizes directly to FP16
+    in GM via hardware Fixpipe `DEQF16` (`out = (lhs @ rhs) * deq_scale`).
+    """
+
+    core = al.CORE.CUBE
+    pipe = al.PIPE.PIPE_M
+    mode = al.MODE.SIMD
+
+    def __init__(
+        self,
+        lhs,
+        rhs,
+        out_gm: tl.uint64,
+        m: tl.uint32,
+        n: tl.uint32,
+        k: tl.uint32,
+        dst_stride: tl.uint32,
+        trans_b: tl.uint32,
+        deq_scale: tl.float32,
+    ):
+        _validate_matmul_l1_to_gm_args(
+            "matmul_l1_to_gm_deqf16",
+            lhs,
+            rhs,
+            m,
+            n,
+            k,
+            dst_stride,
+            trans_b,
+            require_int8=True,
+        )
+        self.symbol = "custom_matmul_l1_to_gm_s8_deqf16"
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
+@al.register_custom_op
+class online_softmax_quant_s8:
+    """Stateless fused score-scale, FP32 online softmax, and INT8 quantization.
+
+    Processes a `[total_rows, cols]` score tile (`total_rows % 8 == 0`,
+    `cols % 64 == 0`) using strictly compiler-allocated UB buffers (`col_scale`,
+    `state_in`, and `out=(state_out, work_ub)`). Updates online softmax state
+    and writes dynamic per-row INT8 weights (`p_hi_gm`, and optional `p_lo_gm`).
+    """
+
+    core = al.CORE.VECTOR
+    pipe = al.PIPE.PIPE_V
+    mode = al.MODE.SIMD
+
+    def __init__(
+        self,
+        c_gm: tl.uint64,
+        r_gm: tl.uint64,
+        row_scale_gm: tl.uint64,
+        col_scale_ub,
+        state_in,
+        p_hi_gm: tl.uint64,
+        p_lo_gm: tl.uint64,
+        total_rows: tl.uint32,
+        cols: tl.uint32,
+        valid_cols: tl.uint32,
+        scale: tl.float32,
+        out_scale: tl.float32,
+        flags: tl.uint32,
+        out=None,
+    ):
+        assert out is not None and isinstance(
+            out,
+            (list, tuple, tl.tuple)) and len(out) == 2, ("online_softmax_quant_s8 requires out=(state_out, work_ub)")
+        state_out, work_ub = out[0], out[1]
+        assert isinstance(col_scale_ub, tl.tensor) and len(
+            col_scale_ub.shape) == 2, ("online_softmax_quant_s8 requires 2D col_scale_ub [1, cols]")
+        assert col_scale_ub.dtype == tl.float32, (
+            f"online_softmax_quant_s8 requires float32 col_scale_ub, got {col_scale_ub.dtype}")
+        assert isinstance(state_in, tl.tensor) and len(
+            state_in.shape) == 2, ("online_softmax_quant_s8 requires 2D state_in [>=2, total_rows]")
+        assert state_in.dtype == tl.float32 and state_in.shape[0] >= 2, (
+            f"online_softmax_quant_s8 requires float32 state_in with >=2 rows, got {state_in.shape}, {state_in.dtype}")
+        assert isinstance(state_out, tl.tensor) and len(
+            state_out.shape) == 2, ("online_softmax_quant_s8 requires 2D state_out [5, total_rows]")
+        assert state_out.dtype == tl.float32 and state_out.shape[0] == 5, (
+            f"online_softmax_quant_s8 requires float32 state_out [5, total_rows], got {state_out.shape}, {state_out.dtype}"
+        )
+        assert isinstance(work_ub, tl.tensor) and len(
+            work_ub.shape) == 1 and work_ub.dtype == tl.float32, ("online_softmax_quant_s8 requires 1D float32 work_ub")
+        rows = int(state_out.shape[1])
+        ncols = int(col_scale_ub.shape[1])
+        assert rows >= 8 and rows % 8 == 0, (
+            f"online_softmax_quant_s8 requires total_rows >= 8 and multiple of 8, got {rows}")
+        assert ncols >= 64 and ncols % 64 == 0, (
+            f"online_softmax_quant_s8 requires cols >= 64 and multiple of 64, got {ncols}")
+        assert int(state_in.shape[1]) == rows, (
+            f"online_softmax_quant_s8 state_in cols ({state_in.shape[1]}) must equal total_rows ({rows})")
+        tile_r = 16 if rows >= 16 else 8
+        nbanks = 2 if (rows // tile_r) >= 2 else 1
+        min_work = (nbanks * 2 * tile_r * ncols + ((rows + 63) & ~63) + ((ncols + 63) & ~63) +
+                    (((ncols + 127) & ~127) // 2) + tile_r * 64 + 512)
+        assert int(work_ub.shape[0]) >= min_work, (
+            f"online_softmax_quant_s8 work_ub too small: got {work_ub.shape[0]}, need >= {min_work}")
+        self.symbol = "custom_online_softmax_quant_s8"
+        self.bitcode = CUSTOM_OPS_BITCODE

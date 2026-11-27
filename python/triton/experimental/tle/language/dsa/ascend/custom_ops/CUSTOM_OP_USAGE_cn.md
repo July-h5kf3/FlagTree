@@ -530,6 +530,51 @@ y = tle_raw.call("ascend_flip", x, t, out=y)
 
 完整示例见 `python/tutorials/tle/custom/test_flip_ops.py`
 
+## nd2nz_gm_to_l1
+
+`nd2nz_gm_to_l1(src_gm, rows, cols, src_stride, out=dst)` 在 Cube 核上将 GM 中的 2D
+ND 矩阵（`int8` / `float16` / `bfloat16`）直接转换为标准 ZN 分形排布并搬入编译器分配
+的 L1/CBUF 缓冲区 `dst`（无状态、无硬编码 L1 地址）。
+
+- `src_gm`：`uint64` GM 基地址（支持通过 `(Ptr + off).to(tl.uint64)` 带偏移传入）
+- `rows` / `cols` / `src_stride`：`uint32`，`rows` 为 16 的倍数，`cols` 为 32B 对齐
+  （`int8` 为 32 的倍数，`fp16`/`bf16` 为 16 的倍数）
+- `out`：2D L1/CBUF 目标张量 `[rows, cols]`，dtype 与源矩阵一致
+
+## gather_blocks_gm_to_l1
+
+`gather_blocks_gm_to_l1(src_gm, block_ids_gm, num_blocks, valid_blocks, block_rows, cols, src_block_stride, out=dst)`
+在 Cube 核上按 GM 中的 `int32` 块索引表 `block_ids_gm`（超出 `valid_blocks` 自动钳位
+至 `valid_blocks - 1`）将 `num_blocks` 个 `[block_rows, cols]` 行块（`int8` /
+`float16` / `bfloat16`）以标准 ZN 分形排布聚集到编译器分配的 L1/CBUF 缓冲区
+`[num_blocks * block_rows, cols]` 中，供后续 `matmul_l1_to_gm` 直接复用。
+
+## matmul_l1_to_gm / matmul_l1_to_gm_deqf16
+
+- `matmul_l1_to_gm(lhs, rhs, out_gm, m, n, k, dst_stride, trans_b)`：无状态通用
+  `L1(ZN) x L1(ZN) -> GM` 矩阵乘（支持 `int8->int32`、`float16->float32`、
+  `bfloat16->float32`），内部采用 L0A/L0B/L0C 双缓冲 ping-pong，通过 `trans_b`
+  （`0` 或 `1`）支持同一份 L1 ZN 权重在转置与非转置矩阵乘之间零重载复用。
+- `matmul_l1_to_gm_deqf16(lhs, rhs, out_gm, m, n, k, dst_stride, trans_b, deq_scale)`：
+  `int8 x int8 -> int32 -> fp16` 变体，在 Fixpipe 写回 GM 阶段通过硬件 `DEQF16`
+  按 `deq_scale` 反量化输出 `float16`。
+
+## online_softmax_quant_s8
+
+`online_softmax_quant_s8(c_gm, r_gm, row_scale_gm, col_scale_ub, state_in, p_hi_gm, p_lo_gm, total_rows, cols, valid_cols, scale, out_scale, flags, out=(state_out, work_ub))`
+在 Vector 核上融合完成评分反量化/缩放、FP32 online softmax 状态更新与逐行动态 INT8
+量化（支持 shifted 8-bit 快速 FP16 路径及峰值行自适应/强制 FP32 双数字残差量化）。
+
+- 完全无状态、100% 编译器管理 UB（无 `get_imm()` 固定地址）：输入 `col_scale_ub`
+  `[1, cols]`、`state_in` `[>=2, total_rows]`，输出 `out=(state_out, work_ub)`
+  （`state_out` 为 `[5, total_rows]`，依次存储 `m_now`、`l_now`、`w_prev`、`w_cur`、
+  `need_lo`；`work_ub` 为 1D `float32` 临时缓冲区，由编译器分配与复用）。
+- 支持任意 `total_rows % 8 == 0`、`cols % 64 == 0`、`valid_cols` 掩码、可选 `r_gm` /
+  `row_scale_gm` / `p_lo_gm`（传 `0` 禁用）与 `flags` 位掩码（`bit0: is_first`，
+  `bit1: use_shifted`，`bit2: force_two_digit`，`bit3: running_norm`）。
+
+完整单元测试见 `python/tutorials/tle/custom/test_cube_and_softmax_ops.py`。
+
 ## @dialect(name="cann")：算子层面混合语言编程
 
 除上面的 OP扩展框架 字符串注册表入口外，用户自备的 AscendC 源码/bitcode 可通过
