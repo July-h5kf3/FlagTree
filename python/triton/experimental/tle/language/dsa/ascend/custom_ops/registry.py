@@ -925,6 +925,8 @@ class online_softmax_quant_s8:
     `cols % 64 == 0`) using strictly compiler-allocated UB buffers (`col_scale`,
     `state_in`, and `out=(state_out, work_ub)`). Updates online softmax state
     and writes dynamic per-row INT8 weights (`p_hi_gm`, and optional `p_lo_gm`).
+    Flags bitmask: bit 0 (`is_first`), bit 1 (`use_shifted`), bit 2
+    (`force_two_digit`), bit 3 (`running_norm`), bit 4 (`group_scale_fast`).
     """
 
     core = al.CORE.VECTOR
@@ -936,6 +938,9 @@ class online_softmax_quant_s8:
         c_gm: tl.uint64,
         r_gm: tl.uint64,
         row_scale_gm: tl.uint64,
+        col_scale_gm: tl.uint64,
+        col_block_ids_gm: tl.uint64,
+        flag_gm: tl.uint64,
         col_scale_ub,
         state_in,
         p_hi_gm: tl.uint64,
@@ -975,11 +980,170 @@ class online_softmax_quant_s8:
             f"online_softmax_quant_s8 requires cols >= 64 and multiple of 64, got {ncols}")
         assert int(state_in.shape[1]) == rows, (
             f"online_softmax_quant_s8 state_in cols ({state_in.shape[1]}) must equal total_rows ({rows})")
-        tile_r = 16 if rows >= 16 else 8
+        tile_r = 8 if (rows >= 128 or ncols > 384) else (16 if rows >= 16 else 8)
         nbanks = 2 if (rows // tile_r) >= 2 else 1
-        min_work = (nbanks * 2 * tile_r * ncols + ((rows + 63) & ~63) + ((ncols + 63) & ~63) +
+        min_work = (nbanks * 2 * tile_r * ncols + ((rows + 63) & ~63) + 2 * ((ncols + 63) & ~63) +
                     (((ncols + 127) & ~127) // 2) + tile_r * 64 + 512)
         assert int(work_ub.shape[0]) >= min_work, (
             f"online_softmax_quant_s8 work_ub too small: got {work_ub.shape[0]}, need >= {min_work}")
         self.symbol = "custom_online_softmax_quant_s8"
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
+@al.register_custom_op
+class gather_blocks_matmul_pair_l1_to_gm:
+    """Stateless chunk-pipelined paired paged-gather + L1-ZN x L1-ZN^T -> GM matmul.
+
+    Streams two block-indexed GM matrices (int8 + bf16 sharing `block_ids_gm`)
+    into compiler-allocated L1 ZN outputs `out=(rhs0_l1, rhs1_l1)` while
+    overlapping chunked `lhs0 @ rhs0^T -> out0_gm` (int32) and `lhs1 @ rhs1^T ->
+    out1_gm` (fp32) matmuls on Cube. When `preloaded_rhs0_chunks != 0`, chunk 0
+    of `rhs0` is assumed already resident in `rhs0_l1`.
+    """
+
+    core = al.CORE.CUBE
+    pipe = al.PIPE.PIPE_M
+    mode = al.MODE.SIMD
+
+    def __init__(
+        self,
+        lhs0,
+        rhs0_gm: tl.uint64,
+        lhs1,
+        rhs1_gm: tl.uint64,
+        block_ids_gm: tl.uint64,
+        out0_gm: tl.uint64,
+        out1_gm: tl.uint64,
+        num_blocks: tl.uint32,
+        valid_blocks: tl.uint32,
+        block_rows: tl.uint32,
+        m: tl.uint32,
+        k0: tl.uint32,
+        k1: tl.uint32,
+        src0_block_stride: tl.uint32,
+        src1_block_stride: tl.uint32,
+        dst_stride: tl.uint32,
+        preloaded_rhs0_chunks: tl.uint32,
+        out=None,
+    ):
+        assert out is not None and isinstance(out, (list, tuple, tl.tuple)) and len(out) == 2, (
+            "gather_blocks_matmul_pair_l1_to_gm requires out=(rhs0_l1, rhs1_l1)")
+        rhs0_l1, rhs1_l1 = out[0], out[1]
+        d0, _, m0, c0 = _validate_l1_zn_matrix(lhs0, "gather_blocks_matmul_pair_l1_to_gm", "lhs0")
+        d1, _, m1, c1 = _validate_l1_zn_matrix(lhs1, "gather_blocks_matmul_pair_l1_to_gm", "lhs1")
+        rd0, _, rn0, rc0 = _validate_l1_zn_matrix(rhs0_l1, "gather_blocks_matmul_pair_l1_to_gm", "rhs0_l1")
+        rd1, _, rn1, rc1 = _validate_l1_zn_matrix(rhs1_l1, "gather_blocks_matmul_pair_l1_to_gm", "rhs1_l1")
+        assert d0 == tl.int8 and rd0 == tl.int8, "gather_blocks_matmul_pair_l1_to_gm requires int8 lhs0/rhs0_l1"
+        assert d1 == tl.bfloat16 and rd1 == tl.bfloat16, (
+            "gather_blocks_matmul_pair_l1_to_gm requires bfloat16 lhs1/rhs1_l1")
+        assert m0 == m1 and rn0 == rn1 and c0 == rc0 and c1 == rc1
+        self.symbol = "custom_gather_blocks_matmul_pair_s8s32_bf16f32"
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
+@al.register_custom_op
+class nd2nz_matmul_l1_to_gm_deqf16:
+    """Stateless chunk-pipelined GM->L1 ND2NZ + INT8 L1-ZN x L1-ZN -> FP16 GM DEQF16 matmul.
+
+    Streams `[m, k]` int8 `lhs_gm` into a compiler-allocated `[m, k]` L1 scratch
+    buffer in k-chunks on PIPE_MTE2 overlapped with `lhs @ rhs -> out_gm`
+    Fixpipe DEQF16 matmul on Cube. Optionally prefetches the next iteration's
+    leading blocks into `rhs_l1` (passed via `out=(scratch_l1, rhs_l1)`) behind
+    the final tile's MMA and Fixpipe stores when `prefetch_gm != 0`.
+    """
+
+    core = al.CORE.CUBE
+    pipe = al.PIPE.PIPE_M
+    mode = al.MODE.SIMD
+
+    def __init__(
+        self,
+        lhs_gm: tl.uint64,
+        out_gm: tl.uint64,
+        m: tl.uint32,
+        n: tl.uint32,
+        k: tl.uint32,
+        dst_stride: tl.uint32,
+        deq_scale: tl.float32,
+        prefetch_gm: tl.uint64,
+        prefetch_ids_gm: tl.uint64,
+        prefetch_blocks: tl.uint32,
+        prefetch_valid_blocks: tl.uint32,
+        prefetch_block_rows: tl.uint32,
+        prefetch_block_stride: tl.uint32,
+        out=None,
+    ):
+        assert out is not None and isinstance(out, (list, tuple, tl.tuple)) and len(out) == 2, (
+            "nd2nz_matmul_l1_to_gm_deqf16 requires out=(scratch_l1, rhs_l1)")
+        scratch_l1, rhs_l1 = out[0], out[1]
+        sd, _, sm, sk = _validate_l1_zn_matrix(scratch_l1, "nd2nz_matmul_l1_to_gm_deqf16", "scratch_l1")
+        rd, _, rk, rn = _validate_l1_zn_matrix(rhs_l1, "nd2nz_matmul_l1_to_gm_deqf16", "rhs_l1")
+        assert sd == tl.int8 and rd == tl.int8, "nd2nz_matmul_l1_to_gm_deqf16 requires int8 rhs/scratch"
+        assert sk == rk, f"nd2nz_matmul_l1_to_gm_deqf16 scratch k ({sk}) must match rhs k ({rk})"
+        if isinstance(m, int):
+            assert m == sm, f"nd2nz_matmul_l1_to_gm_deqf16 m ({m}) must match scratch rows ({sm})"
+        if isinstance(n, int):
+            assert n == rn and n % 32 == 0, f"nd2nz_matmul_l1_to_gm_deqf16 n ({n}) must match rhs cols ({rn})"
+        if isinstance(k, int):
+            assert k == sk and k % 32 == 0, f"nd2nz_matmul_l1_to_gm_deqf16 k ({k}) must match scratch cols ({sk})"
+        self.symbol = "custom_nd2nz_matmul_l1_to_gm_s8_deqf16"
+        self.bitcode = CUSTOM_OPS_BITCODE
+
+
+@al.register_custom_op
+class online_rescaled_accum:
+    """Stateless 2-bank contiguous online rescaled accumulator update in UB.
+
+    Updates compiler-allocated `acc_ub` (`[total_rows, dim]` FP16 or FP32) in
+    place with `acc = alpha * acc + step * (src + bias_scale * bias + lo_scale *
+    src_lo)` using 2-bank contiguous GM->UB DMA ping-pong and fused `vmla`, with
+    optional final BF16 GM writeback when `(flags & 2) != 0` and optional
+    `state_ub[4, 0]` gating of `src_lo_gm` when `(flags & 16) != 0`.
+    """
+
+    core = al.CORE.VECTOR
+    pipe = al.PIPE.PIPE_V
+    mode = al.MODE.SIMD
+
+    def __init__(
+        self,
+        src_gm: tl.uint64,
+        src_lo_gm: tl.uint64,
+        bias_gm: tl.uint64,
+        state_ub,
+        out_gm: tl.uint64,
+        total_rows: tl.uint32,
+        dim: tl.uint32,
+        bias_scale: tl.float32,
+        lo_scale: tl.float32,
+        flags: tl.uint32,
+        out=None,
+    ):
+        assert out is not None and isinstance(
+            out, (list, tuple, tl.tuple)) and len(out) == 2, ("online_rescaled_accum requires out=(acc_ub, work_ub)")
+        acc_ub, work_ub = out[0], out[1]
+        assert isinstance(state_ub, tl.tensor) and len(state_ub.shape) == 2 and state_ub.dtype == tl.float32
+        assert state_ub.shape[0] >= 4
+        assert isinstance(acc_ub, tl.tensor) and len(acc_ub.shape) == 2
+        assert acc_ub.dtype in (tl.float16, tl.float32), (
+            f"online_rescaled_accum requires float16 or float32 acc_ub, got {acc_ub.dtype}")
+        assert isinstance(work_ub, tl.tensor) and len(work_ub.shape) == 1 and work_ub.dtype == tl.float32
+        rows, ndim = int(acc_ub.shape[0]), int(acc_ub.shape[1])
+        assert rows >= 8 and rows % 8 == 0 and int(state_ub.shape[1]) == rows
+        assert ndim >= 128 and ndim % 128 == 0
+        if acc_ub.dtype == tl.float16:
+            tr = 16 if rows >= 128 else (32 if rows >= 32 else rows)
+            nb = 2 if (rows // tr) >= 2 else 1
+            lo_r = 8 if tr >= 8 else tr
+            min_w = (nb * tr + lo_r) * (ndim // 2) + ndim // 2 + tr * 16 + 128
+            assert int(work_ub.shape[0]) >= min_w, (
+                f"online_rescaled_accum work_ub too small: got {work_ub.shape[0]}, need >= {min_w}")
+            self.symbol = "custom_online_rescaled_accum_f16"
+        else:
+            tr = 8 if rows >= 8 else rows
+            nb = 2 if (rows // tr) >= 2 else 1
+            min_w = (nb + 1) * tr * ndim + ndim + tr * 16 + 128
+            assert int(work_ub.shape[0]) >= min_w, (
+                f"online_rescaled_accum work_ub too small: got {work_ub.shape[0]}, need >= {min_w}")
+            self.symbol = "custom_online_rescaled_accum_f32"
         self.bitcode = CUSTOM_OPS_BITCODE

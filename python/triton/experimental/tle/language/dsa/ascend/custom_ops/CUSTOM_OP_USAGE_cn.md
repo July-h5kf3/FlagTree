@@ -549,7 +549,16 @@ ND 矩阵（`int8` / `float16` / `bfloat16`）直接转换为标准 ZN 分形排
 `float16` / `bfloat16`）以标准 ZN 分形排布聚集到编译器分配的 L1/CBUF 缓冲区
 `[num_blocks * block_rows, cols]` 中，供后续 `matmul_l1_to_gm` 直接复用。
 
-## matmul_l1_to_gm / matmul_l1_to_gm_deqf16
+## gather_blocks_matmul_pair_l1_to_gm
+
+`gather_blocks_matmul_pair_l1_to_gm(lhs0, rhs0_gm, lhs1, rhs1_gm, block_ids_gm, out0_gm, out1_gm, num_blocks, valid_blocks, block_rows, m, k0, k1, src0_block_stride, src1_block_stride, dst_stride, preloaded_rhs0_chunks, out=(rhs0_l1, rhs1_l1))`
+在 Cube 核上将一对共享 `block_ids_gm` 的分块 GM 矩阵（`int8` + `bfloat16`）按 2-block chunk
+流式 ND2NZ 搬入编译器分配的 L1 缓冲区 `out=(rhs0_l1, rhs1_l1)`，并与 `lhs0 @ rhs0^T -> out0_gm`
+（`int32`）、`lhs1 @ rhs1^T -> out1_gm`（`float32`）按 chunk 流水线重叠执行。当
+`preloaded_rhs0_chunks != 0` 时，直接复用已预取至 `rhs0_l1` 的第 0 个 chunk，在 `t=0`
+即刻启动首块矩阵乘。
+
+## matmul_l1_to_gm / matmul_l1_to_gm_deqf16 / nd2nz_matmul_l1_to_gm_deqf16
 
 - `matmul_l1_to_gm(lhs, rhs, out_gm, m, n, k, dst_stride, trans_b)`：无状态通用
   `L1(ZN) x L1(ZN) -> GM` 矩阵乘（支持 `int8->int32`、`float16->float32`、
@@ -558,20 +567,35 @@ ND 矩阵（`int8` / `float16` / `bfloat16`）直接转换为标准 ZN 分形排
 - `matmul_l1_to_gm_deqf16(lhs, rhs, out_gm, m, n, k, dst_stride, trans_b, deq_scale)`：
   `int8 x int8 -> int32 -> fp16` 变体，在 Fixpipe 写回 GM 阶段通过硬件 `DEQF16`
   按 `deq_scale` 反量化输出 `float16`。
+- `nd2nz_matmul_l1_to_gm_deqf16(lhs_gm, out_gm, m, n, k, dst_stride, deq_scale, prefetch_gm, prefetch_ids_gm, prefetch_blocks, prefetch_valid_blocks, prefetch_block_rows, prefetch_block_stride, out=(scratch_l1, rhs_l1))`：
+  将 GM `int8` 左矩阵按 k-chunk 流式 ND2NZ 搬入编译器分配的 `scratch_l1`，与
+  `L1 x rhs_l1 -> GM (DEQF16)` 流水重叠执行；当 `prefetch_gm != 0` 时，在尾块 MMA
+  与 Fixpipe 写回阶段重叠预取下一轮首块到 `rhs_l1`（返回前完成同步，无跨调用状态）。
 
 ## online_softmax_quant_s8
 
-`online_softmax_quant_s8(c_gm, r_gm, row_scale_gm, col_scale_ub, state_in, p_hi_gm, p_lo_gm, total_rows, cols, valid_cols, scale, out_scale, flags, out=(state_out, work_ub))`
-在 Vector 核上融合完成评分反量化/缩放、FP32 online softmax 状态更新与逐行动态 INT8
-量化（支持 shifted 8-bit 快速 FP16 路径及峰值行自适应/强制 FP32 双数字残差量化）。
+`online_softmax_quant_s8(c_gm, r_gm, row_scale_gm, col_scale_gm, col_block_ids_gm, flag_gm, col_scale_ub, state_in, p_hi_gm, p_lo_gm, total_rows, cols, valid_cols, scale, out_scale, flags, out=(state_out, work_ub))`
+在 Vector 核上融合完成评分反量化/缩放、在线 softmax 状态更新与动态 INT8 量化
+（支持直采分块 `col_scale_gm`/`col_block_ids_gm`、直写 `flag_gm`、混合 FP16 `vexp` +
+FP32 精确行求和快速路径、紧范围组内共享 scale 路径及峰值行/离群值自适应精确 FP32 双数字残差回退）。
 
 - 完全无状态、100% 编译器管理 UB（无 `get_imm()` 固定地址）：输入 `col_scale_ub`
   `[1, cols]`、`state_in` `[>=2, total_rows]`，输出 `out=(state_out, work_ub)`
   （`state_out` 为 `[5, total_rows]`，依次存储 `m_now`、`l_now`、`w_prev`、`w_cur`、
   `need_lo`；`work_ub` 为 1D `float32` 临时缓冲区，由编译器分配与复用）。
 - 支持任意 `total_rows % 8 == 0`、`cols % 64 == 0`、`valid_cols` 掩码、可选 `r_gm` /
-  `row_scale_gm` / `p_lo_gm`（传 `0` 禁用）与 `flags` 位掩码（`bit0: is_first`，
-  `bit1: use_shifted`，`bit2: force_two_digit`，`bit3: running_norm`）。
+  `row_scale_gm` / `col_scale_gm` / `flag_gm` / `p_lo_gm`（传 `0` 禁用）与 `flags` 位掩码
+  （`bit0: is_first`，`bit1: use_shifted`，`bit2: force_two_digit`，`bit3: running_norm`，
+  `bit4: group_scale_fast`）。
+
+## online_rescaled_accum
+
+`online_rescaled_accum(src_gm, src_lo_gm, bias_gm, state_ub, out_gm, total_rows, dim, bias_scale, lo_scale, flags, out=(acc_ub, work_ub))`
+在 Vector 核上以双缓冲连续 GM→UB DMA 与融合 `vmla` 原地更新编译器管理的 UB 累加器
+`acc_ub`（`float16` 或 `float32`）：`acc = alpha * acc + step * (src + bias_scale * bias + lo_scale * src_lo)`。
+支持 `flags` 位掩码：`bit0: is_first`，`bit1: is_last`（同步写回 `out_gm` 为 `bfloat16`），
+`bit2: first_empty`（写零），`bit3: normalize_out`（FP32 末尾除以 `l_now`），
+`bit4: check_state_need_lo`（按 `state_ub[4, 0]` 动态门控 `src_lo_gm`）。
 
 完整单元测试见 `python/tutorials/tle/custom/test_cube_and_softmax_ops.py`。
 
